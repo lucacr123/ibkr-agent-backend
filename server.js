@@ -34,15 +34,18 @@ async function fetchFlex() {
   const url      = sendData?.FlexStatementResponse?.Url;
   if (status !== "Success") throw new Error(`Flex request failed: ${JSON.stringify(sendData)}`);
 
-  await new Promise(r => setTimeout(r, 3000));
-  for (let i = 0; i < 6; i++) {
+  // Wait longer for IBKR to generate the report
+  await new Promise(r => setTimeout(r, 8000));
+  for (let i = 0; i < 10; i++) {
     const getRes  = await fetch(`${url}?t=${FLEX_TOKEN}&q=${refCode}&v=3`, { headers: { "User-Agent": "Node/18" } });
-    const getData = parser.parse(await getRes.text());
+    const rawXml  = await getRes.text();
+    const getData = parser.parse(rawXml);
     // Returns either FlexQueryResponse or FlexStatementResponse
     const stmts = getData?.FlexQueryResponse?.FlexStatements?.FlexStatement
                ?? getData?.FlexStatementResponse?.FlexStatements?.FlexStatement;
-    if (stmts) return Array.isArray(stmts) ? stmts : [stmts]; // always return array
-    await new Promise(r => setTimeout(r, 2000));
+    if (stmts) return Array.isArray(stmts) ? stmts : [stmts];
+    // Still generating — wait longer each retry
+    await new Promise(r => setTimeout(r, 3000 + i * 1000));
   }
   throw new Error("Could not retrieve Flex report after retries");
 }

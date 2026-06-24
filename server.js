@@ -68,17 +68,27 @@ async function executeTool(name, input) {
   switch (name) {
 
     case "get_account_summary": {
-      const stmts = await getFlexData(input?.refresh);
+      const allStmts = await getFlexData(input?.refresh);
+
+      // Deduplicate — keep only the most recent statement per account
+      const byAccount = {};
+      for (const s of allStmts) {
+        const id = s.accountId;
+        if (!byAccount[id] || s.whenGenerated > byAccount[id].whenGenerated) {
+          byAccount[id] = s;
+        }
+      }
+      const stmts = Object.values(byAccount);
+
       const accounts = stmts.map(stmt => {
-        const info     = stmt?.AccountInformation || {};
+        const info = stmt?.AccountInformation || {};
         // Equity summary — get the last (most recent) row
         const equityRows = toArr(stmt?.EquitySummaryInBase?.EquitySummaryByReportDateInBase);
         const equity     = equityRows[equityRows.length - 1] || {};
-        // Performance summary — all positions except "Total" row
-        const perf = toArr(stmt?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)
-          .filter(p => p.symbol && p.symbol !== "");
-        const totalUnrealized = perf.reduce((s, p) => s + fmtNum(p.totalUnrealizedPnl), 0);
-        const totalRealized   = perf.reduce((s, p) => s + fmtNum(p.totalRealizedPnl),   0);
+        // Use OpenPositions for actual position data
+        const positions  = toArr(stmt?.OpenPositions?.OpenPosition)
+          .filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
+        const totalUnrealized = positions.reduce((s, p) => s + fmtNum(p.fifoPnlUnrealized), 0);
         return {
           accountId:          stmt.accountId,
           accountName:        info.name || "",
@@ -87,17 +97,19 @@ async function executeTool(name, input) {
           cash:               fmt(equity.cash),
           stockValue:         fmt(equity.stock),
           totalUnrealizedPnl: fmt(totalUnrealized),
-          totalRealizedPnl:   fmt(totalRealized),
-          totalPnl:           fmt(totalUnrealized + totalRealized),
-          positionCount:      perf.length,
-          positions: perf.map(p => ({
+          totalPnl:           fmt(totalUnrealized),
+          positionCount:      positions.length,
+          positions: positions.map(p => ({
             symbol:        p.symbol,
             description:   p.description,
             assetCategory: p.assetCategory,
-            exchange:      p.listingExchange,
-            realizedPnl:   fmt(p.totalRealizedPnl),
-            unrealizedPnl: fmt(p.totalUnrealizedPnl),
-            totalPnl:      fmt(p.totalFifoPnl),
+            quantity:      p.position,
+            markPrice:     fmt(p.markPrice),
+            positionValue: fmt(p.positionValue),
+            costBasis:     fmt(p.costBasisPrice),
+            unrealizedPnl: fmt(p.fifoPnlUnrealized),
+            percentOfNAV:  p.percentOfNAV,
+            currency:      p.currency,
           })),
         };
       });
@@ -115,8 +127,12 @@ async function executeTool(name, input) {
     }
 
     case "get_trades": {
-      const stmts  = await getFlexData();
-      const all    = stmts.flatMap(s => toArr(s?.Trades?.Trade).map(t => ({ ...t, accountId: s.accountId })));
+      const allStmts = await getFlexData();
+      const byAccount = {};
+      for (const s of allStmts) {
+        if (!byAccount[s.accountId] || s.whenGenerated > byAccount[s.accountId].whenGenerated) byAccount[s.accountId] = s;
+      }
+      const all = Object.values(byAccount).flatMap(s => toArr(s?.Trades?.Trade).map(t => ({ ...t, accountId: s.accountId })));
       const filtered = input?.symbol ? all.filter(t => t.symbol?.toUpperCase() === input.symbol.toUpperCase()) : all;
       return {
         count: filtered.length,
@@ -137,7 +153,12 @@ async function executeTool(name, input) {
     }
 
     case "get_cash": {
-      const stmts = await getFlexData();
+      const allStmts = await getFlexData();
+      const byAccount = {};
+      for (const s of allStmts) {
+        if (!byAccount[s.accountId] || s.whenGenerated > byAccount[s.accountId].whenGenerated) byAccount[s.accountId] = s;
+      }
+      const stmts = Object.values(byAccount);
       return {
         accounts: stmts.map(s => {
           const rows = toArr(s?.CashReport?.CashReportCurrency);
@@ -157,15 +178,21 @@ async function executeTool(name, input) {
     }
 
     case "get_pnl_summary": {
-      const stmts = await getFlexData();
+      const allStmts = await getFlexData();
+      const byAccount = {};
+      for (const s of allStmts) {
+        if (!byAccount[s.accountId] || s.whenGenerated > byAccount[s.accountId].whenGenerated) byAccount[s.accountId] = s;
+      }
+      const stmts = Object.values(byAccount);
       return {
         accounts: stmts.map(s => {
-          const perf   = toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying).filter(p => p.symbol);
-          const sorted = [...perf].sort((a, b) => fmtNum(b.totalFifoPnl) - fmtNum(a.totalFifoPnl));
-          const cashRows = toArr(s?.CashReport?.CashReportCurrency);
-          const base     = cashRows.find(c => c.currency === "BASE_SUMMARY") || {};
-          const totalR   = perf.reduce((s, p) => s + fmtNum(p.totalRealizedPnl),   0);
-          const totalU   = perf.reduce((s, p) => s + fmtNum(p.totalUnrealizedPnl), 0);
+          const positions = toArr(s?.OpenPositions?.OpenPosition).filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
+          const perf      = toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying).filter(p => p.symbol);
+          const sorted    = [...positions].sort((a, b) => fmtNum(b.fifoPnlUnrealized) - fmtNum(a.fifoPnlUnrealized));
+          const cashRows  = toArr(s?.CashReport?.CashReportCurrency);
+          const base      = cashRows.find(c => c.currency === "BASE_SUMMARY") || {};
+          const totalU    = positions.reduce((sum, p) => sum + fmtNum(p.fifoPnlUnrealized), 0);
+          const totalR    = perf.reduce((sum, p) => sum + fmtNum(p.totalRealizedPnl), 0);
           return {
             accountId:          s.accountId,
             totalRealizedPnl:   fmt(totalR),
@@ -174,8 +201,8 @@ async function executeTool(name, input) {
             commissions:        fmt(base.commissions),
             dividends:          fmt(base.dividends),
             brokerInterest:     fmt(base.brokerInterest),
-            bestPositions:      sorted.slice(0, 3).map(p => ({ symbol: p.symbol, totalPnl: fmt(p.totalFifoPnl) })),
-            worstPositions:     sorted.slice(-3).reverse().map(p => ({ symbol: p.symbol, totalPnl: fmt(p.totalFifoPnl) })),
+            bestPositions:      sorted.slice(0, 3).map(p => ({ symbol: p.symbol, unrealizedPnl: fmt(p.fifoPnlUnrealized) })),
+            worstPositions:     sorted.slice(-3).reverse().map(p => ({ symbol: p.symbol, unrealizedPnl: fmt(p.fifoPnlUnrealized) })),
           };
         }),
       };

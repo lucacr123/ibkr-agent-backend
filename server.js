@@ -336,3 +336,28 @@ app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISO
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`🚀 IBKR Agent on port ${PORT}`));
+
+// Debug endpoint — remove after fixing
+app.get("/api/debug/structure", async (req, res) => {
+  try {
+    const stmts = await getFlexData(true);
+    const structure = stmts.map(s => ({
+      accountId: s.accountId,
+      sections: Object.keys(s),
+      FIFOCount: toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying).length,
+      OpenPositionsCount: toArr(s?.OpenPositions?.OpenPosition).length,
+      TradesCount: toArr(s?.Trades?.Trade).length,
+      EquitySummaryCount: toArr(s?.EquitySummaryInBase?.EquitySummaryByReportDateInBase).length,
+      // Show first FIFO item keys if exists
+      firstFIFOKeys: toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)[0] 
+        ? Object.keys(toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)[0])
+        : [],
+      firstOpenPosKeys: toArr(s?.OpenPositions?.OpenPosition)[0]
+        ? Object.keys(toArr(s?.OpenPositions?.OpenPosition)[0])
+        : [],
+    }));
+    res.json(structure);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});

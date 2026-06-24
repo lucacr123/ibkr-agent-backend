@@ -22,196 +22,270 @@ const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: 
 
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
 
+// ─── Helpers ──────────────────────────────────────────────────────
+const toArr = v  => Array.isArray(v) ? v : v ? [v] : [];
+const n     = v  => parseFloat(v || 0);
+const fmt   = v  => n(v).toFixed(2);
+
 // ─── Flex Web Service ─────────────────────────────────────────────
 const FLEX_BASE = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService";
 
 async function fetchFlex() {
-  if (!FLEX_TOKEN || !FLEX_QUERY_ID) throw new Error("IBKR_FLEX_TOKEN or IBKR_FLEX_QUERY_ID not set");
+  if (!FLEX_TOKEN || !FLEX_QUERY_ID) throw new Error("Missing IBKR_FLEX_TOKEN or IBKR_FLEX_QUERY_ID");
+
+  // Step 1 — request report generation
   const sendRes  = await fetch(`${FLEX_BASE}/SendRequest?t=${FLEX_TOKEN}&q=${FLEX_QUERY_ID}&v=3`, { headers: { "User-Agent": "Node/18" } });
   const sendData = parser.parse(await sendRes.text());
-  const status   = sendData?.FlexStatementResponse?.Status;
-  const refCode  = sendData?.FlexStatementResponse?.ReferenceCode;
-  const url      = sendData?.FlexStatementResponse?.Url;
-  if (status !== "Success") throw new Error(`Flex request failed: ${JSON.stringify(sendData)}`);
+  if (sendData?.FlexStatementResponse?.Status !== "Success")
+    throw new Error(`Flex SendRequest failed: ${JSON.stringify(sendData)}`);
 
-  // Wait longer for IBKR to generate the report
+  const refCode = sendData.FlexStatementResponse.ReferenceCode;
+  const url     = sendData.FlexStatementResponse.Url;
+
+  // Step 2 — retrieve report (wait for IBKR to generate it)
   await new Promise(r => setTimeout(r, 8000));
   for (let i = 0; i < 10; i++) {
-    const getRes  = await fetch(`${url}?t=${FLEX_TOKEN}&q=${refCode}&v=3`, { headers: { "User-Agent": "Node/18" } });
-    const rawXml  = await getRes.text();
-    const getData = parser.parse(rawXml);
-    // Returns either FlexQueryResponse or FlexStatementResponse
-    const stmts = getData?.FlexQueryResponse?.FlexStatements?.FlexStatement
-               ?? getData?.FlexStatementResponse?.FlexStatements?.FlexStatement;
-    if (stmts) return Array.isArray(stmts) ? stmts : [stmts];
-    // Still generating — wait longer each retry
+    const res     = await fetch(`${url}?t=${FLEX_TOKEN}&q=${refCode}&v=3`, { headers: { "User-Agent": "Node/18" } });
+    const getData = parser.parse(await res.text());
+    const raw     = getData?.FlexQueryResponse?.FlexStatements?.FlexStatement
+                 ?? getData?.FlexStatementResponse?.FlexStatements?.FlexStatement;
+    if (raw) return Array.isArray(raw) ? raw : [raw];
     await new Promise(r => setTimeout(r, 3000 + i * 1000));
   }
-  throw new Error("Could not retrieve Flex report after retries");
+  throw new Error("Flex report never became available after retries");
 }
 
-let flexCache = null, flexCacheTime = 0;
-async function getFlexData(force = false) {
-  if (!force && flexCache && Date.now() - flexCacheTime < 15 * 60 * 1000) return flexCache;
-  flexCache     = await fetchFlex(); // array of statements
-  flexCacheTime = Date.now();
-  return flexCache;
+// Cache 15 min
+let _cache = null, _cacheTime = 0;
+async function getStatements(force = false) {
+  if (!force && _cache && Date.now() - _cacheTime < 15 * 60 * 1000) return _cache;
+  _cache     = await fetchFlex();
+  _cacheTime = Date.now();
+  return _cache;
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────
-function toArr(v)    { return Array.isArray(v) ? v : v ? [v] : []; }
-function fmt(v)      { return parseFloat(v || 0).toFixed(2); }
-function fmtNum(v)   { return parseFloat(v || 0); }
+// ─── Data layer ───────────────────────────────────────────────────
+// Deduplicate statements: IBKR returns one FlexStatement per day per account.
+// We want only the LATEST statement per account.
+function latestPerAccount(stmts) {
+  const map = {};
+  for (const s of stmts) {
+    const id = s.accountId;
+    if (!map[id] || (s.whenGenerated || "") > (map[id].whenGenerated || "")) map[id] = s;
+  }
+  return Object.values(map);
+}
+
+// Get FX rates from statements (currency → rate to base EUR)
+function getFxRates(stmt) {
+  const rates = { EUR: 1 };
+  toArr(stmt?.ConversionRates?.ConversionRate).forEach(r => {
+    rates[r.fromCurrency] = n(r.rate);
+  });
+  return rates;
+}
+
+// Convert value to EUR using fx rates
+function toEUR(value, currency, fxRates) {
+  const rate = fxRates[currency] ?? 1;
+  return n(value) * rate;
+}
+
+// ─── Build portfolio object ───────────────────────────────────────
+async function buildPortfolio(force = false) {
+  const all   = await getStatements(force);
+  const stmts = latestPerAccount(all);
+
+  // Per-account data
+  const accounts = stmts.map(stmt => {
+    const info      = stmt?.AccountInformation || {};
+    const fxRates   = getFxRates(stmt);
+    const equityRows = toArr(stmt?.EquitySummaryInBase?.EquitySummaryByReportDateInBase);
+    const equity    = equityRows[equityRows.length - 1] || {};
+    const positions = toArr(stmt?.OpenPositions?.OpenPosition)
+      .filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
+    const cashRows  = toArr(stmt?.CashReport?.CashReportCurrency);
+    const baseCash  = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
+
+    return {
+      accountId:    stmt.accountId,
+      accountName:  info.name || "",
+      baseCurrency: info.currency || "EUR",
+      // Balances (in account base currency, already converted by IBKR)
+      netLiquidation: n(equity.total),
+      cash:           n(equity.cash),
+      stockValue:     n(equity.stock),
+      dividendAccruals: n(equity.dividendAccruals),
+      // Cash report
+      commissions:  n(baseCash.commissions),
+      deposits:     n(baseCash.deposits),
+      withdrawals:  n(baseCash.withdrawals),
+      dividends:    n(baseCash.dividends),
+      brokerInterest: n(baseCash.brokerInterest),
+      // Positions
+      positions: positions.map(p => {
+        const fxRate      = n(p.fxRateToBase) || fxRates[p.currency] || 1;
+        const valueEUR    = n(p.positionValue) * fxRate;
+        const unrealEUR   = n(p.fifoPnlUnrealized) * fxRate;
+        const costEUR     = n(p.costBasisMoney) * fxRate;
+        return {
+          symbol:          p.symbol,
+          description:     p.description,
+          assetCategory:   p.assetCategory,
+          currency:        p.currency,
+          quantity:        n(p.position),
+          markPrice:       n(p.markPrice),
+          costBasisPrice:  n(p.costBasisPrice),
+          positionValue:   n(p.positionValue),    // in position currency
+          positionValueEUR: valueEUR,             // converted to EUR
+          unrealizedPnl:   n(p.fifoPnlUnrealized), // in position currency
+          unrealizedPnlEUR: unrealEUR,            // converted to EUR
+          costBasisMoneyEUR: costEUR,
+          percentOfAccountNAV: n(p.percentOfNAV),
+          fxRateToBase:    fxRate,
+        };
+      }),
+      fxRates,
+    };
+  });
+
+  // Combined portfolio — aggregate across accounts in EUR
+  const totalNLV = accounts.reduce((s, a) => s + a.netLiquidation, 0);
+
+  // Merge positions by symbol across accounts
+  const symbolMap = {};
+  for (const acct of accounts) {
+    for (const p of acct.positions) {
+      if (!symbolMap[p.symbol]) {
+        symbolMap[p.symbol] = {
+          symbol:          p.symbol,
+          description:     p.description,
+          assetCategory:   p.assetCategory,
+          totalValueEUR:   0,
+          totalUnrealEUR:  0,
+          totalCostEUR:    0,
+          legs: [],
+        };
+      }
+      symbolMap[p.symbol].totalValueEUR  += p.positionValueEUR;
+      symbolMap[p.symbol].totalUnrealEUR += p.unrealizedPnlEUR;
+      symbolMap[p.symbol].totalCostEUR   += p.costBasisMoneyEUR;
+      symbolMap[p.symbol].legs.push({
+        accountId:     acct.accountId,
+        currency:      p.currency,
+        quantity:      p.quantity,
+        markPrice:     p.markPrice,
+        positionValue: p.positionValue,
+        unrealizedPnl: p.unrealizedPnl,
+        costBasisPrice: p.costBasisPrice,
+      });
+    }
+  }
+
+  const combinedPositions = Object.values(symbolMap)
+    .sort((a, b) => b.totalValueEUR - a.totalValueEUR)
+    .map(s => ({
+      ...s,
+      allocationPct: totalNLV > 0 ? (s.totalValueEUR / totalNLV) * 100 : 0,
+      totalValueEUR:  +s.totalValueEUR.toFixed(2),
+      totalUnrealEUR: +s.totalUnrealEUR.toFixed(2),
+      totalCostEUR:   +s.totalCostEUR.toFixed(2),
+      returnPct: s.totalCostEUR > 0 ? ((s.totalValueEUR - s.totalCostEUR) / s.totalCostEUR) * 100 : 0,
+    }));
+
+  return {
+    accounts,
+    combined: {
+      totalNetLiquidation: +totalNLV.toFixed(2),
+      totalCash:           +accounts.reduce((s, a) => s + a.cash, 0).toFixed(2),
+      totalStockValue:     +accounts.reduce((s, a) => s + a.stockValue, 0).toFixed(2),
+      totalUnrealizedPnlEUR: +combinedPositions.reduce((s, p) => s + p.totalUnrealEUR, 0).toFixed(2),
+      totalCommissions:    +accounts.reduce((s, a) => s + a.commissions, 0).toFixed(2),
+      totalDividends:      +accounts.reduce((s, a) => s + a.dividends, 0).toFixed(2),
+      positionCount:       combinedPositions.length,
+      positions:           combinedPositions,
+    },
+  };
+}
 
 // ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {
   switch (name) {
 
-    case "get_account_summary": {
-      const allStmts = await getFlexData(input?.refresh);
-
-      // Deduplicate — keep only the most recent statement per account
-      const byAccount = {};
-      for (const s of allStmts) {
-        const id = s.accountId;
-        if (!byAccount[id] || s.whenGenerated > byAccount[id].whenGenerated) {
-          byAccount[id] = s;
-        }
-      }
-      const stmts = Object.values(byAccount);
-
-      const accounts = stmts.map(stmt => {
-        const info = stmt?.AccountInformation || {};
-        // Equity summary — get the last (most recent) row
-        const equityRows = toArr(stmt?.EquitySummaryInBase?.EquitySummaryByReportDateInBase);
-        const equity     = equityRows[equityRows.length - 1] || {};
-        // Use OpenPositions for actual position data
-        const positions  = toArr(stmt?.OpenPositions?.OpenPosition)
-          .filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
-        const totalUnrealized = positions.reduce((s, p) => s + fmtNum(p.fifoPnlUnrealized), 0);
-        return {
-          accountId:          stmt.accountId,
-          accountName:        info.name || "",
-          currency:           info.currency || "EUR",
-          netLiquidation:     fmt(equity.total),
-          cash:               fmt(equity.cash),
-          stockValue:         fmt(equity.stock),
-          totalUnrealizedPnl: fmt(totalUnrealized),
-          totalPnl:           fmt(totalUnrealized),
-          positionCount:      positions.length,
-          positions: positions.map(p => ({
-            symbol:        p.symbol,
-            description:   p.description,
-            assetCategory: p.assetCategory,
-            quantity:      p.position,
-            markPrice:     fmt(p.markPrice),
-            positionValue: fmt(p.positionValue),
-            costBasis:     fmt(p.costBasisPrice),
-            unrealizedPnl: fmt(p.fifoPnlUnrealized),
-            percentOfNAV:  p.percentOfNAV,
-            currency:      p.currency,
-          })),
-        };
-      });
-
-      // Combined totals
-      const combined = {
-        totalNetLiquidation: fmt(accounts.reduce((s, a) => s + fmtNum(a.netLiquidation), 0)),
-        totalCash:           fmt(accounts.reduce((s, a) => s + fmtNum(a.cash), 0)),
-        totalUnrealizedPnl:  fmt(accounts.reduce((s, a) => s + fmtNum(a.totalUnrealizedPnl), 0)),
-        totalRealizedPnl:    fmt(accounts.reduce((s, a) => s + fmtNum(a.totalRealizedPnl), 0)),
-        totalPnl:            fmt(accounts.reduce((s, a) => s + fmtNum(a.totalPnl), 0)),
-      };
-
-      return { accounts, combined };
+    case "get_portfolio": {
+      return buildPortfolio(input?.refresh || false);
     }
 
     case "get_trades": {
-      const allStmts = await getFlexData();
-      const byAccount = {};
-      for (const s of allStmts) {
-        if (!byAccount[s.accountId] || s.whenGenerated > byAccount[s.accountId].whenGenerated) byAccount[s.accountId] = s;
-      }
-      const all = Object.values(byAccount).flatMap(s => toArr(s?.Trades?.Trade).map(t => ({ ...t, accountId: s.accountId })));
-      const filtered = input?.symbol ? all.filter(t => t.symbol?.toUpperCase() === input.symbol.toUpperCase()) : all;
-      return {
-        count: filtered.length,
-        trades: filtered.slice(0, 100).map(t => ({
-          accountId:   t.accountId,
+      const all   = await getStatements();
+      const stmts = latestPerAccount(all);
+      const trades = stmts.flatMap(s =>
+        toArr(s?.Trades?.Trade).map(t => ({
+          accountId:   s.accountId,
           symbol:      t.symbol,
           description: t.description,
           dateTime:    t.dateTime,
           side:        t.buySell,
-          quantity:    t.quantity,
-          price:       t.tradePrice,
+          quantity:    n(t.quantity),
+          price:       n(t.tradePrice),
           currency:    t.currency,
-          proceeds:    fmt(t.proceeds),
-          commission:  fmt(t.ibCommission),
-          realizedPnl: fmt(t.fifoPnlRealized),
+          proceeds:    n(t.proceeds),
+          commission:  n(t.ibCommission),
+          realizedPnl: n(t.fifoPnlRealized),
+          exchange:    t.exchange,
+        }))
+      );
+      const filtered = input?.symbol
+        ? trades.filter(t => t.symbol?.toUpperCase() === input.symbol.toUpperCase())
+        : trades;
+      // Sort by date descending
+      filtered.sort((a, b) => (b.dateTime || "").localeCompare(a.dateTime || ""));
+      return { count: filtered.length, trades: filtered.slice(0, 100) };
+    }
+
+    case "get_pnl": {
+      const portfolio = await buildPortfolio();
+      const { combined, accounts } = portfolio;
+      const sorted = [...combined.positions].sort((a, b) => b.totalUnrealEUR - a.totalUnrealEUR);
+      return {
+        combined: {
+          totalUnrealizedPnlEUR: combined.totalUnrealizedPnlEUR,
+          totalCommissions:      combined.totalCommissions,
+          totalDividends:        combined.totalDividends,
+          bestPositions:  sorted.slice(0, 5).map(p => ({ symbol: p.symbol, unrealizedPnlEUR: p.totalUnrealEUR, allocationPct: +p.allocationPct.toFixed(2) })),
+          worstPositions: sorted.slice(-5).reverse().map(p => ({ symbol: p.symbol, unrealizedPnlEUR: p.totalUnrealEUR, allocationPct: +p.allocationPct.toFixed(2) })),
+        },
+        perAccount: accounts.map(a => ({
+          accountId:    a.accountId,
+          baseCurrency: a.baseCurrency,
+          unrealizedPnl: a.positions.reduce((s, p) => s + p.unrealizedPnl, 0).toFixed(2),
+          commissions:  a.commissions.toFixed(2),
+          dividends:    a.dividends.toFixed(2),
+          brokerInterest: a.brokerInterest.toFixed(2),
         })),
       };
     }
 
-    case "get_cash": {
-      const allStmts = await getFlexData();
-      const byAccount = {};
-      for (const s of allStmts) {
-        if (!byAccount[s.accountId] || s.whenGenerated > byAccount[s.accountId].whenGenerated) byAccount[s.accountId] = s;
-      }
-      const stmts = Object.values(byAccount);
+    case "get_allocation": {
+      const portfolio = await buildPortfolio();
       return {
-        accounts: stmts.map(s => {
-          const rows = toArr(s?.CashReport?.CashReportCurrency);
-          const base = rows.find(c => c.currency === "BASE_SUMMARY") || rows[0] || {};
-          return {
-            accountId:         s.accountId,
-            endingCash:        fmt(base.endingCash),
-            endingSettledCash: fmt(base.endingSettledCash),
-            commissions:       fmt(base.commissions),
-            deposits:          fmt(base.deposits),
-            withdrawals:       fmt(base.withdrawals),
-            dividends:         fmt(base.dividends),
-            brokerInterest:    fmt(base.brokerInterest),
-          };
-        }),
-      };
-    }
-
-    case "get_pnl_summary": {
-      const allStmts = await getFlexData();
-      const byAccount = {};
-      for (const s of allStmts) {
-        if (!byAccount[s.accountId] || s.whenGenerated > byAccount[s.accountId].whenGenerated) byAccount[s.accountId] = s;
-      }
-      const stmts = Object.values(byAccount);
-      return {
-        accounts: stmts.map(s => {
-          const positions = toArr(s?.OpenPositions?.OpenPosition).filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
-          const perf      = toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying).filter(p => p.symbol);
-          const sorted    = [...positions].sort((a, b) => fmtNum(b.fifoPnlUnrealized) - fmtNum(a.fifoPnlUnrealized));
-          const cashRows  = toArr(s?.CashReport?.CashReportCurrency);
-          const base      = cashRows.find(c => c.currency === "BASE_SUMMARY") || {};
-          const totalU    = positions.reduce((sum, p) => sum + fmtNum(p.fifoPnlUnrealized), 0);
-          const totalR    = perf.reduce((sum, p) => sum + fmtNum(p.totalRealizedPnl), 0);
-          return {
-            accountId:          s.accountId,
-            totalRealizedPnl:   fmt(totalR),
-            totalUnrealizedPnl: fmt(totalU),
-            totalPnl:           fmt(totalR + totalU),
-            commissions:        fmt(base.commissions),
-            dividends:          fmt(base.dividends),
-            brokerInterest:     fmt(base.brokerInterest),
-            bestPositions:      sorted.slice(0, 3).map(p => ({ symbol: p.symbol, unrealizedPnl: fmt(p.fifoPnlUnrealized) })),
-            worstPositions:     sorted.slice(-3).reverse().map(p => ({ symbol: p.symbol, unrealizedPnl: fmt(p.fifoPnlUnrealized) })),
-          };
-        }),
+        totalNLV_EUR: portfolio.combined.totalNetLiquidation,
+        allocations: portfolio.combined.positions.map(p => ({
+          symbol:       p.symbol,
+          description:  p.description,
+          valueEUR:     p.totalValueEUR,
+          allocationPct: +p.allocationPct.toFixed(2),
+          unrealizedPnlEUR: p.totalUnrealEUR,
+          returnPct:    +p.returnPct.toFixed(2),
+          legs:         p.legs,
+        })),
       };
     }
 
     case "refresh_data": {
-      flexCache = null;
-      const stmts = await getFlexData(true);
-      return { ok: true, message: "Refreshed", accounts: stmts.map(s => s.accountId) };
+      _cache = null;
+      const portfolio = await buildPortfolio(true);
+      return { ok: true, message: "Data refreshed from IBKR", accounts: portfolio.accounts.map(a => a.accountId) };
     }
 
     default:
@@ -221,24 +295,50 @@ async function executeTool(name, input) {
 
 // ─── Claude agent ─────────────────────────────────────────────────
 const TOOLS = [
-  { name: "get_account_summary", description: "Get full summary for ALL accounts: positions, net liquidation, cash, P&L per account and combined totals.", input_schema: { type: "object", properties: { refresh: { type: "boolean" } }, required: [] } },
-  { name: "get_trades",          description: "Get trade history across all accounts. Filter by symbol optionally.", input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: [] } },
-  { name: "get_cash",            description: "Get cash balances, commissions, deposits, dividends for all accounts.", input_schema: { type: "object", properties: {}, required: [] } },
-  { name: "get_pnl_summary",     description: "Get P&L summary per account: realized, unrealized, best/worst positions, commissions.", input_schema: { type: "object", properties: {}, required: [] } },
-  { name: "refresh_data",        description: "Force a fresh data pull from IBKR.", input_schema: { type: "object", properties: {}, required: [] } },
+  {
+    name: "get_portfolio",
+    description: "Get complete portfolio across BOTH accounts (U11354150 EUR + U9733561 GBP). Returns per-account breakdown AND combined positions with correct EUR-converted values and true allocation percentages.",
+    input_schema: { type: "object", properties: { refresh: { type: "boolean", description: "Force fresh data from IBKR" } }, required: [] },
+  },
+  {
+    name: "get_trades",
+    description: "Get trade history across both accounts. Optionally filter by symbol.",
+    input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: [] },
+  },
+  {
+    name: "get_pnl",
+    description: "Get P&L summary across both accounts: unrealized P&L in EUR, best/worst positions, commissions, dividends.",
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "get_allocation",
+    description: "Get true portfolio allocation by symbol across both accounts, all values converted to EUR with correct percentages of total portfolio.",
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+  {
+    name: "refresh_data",
+    description: "Force fresh data pull from IBKR.",
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
 ];
 
-const SYSTEM = `You are a professional finance AI agent managing an Interactive Brokers (IBKR) account with TWO sub-accounts (U11354150 and U9733561). Data is read-only via IBKR Flex Web Service.
+const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
+- U11354150: EUR-denominated account (main)
+- U9733561: GBP-denominated account (ISA/secondary)
 
-You can view positions, P&L, trades, cash, and dividends across both accounts. Always show combined totals as well as per-account breakdowns when relevant.
+Data is read-only via IBKR Flex Web Service. All combined figures are converted to EUR.
 
-Be concise and data-driven. Format numbers with currency symbols (EUR). Today is ${new Date().toDateString()}.`;
+Portfolio holdings: CSNDX (Nasdaq 100 USD), CSPX (S&P 500 USD), CSSX5E (Euro Stoxx 50 EUR), IEEM (MSCI EM USD), IUSE (S&P 500 EUR-hedged), NQSE (Nasdaq 100 EUR-hedged), SPCX (SpaceX), VUAG (Vanguard S&P500 GBP), VWRL (Vanguard All-World GBP), VFEM (Vanguard EM GBP).
+
+When showing allocations, ALWAYS use the combined portfolio percentages from get_allocation or get_portfolio combined.positions, NOT per-account percentOfNAV.
+
+Format: EUR amounts with € sign, GBP with £, USD with $. 2 decimal places. Today: ${new Date().toDateString()}.`;
 
 async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
-  let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 1500, system: SYSTEM, tools: TOOLS, messages });
+  let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 2000, system: SYSTEM, tools: TOOLS, messages });
   let loop = [...messages], i = 0;
-  while (response.stop_reason === "tool_use" && i++ < 8) {
+  while (response.stop_reason === "tool_use" && i++ < 10) {
     loop.push({ role: "assistant", content: response.content });
     const results = await Promise.all(
       response.content.filter(b => b.type === "tool_use").map(async b => {
@@ -248,16 +348,16 @@ async function runAgent(prompt, history = []) {
       })
     );
     loop.push({ role: "user", content: results });
-    response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 1500, system: SYSTEM, tools: TOOLS, messages: loop });
+    response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 2000, system: SYSTEM, tools: TOOLS, messages: loop });
   }
   return response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
 }
 
 // ─── Push ─────────────────────────────────────────────────────────
 const pushSubs = new Map();
-async function sendPush(title, body, icon = "📈", data = {}) {
+async function sendPush(title, body, icon = "📈") {
   if (!VAPID_PUBLIC || !VAPID_PRIVATE || !pushSubs.size) return;
-  const payload = JSON.stringify({ title, body, icon, data, timestamp: Date.now() });
+  const payload = JSON.stringify({ title, body, icon, timestamp: Date.now() });
   const expired = [];
   for (const [id, sub] of pushSubs.entries()) {
     try { await webpush.sendNotification(sub, payload); }
@@ -268,10 +368,26 @@ async function sendPush(title, body, icon = "📈", data = {}) {
 
 // ─── Scheduled tasks ──────────────────────────────────────────────
 const TASKS = [
-  { id: "morning", label: "Morning briefing",  icon: "🌅", cron: "30 8 * * 1-5",  prompt: "Get account summary for both accounts. Morning briefing: combined net liquidation, combined P&L, top 3 positions across both accounts, any position down >5%. Keep it short." },
-  { id: "midday",  label: "Midday check",      icon: "☀️", cron: "0 12 * * 1-5",  prompt: "Quick midday: get P&L summary for both accounts. Combined unrealized P&L. 3 sentences." },
-  { id: "eod",     label: "End-of-day summary",icon: "🌆", cron: "30 16 * * 1-5", prompt: "End of day: account summary and trades for both accounts. Combined totals, today's trades, overall P&L." },
-  { id: "weekly",  label: "Weekly review",     icon: "⚖️", cron: "0 15 * * 5",    prompt: "Weekly review across both accounts: combined P&L, best/worst positions, trades made this week, commissions paid, any concentration risks." },
+  {
+    id: "morning", label: "Morning briefing", icon: "🌅",
+    cron: "30 8 * * 1-5",
+    prompt: "Morning briefing across both accounts: get portfolio. Show combined NLV in EUR, combined unrealized P&L, top 5 positions by allocation %, any position with unrealized loss > €500. Keep it concise.",
+  },
+  {
+    id: "midday", label: "Midday check", icon: "☀️",
+    cron: "0 12 * * 1-5",
+    prompt: "Quick midday check: get P&L. Show combined unrealized P&L in EUR, best and worst performer today. 3 sentences.",
+  },
+  {
+    id: "eod", label: "End-of-day summary", icon: "🌆",
+    cron: "30 16 * * 1-5",
+    prompt: "End of day report: get portfolio and trades. Show combined NLV, unrealized P&L, any trades executed today across both accounts, top movers.",
+  },
+  {
+    id: "weekly", label: "Weekly review", icon: "⚖️",
+    cron: "0 15 * * 5",
+    prompt: "Weekly review: get portfolio, allocation, P&L, and trades. Show combined NLV, full allocation breakdown by symbol with %, total unrealized P&L, trades this week, commissions paid, and any concentration risk (any single position > 30%).",
+  },
 ];
 
 const taskState = {};
@@ -297,7 +413,7 @@ TASKS.forEach(task => {
   }, { timezone: "America/New_York" });
 });
 
-// ─── Routes ───────────────────────────────────────────────────────
+// ─── API Routes ───────────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
   const { message, history = [] } = req.body;
   if (!message) return res.status(400).json({ error: "message required" });
@@ -306,7 +422,7 @@ app.post("/api/chat", async (req, res) => {
 });
 
 app.get("/api/account", async (req, res) => {
-  try { res.json(await executeTool("get_account_summary", {})); }
+  try { res.json(await buildPortfolio()); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -337,6 +453,7 @@ app.post("/api/tasks/:id/run", async (req, res) => {
 });
 
 app.get("/api/log", (req, res) => res.json(taskLog.slice(0, 50)));
+
 app.get("/api/push/vapid-key", (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
 app.post("/api/push/subscribe", (req, res) => {
   const sub = req.body;
@@ -352,42 +469,24 @@ app.post("/api/push/unsubscribe", (req, res) => {
 });
 app.post("/api/push/test", async (req, res) => {
   await sendPush("✅ Test", "Push notifications working!", "✅");
-  res.json({ ok: true });
+  res.json({ ok: true, subscribers: pushSubs.size });
 });
+
 app.get("/api/ibkr/status", async (req, res) => {
   try {
-    const stmts = await getFlexData();
-    res.json({ authenticated: true, mode: "flex_web_service", accounts: stmts.map(s => s.accountId) });
+    const portfolio = await buildPortfolio();
+    res.json({
+      authenticated: true,
+      mode: "flex_web_service",
+      accounts: portfolio.accounts.map(a => ({ id: a.accountId, currency: a.baseCurrency, nlv: a.netLiquidation })),
+      combinedNLV_EUR: portfolio.combined.totalNetLiquidation,
+    });
   } catch (e) {
     res.status(503).json({ authenticated: false, error: e.message });
   }
 });
+
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`🚀 IBKR Agent on port ${PORT}`));
-
-// Debug endpoint — remove after fixing
-app.get("/api/debug/structure", async (req, res) => {
-  try {
-    const stmts = await getFlexData(true);
-    const structure = stmts.map(s => ({
-      accountId: s.accountId,
-      sections: Object.keys(s),
-      FIFOCount: toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying).length,
-      OpenPositionsCount: toArr(s?.OpenPositions?.OpenPosition).length,
-      TradesCount: toArr(s?.Trades?.Trade).length,
-      EquitySummaryCount: toArr(s?.EquitySummaryInBase?.EquitySummaryByReportDateInBase).length,
-      // Show first FIFO item keys if exists
-      firstFIFOKeys: toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)[0] 
-        ? Object.keys(toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)[0])
-        : [],
-      firstOpenPosKeys: toArr(s?.OpenPositions?.OpenPosition)[0]
-        ? Object.keys(toArr(s?.OpenPositions?.OpenPosition)[0])
-        : [],
-    }));
-    res.json(structure);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});

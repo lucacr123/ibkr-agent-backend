@@ -118,15 +118,24 @@ async function buildPortfolio(force = false) {
     const cashRows  = toArr(stmt?.CashReport?.CashReportCurrency);
     const baseCash  = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
 
+    // Convert account base currency to EUR
+    // e.g. U9733561 is GBP — fxRates[GBP] = 1.1601 meaning 1 GBP = 1.1601 EUR
+    const baseCurrency = info.currency || "EUR";
+    const acctFxToEUR  = baseCurrency === "EUR" ? 1 : (fxRates[baseCurrency] || 1);
+
     return {
       accountId:    stmt.accountId,
       accountName:  info.name || "",
-      baseCurrency: info.currency || "EUR",
-      // Balances (in account base currency, already converted by IBKR)
-      netLiquidation: n(equity.total),
-      cash:           n(equity.cash),
-      stockValue:     n(equity.stock),
-      dividendAccruals: n(equity.dividendAccruals),
+      baseCurrency,
+      // Balances in account base currency
+      netLiquidation:    n(equity.total),
+      netLiquidationEUR: n(equity.total) * acctFxToEUR,
+      cash:              n(equity.cash),
+      cashEUR:           n(equity.cash) * acctFxToEUR,
+      stockValue:        n(equity.stock),
+      stockValueEUR:     n(equity.stock) * acctFxToEUR,
+      dividendAccruals:  n(equity.dividendAccruals),
+      acctFxToEUR,
       // Cash report
       commissions:  n(baseCash.commissions),
       deposits:     n(baseCash.deposits),
@@ -174,7 +183,7 @@ async function buildPortfolio(force = false) {
   });
 
   // Combined portfolio — aggregate across accounts in EUR
-  const totalNLV = accounts.reduce((s, a) => s + a.netLiquidation, 0);
+  const totalNLV = accounts.reduce((s, a) => s + a.netLiquidationEUR, 0);
 
   // Merge positions by symbol across accounts
   const symbolMap = {};
@@ -229,8 +238,8 @@ async function buildPortfolio(force = false) {
     accounts,
     combined: {
       totalNetLiquidation:   +totalNLV.toFixed(2),
-      totalCash:             +accounts.reduce((s, a) => s + a.cash, 0).toFixed(2),
-      totalStockValue:       +accounts.reduce((s, a) => s + a.stockValue, 0).toFixed(2),
+      totalCash:             +accounts.reduce((s, a) => s + a.cashEUR, 0).toFixed(2),
+      totalStockValue:       +accounts.reduce((s, a) => s + a.stockValueEUR, 0).toFixed(2),
       totalUnrealizedPnlEUR: totalUnrealEUR,
       totalRealizedPnlEUR:   totalRealEUR,
       totalPnlEUR:           +(totalUnrealEUR + totalRealEUR).toFixed(2),

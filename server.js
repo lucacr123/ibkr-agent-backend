@@ -10,7 +10,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── Config ──────────────────────────────────────────────────────
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY  || "";
 const FLEX_TOKEN    = process.env.IBKR_FLEX_TOKEN    || "";
 const FLEX_QUERY_ID = process.env.IBKR_FLEX_QUERY_ID || "";
@@ -21,103 +20,105 @@ const VAPID_EMAIL   = process.env.VAPID_EMAIL        || "mailto:you@example.com"
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 
-if (VAPID_PUBLIC && VAPID_PRIVATE) {
-  webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
-  console.log("✅ Push configured");
-}
+if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
 
 // ─── Flex Web Service ─────────────────────────────────────────────
 const FLEX_BASE = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService";
 
 async function fetchFlex() {
   if (!FLEX_TOKEN || !FLEX_QUERY_ID) throw new Error("IBKR_FLEX_TOKEN or IBKR_FLEX_QUERY_ID not set");
-
-  // Step 1: request
   const sendRes  = await fetch(`${FLEX_BASE}/SendRequest?t=${FLEX_TOKEN}&q=${FLEX_QUERY_ID}&v=3`, { headers: { "User-Agent": "Node/18" } });
-  const sendXml  = await sendRes.text();
-  const sendData = parser.parse(sendXml);
+  const sendData = parser.parse(await sendRes.text());
   const status   = sendData?.FlexStatementResponse?.Status;
   const refCode  = sendData?.FlexStatementResponse?.ReferenceCode;
   const url      = sendData?.FlexStatementResponse?.Url;
   if (status !== "Success") throw new Error(`Flex request failed: ${JSON.stringify(sendData)}`);
 
-  // Step 2: retrieve (retry)
   await new Promise(r => setTimeout(r, 3000));
   for (let i = 0; i < 6; i++) {
     const getRes  = await fetch(`${url}?t=${FLEX_TOKEN}&q=${refCode}&v=3`, { headers: { "User-Agent": "Node/18" } });
-    const getXml  = await getRes.text();
-    const getData = parser.parse(getXml);
-    const stmts   = getData?.FlexQueryResponse?.FlexStatements?.FlexStatement
-                 ?? getData?.FlexStatementResponse?.FlexStatements?.FlexStatement;
-    if (stmts) return Array.isArray(stmts) ? stmts[0] : stmts;
+    const getData = parser.parse(await getRes.text());
+    // Returns either FlexQueryResponse or FlexStatementResponse
+    const stmts = getData?.FlexQueryResponse?.FlexStatements?.FlexStatement
+               ?? getData?.FlexStatementResponse?.FlexStatements?.FlexStatement;
+    if (stmts) return Array.isArray(stmts) ? stmts : [stmts]; // always return array
     await new Promise(r => setTimeout(r, 2000));
   }
   throw new Error("Could not retrieve Flex report after retries");
 }
 
-// Cache 15 min
 let flexCache = null, flexCacheTime = 0;
 async function getFlexData(force = false) {
   if (!force && flexCache && Date.now() - flexCacheTime < 15 * 60 * 1000) return flexCache;
-  flexCache     = await fetchFlex();
+  flexCache     = await fetchFlex(); // array of statements
   flexCacheTime = Date.now();
   return flexCache;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
-function toArr(v) { return Array.isArray(v) ? v : v ? [v] : []; }
-function fmt(v)   { return parseFloat(v || 0).toFixed(2); }
+function toArr(v)    { return Array.isArray(v) ? v : v ? [v] : []; }
+function fmt(v)      { return parseFloat(v || 0).toFixed(2); }
+function fmtNum(v)   { return parseFloat(v || 0); }
 
 // ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {
   switch (name) {
 
     case "get_account_summary": {
-      const d = await getFlexData(input?.refresh);
+      const stmts = await getFlexData(input?.refresh);
+      const accounts = stmts.map(stmt => {
+        const info     = stmt?.AccountInformation || {};
+        // Equity summary — get the last (most recent) row
+        const equityRows = toArr(stmt?.EquitySummaryInBase?.EquitySummaryByReportDateInBase);
+        const equity     = equityRows[equityRows.length - 1] || {};
+        // Performance summary — all positions except "Total" row
+        const perf = toArr(stmt?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)
+          .filter(p => p.symbol && p.symbol !== "");
+        const totalUnrealized = perf.reduce((s, p) => s + fmtNum(p.totalUnrealizedPnl), 0);
+        const totalRealized   = perf.reduce((s, p) => s + fmtNum(p.totalRealizedPnl),   0);
+        return {
+          accountId:          stmt.accountId,
+          accountName:        info.name || "",
+          currency:           info.currency || "EUR",
+          netLiquidation:     fmt(equity.total),
+          cash:               fmt(equity.cash),
+          stockValue:         fmt(equity.stock),
+          totalUnrealizedPnl: fmt(totalUnrealized),
+          totalRealizedPnl:   fmt(totalRealized),
+          totalPnl:           fmt(totalUnrealized + totalRealized),
+          positionCount:      perf.length,
+          positions: perf.map(p => ({
+            symbol:        p.symbol,
+            description:   p.description,
+            assetCategory: p.assetCategory,
+            exchange:      p.listingExchange,
+            realizedPnl:   fmt(p.totalRealizedPnl),
+            unrealizedPnl: fmt(p.totalUnrealizedPnl),
+            totalPnl:      fmt(p.totalFifoPnl),
+          })),
+        };
+      });
 
-      // Positions from FIFOPerformanceSummaryInBase (excludes the "Total" row)
-      const perf = toArr(d?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)
-        .filter(p => p.symbol && p.symbol !== "");
-
-      // Cash from CashReport — base currency summary
-      const cashRows  = toArr(d?.CashReport?.CashReportCurrency);
-      const baseCash  = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
-
-      const totalUnrealized = perf.reduce((s, p) => s + parseFloat(p.totalUnrealizedPnl || 0), 0);
-      const totalRealized   = perf.reduce((s, p) => s + parseFloat(p.totalRealizedPnl   || 0), 0);
-
-      return {
-        accountId:       d?.accountId,
-        fromDate:        d?.fromDate,
-        toDate:          d?.toDate,
-        endingCash:      fmt(baseCash.endingCash),
-        endingSettledCash: fmt(baseCash.endingSettledCash),
-        totalUnrealizedPnl: fmt(totalUnrealized),
-        totalRealizedPnl:   fmt(totalRealized),
-        totalPnl:        fmt(totalUnrealized + totalRealized),
-        positionCount:   perf.length,
-        positions: perf.map(p => ({
-          symbol:          p.symbol,
-          description:     p.description,
-          assetCategory:   p.assetCategory,
-          subCategory:     p.subCategory,
-          exchange:        p.listingExchange,
-          realizedPnl:     fmt(p.totalRealizedPnl),
-          unrealizedPnl:   fmt(p.totalUnrealizedPnl),
-          totalPnl:        fmt(p.totalFifoPnl),
-        })),
+      // Combined totals
+      const combined = {
+        totalNetLiquidation: fmt(accounts.reduce((s, a) => s + fmtNum(a.netLiquidation), 0)),
+        totalCash:           fmt(accounts.reduce((s, a) => s + fmtNum(a.cash), 0)),
+        totalUnrealizedPnl:  fmt(accounts.reduce((s, a) => s + fmtNum(a.totalUnrealizedPnl), 0)),
+        totalRealizedPnl:    fmt(accounts.reduce((s, a) => s + fmtNum(a.totalRealizedPnl), 0)),
+        totalPnl:            fmt(accounts.reduce((s, a) => s + fmtNum(a.totalPnl), 0)),
       };
+
+      return { accounts, combined };
     }
 
     case "get_trades": {
-      const d      = await getFlexData();
-      const trades = toArr(d?.Trades?.Trade);
-      const filtered = input?.symbol
-        ? trades.filter(t => t.symbol?.toUpperCase() === input.symbol.toUpperCase())
-        : trades;
+      const stmts  = await getFlexData();
+      const all    = stmts.flatMap(s => toArr(s?.Trades?.Trade).map(t => ({ ...t, accountId: s.accountId })));
+      const filtered = input?.symbol ? all.filter(t => t.symbol?.toUpperCase() === input.symbol.toUpperCase()) : all;
       return {
         count: filtered.length,
         trades: filtered.slice(0, 100).map(t => ({
+          accountId:   t.accountId,
           symbol:      t.symbol,
           description: t.description,
           dateTime:    t.dateTime,
@@ -133,52 +134,54 @@ async function executeTool(name, input) {
     }
 
     case "get_cash": {
-      const d       = await getFlexData();
-      const rows    = toArr(d?.CashReport?.CashReportCurrency);
+      const stmts = await getFlexData();
       return {
-        currencies: rows.map(c => ({
-          currency:          c.currency,
-          endingCash:        fmt(c.endingCash),
-          endingSettledCash: fmt(c.endingSettledCash),
-          commissions:       fmt(c.commissions),
-          deposits:          fmt(c.deposits),
-          withdrawals:       fmt(c.withdrawals),
-          dividends:         fmt(c.dividends),
-          brokerInterest:    fmt(c.brokerInterest),
-        })),
+        accounts: stmts.map(s => {
+          const rows = toArr(s?.CashReport?.CashReportCurrency);
+          const base = rows.find(c => c.currency === "BASE_SUMMARY") || rows[0] || {};
+          return {
+            accountId:         s.accountId,
+            endingCash:        fmt(base.endingCash),
+            endingSettledCash: fmt(base.endingSettledCash),
+            commissions:       fmt(base.commissions),
+            deposits:          fmt(base.deposits),
+            withdrawals:       fmt(base.withdrawals),
+            dividends:         fmt(base.dividends),
+            brokerInterest:    fmt(base.brokerInterest),
+          };
+        }),
       };
     }
 
     case "get_pnl_summary": {
-      const d    = await getFlexData();
-      const perf = toArr(d?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)
-        .filter(p => p.symbol);
-
-      const totalRow = toArr(d?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)
-        .find(p => p.description === "Total (All Assets)");
-
-      const cashRows = toArr(d?.CashReport?.CashReportCurrency);
-      const base     = cashRows.find(c => c.currency === "BASE_SUMMARY") || {};
-
-      // Best and worst positions
-      const sorted = [...perf].sort((a, b) => parseFloat(b.totalFifoPnl) - parseFloat(a.totalFifoPnl));
-
+      const stmts = await getFlexData();
       return {
-        totalRealizedPnl:   fmt(totalRow?.totalRealizedPnl),
-        totalUnrealizedPnl: fmt(totalRow?.totalUnrealizedPnl),
-        totalFifoPnl:       fmt(totalRow?.totalFifoPnl),
-        commissions:        fmt(base.commissions),
-        dividends:          fmt(base.dividends),
-        brokerInterest:     fmt(base.brokerInterest),
-        bestPositions:  sorted.slice(0, 3).map(p => ({ symbol: p.symbol, totalPnl: fmt(p.totalFifoPnl) })),
-        worstPositions: sorted.slice(-3).reverse().map(p => ({ symbol: p.symbol, totalPnl: fmt(p.totalFifoPnl) })),
+        accounts: stmts.map(s => {
+          const perf   = toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying).filter(p => p.symbol);
+          const sorted = [...perf].sort((a, b) => fmtNum(b.totalFifoPnl) - fmtNum(a.totalFifoPnl));
+          const cashRows = toArr(s?.CashReport?.CashReportCurrency);
+          const base     = cashRows.find(c => c.currency === "BASE_SUMMARY") || {};
+          const totalR   = perf.reduce((s, p) => s + fmtNum(p.totalRealizedPnl),   0);
+          const totalU   = perf.reduce((s, p) => s + fmtNum(p.totalUnrealizedPnl), 0);
+          return {
+            accountId:          s.accountId,
+            totalRealizedPnl:   fmt(totalR),
+            totalUnrealizedPnl: fmt(totalU),
+            totalPnl:           fmt(totalR + totalU),
+            commissions:        fmt(base.commissions),
+            dividends:          fmt(base.dividends),
+            brokerInterest:     fmt(base.brokerInterest),
+            bestPositions:      sorted.slice(0, 3).map(p => ({ symbol: p.symbol, totalPnl: fmt(p.totalFifoPnl) })),
+            worstPositions:     sorted.slice(-3).reverse().map(p => ({ symbol: p.symbol, totalPnl: fmt(p.totalFifoPnl) })),
+          };
+        }),
       };
     }
 
     case "refresh_data": {
       flexCache = null;
-      const d = await getFlexData(true);
-      return { ok: true, message: "Refreshed from IBKR", accountId: d?.accountId };
+      const stmts = await getFlexData(true);
+      return { ok: true, message: "Refreshed", accounts: stmts.map(s => s.accountId) };
     }
 
     default:
@@ -188,32 +191,23 @@ async function executeTool(name, input) {
 
 // ─── Claude agent ─────────────────────────────────────────────────
 const TOOLS = [
-  { name: "get_account_summary", description: "Get full IBKR account: all positions with realized/unrealized P&L, cash balance.", input_schema: { type: "object", properties: { refresh: { type: "boolean" } }, required: [] } },
-  { name: "get_trades",          description: "Get trade history, optionally filtered by symbol.", input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: [] } },
-  { name: "get_cash",            description: "Get cash balances by currency including commissions, deposits, dividends.", input_schema: { type: "object", properties: {}, required: [] } },
-  { name: "get_pnl_summary",     description: "Get P&L summary: realized, unrealized, best/worst positions, commissions.", input_schema: { type: "object", properties: {}, required: [] } },
+  { name: "get_account_summary", description: "Get full summary for ALL accounts: positions, net liquidation, cash, P&L per account and combined totals.", input_schema: { type: "object", properties: { refresh: { type: "boolean" } }, required: [] } },
+  { name: "get_trades",          description: "Get trade history across all accounts. Filter by symbol optionally.", input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: [] } },
+  { name: "get_cash",            description: "Get cash balances, commissions, deposits, dividends for all accounts.", input_schema: { type: "object", properties: {}, required: [] } },
+  { name: "get_pnl_summary",     description: "Get P&L summary per account: realized, unrealized, best/worst positions, commissions.", input_schema: { type: "object", properties: {}, required: [] } },
   { name: "refresh_data",        description: "Force a fresh data pull from IBKR.", input_schema: { type: "object", properties: {}, required: [] } },
 ];
 
-const SYSTEM = `You are a professional finance AI agent with read access to an Interactive Brokers (IBKR) account.
+const SYSTEM = `You are a professional finance AI agent managing an Interactive Brokers (IBKR) account with TWO sub-accounts (U11354150 and U9733561). Data is read-only via IBKR Flex Web Service.
 
-The portfolio contains ETFs and stocks. Data comes from IBKR's Flex Web Service (read-only — no order placement).
+You can view positions, P&L, trades, cash, and dividends across both accounts. Always show combined totals as well as per-account breakdowns when relevant.
 
-You can:
-- Show all positions with P&L
-- Analyse trade history
-- Check cash balances, commissions, dividends
-- Summarise realized and unrealized P&L
-- Identify best/worst performers
-- Analyse portfolio concentration
-
-Be concise and data-driven. Format numbers with currency symbols. Today is ${new Date().toDateString()}.`;
+Be concise and data-driven. Format numbers with currency symbols (EUR). Today is ${new Date().toDateString()}.`;
 
 async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
   let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 1500, system: SYSTEM, tools: TOOLS, messages });
-  let loop = [...messages];
-  let i = 0;
+  let loop = [...messages], i = 0;
   while (response.stop_reason === "tool_use" && i++ < 8) {
     loop.push({ role: "assistant", content: response.content });
     const results = await Promise.all(
@@ -244,10 +238,10 @@ async function sendPush(title, body, icon = "📈", data = {}) {
 
 // ─── Scheduled tasks ──────────────────────────────────────────────
 const TASKS = [
-  { id: "morning",   label: "Morning briefing",   icon: "🌅", cron: "30 8 * * 1-5",  prompt: "Get account summary and P&L summary. Give a morning briefing: total P&L, top 3 positions, any position down more than 5%. Keep it short." },
-  { id: "midday",    label: "Midday check",        icon: "☀️", cron: "0 12 * * 1-5",  prompt: "Quick midday check: get P&L summary. Any notable P&L changes? 3 sentences max." },
-  { id: "eod",       label: "End-of-day summary",  icon: "🌆", cron: "30 16 * * 1-5", prompt: "End of day: get account summary, trades today, and P&L. List today's trades and overall portfolio P&L." },
-  { id: "weekly",    label: "Weekly review",       icon: "⚖️", cron: "0 15 * * 5",    prompt: "Weekly review: get account summary, P&L summary, and all trades. Summarise the week: total P&L, best/worst positions, trades made, commissions paid." },
+  { id: "morning", label: "Morning briefing",  icon: "🌅", cron: "30 8 * * 1-5",  prompt: "Get account summary for both accounts. Morning briefing: combined net liquidation, combined P&L, top 3 positions across both accounts, any position down >5%. Keep it short." },
+  { id: "midday",  label: "Midday check",      icon: "☀️", cron: "0 12 * * 1-5",  prompt: "Quick midday: get P&L summary for both accounts. Combined unrealized P&L. 3 sentences." },
+  { id: "eod",     label: "End-of-day summary",icon: "🌆", cron: "30 16 * * 1-5", prompt: "End of day: account summary and trades for both accounts. Combined totals, today's trades, overall P&L." },
+  { id: "weekly",  label: "Weekly review",     icon: "⚖️", cron: "0 15 * * 5",    prompt: "Weekly review across both accounts: combined P&L, best/worst positions, trades made this week, commissions paid, any concentration risks." },
 ];
 
 const taskState = {};
@@ -287,11 +281,13 @@ app.get("/api/account", async (req, res) => {
 });
 
 app.get("/api/tasks", (req, res) => res.json(TASKS.map(t => ({ ...t, ...taskState[t.id] }))));
+
 app.patch("/api/tasks/:id", (req, res) => {
   if (!taskState[req.params.id]) return res.status(404).json({ error: "Not found" });
   taskState[req.params.id].enabled = req.body.enabled;
   res.json({ ok: true });
 });
+
 app.post("/api/tasks/:id/run", async (req, res) => {
   const task = TASKS.find(t => t.id === req.params.id);
   if (!task) return res.status(404).json({ error: "Not found" });
@@ -311,7 +307,6 @@ app.post("/api/tasks/:id/run", async (req, res) => {
 });
 
 app.get("/api/log", (req, res) => res.json(taskLog.slice(0, 50)));
-
 app.get("/api/push/vapid-key", (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
 app.post("/api/push/subscribe", (req, res) => {
   const sub = req.body;
@@ -329,16 +324,14 @@ app.post("/api/push/test", async (req, res) => {
   await sendPush("✅ Test", "Push notifications working!", "✅");
   res.json({ ok: true });
 });
-
 app.get("/api/ibkr/status", async (req, res) => {
   try {
-    const d = await getFlexData();
-    res.json({ authenticated: true, mode: "flex_web_service", accountId: d?.accountId });
+    const stmts = await getFlexData();
+    res.json({ authenticated: true, mode: "flex_web_service", accounts: stmts.map(s => s.accountId) });
   } catch (e) {
     res.status(503).json({ authenticated: false, error: e.message });
   }
 });
-
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
 
 const PORT = process.env.PORT || 3001;

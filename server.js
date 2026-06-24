@@ -97,6 +97,10 @@ async function buildPortfolio(force = false) {
   const stmts = latestPerAccount(all);
 
   // Per-account data
+  // Build master EUR-based FX rates from the EUR account (most reliable)
+  const eurStmt    = stmts.find(s => (s?.AccountInformation?.currency || "EUR") === "EUR") || stmts[0];
+  const masterFxRates = getFxRates(eurStmt); // EUR-based: GBP=1.1601, USD=0.87861, etc.
+
   const accounts = stmts.map(stmt => {
     const info      = stmt?.AccountInformation || {};
     const fxRates   = getFxRates(stmt);
@@ -118,10 +122,10 @@ async function buildPortfolio(force = false) {
     const cashRows  = toArr(stmt?.CashReport?.CashReportCurrency);
     const baseCash  = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
 
-    // Convert account base currency to EUR
-    // e.g. U9733561 is GBP — fxRates[GBP] = 1.1601 meaning 1 GBP = 1.1601 EUR
+    // Convert account base currency to EUR using master (EUR-based) FX rates
+    // e.g. U9733561 is GBP — masterFxRates["GBP"] = 1.1601 meaning 1 GBP = 1.1601 EUR
     const baseCurrency = info.currency || "EUR";
-    const acctFxToEUR  = baseCurrency === "EUR" ? 1 : (fxRates[baseCurrency] || 1);
+    const acctFxToEUR  = baseCurrency === "EUR" ? 1 : (masterFxRates[baseCurrency] || 1);
 
     return {
       accountId:    stmt.accountId,

@@ -4,13 +4,13 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js",
-    "generate-vapid": "npx web-push generate-vapid-keys"
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.30.0",
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "fast-xml-parser": "^4.4.1",
     "node-cron": "^3.0.3",
     "node-fetch": "^3.3.2",
     "web-push": "^3.6.7"

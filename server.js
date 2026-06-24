@@ -104,6 +104,17 @@ async function buildPortfolio(force = false) {
     const equity    = equityRows[equityRows.length - 1] || {};
     const positions = toArr(stmt?.OpenPositions?.OpenPosition)
       .filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
+
+    // P&L by symbol from Realized & Unrealized Performance Summary
+    const pnlBySymbol = {};
+    toArr(stmt?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)
+      .filter(p => p.symbol).forEach(p => { pnlBySymbol[p.symbol] = p; });
+
+    // YTD by symbol from MTD/YTD Performance Summary
+    const ytdBySymbol = {};
+    toArr(stmt?.MTDYTDPerformanceSummary?.MTDYTDPerformanceSummaryUnderlying)
+      .filter(p => p.symbol).forEach(p => { ytdBySymbol[p.symbol] = p; });
+
     const cashRows  = toArr(stmt?.CashReport?.CashReportCurrency);
     const baseCash  = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
 
@@ -124,25 +135,38 @@ async function buildPortfolio(force = false) {
       brokerInterest: n(baseCash.brokerInterest),
       // Positions
       positions: positions.map(p => {
-        const fxRate      = n(p.fxRateToBase) || fxRates[p.currency] || 1;
-        const valueEUR    = n(p.positionValue) * fxRate;
-        const unrealEUR   = n(p.fifoPnlUnrealized) * fxRate;
-        const costEUR     = n(p.costBasisMoney) * fxRate;
+        const fxRate    = n(p.fxRateToBase) || fxRates[p.currency] || 1;
+        const pnl       = pnlBySymbol[p.symbol] || {};
+        const ytd       = ytdBySymbol[p.symbol] || {};
+        const valueEUR  = n(p.positionValue) * fxRate;
+        // Use P&L from performance summary (more reliable than OpenPositions)
+        const unrealRaw = n(pnl.totalUnrealizedPnl) || n(p.fifoPnlUnrealized);
+        const unrealEUR = unrealRaw * fxRate;
+        const realRaw   = n(pnl.totalRealizedPnl);
+        const costMoney = n(p.costBasisMoney);
+        const costEUR   = costMoney * fxRate;
         return {
-          symbol:          p.symbol,
-          description:     p.description,
-          assetCategory:   p.assetCategory,
-          currency:        p.currency,
-          quantity:        n(p.position),
-          markPrice:       n(p.markPrice),
-          costBasisPrice:  n(p.costBasisPrice),
-          positionValue:   n(p.positionValue),    // in position currency
-          positionValueEUR: valueEUR,             // converted to EUR
-          unrealizedPnl:   n(p.fifoPnlUnrealized), // in position currency
-          unrealizedPnlEUR: unrealEUR,            // converted to EUR
-          costBasisMoneyEUR: costEUR,
+          symbol:             p.symbol,
+          description:        p.description,
+          assetCategory:      p.assetCategory,
+          currency:           p.currency,
+          quantity:           n(p.position),
+          markPrice:          n(p.markPrice),
+          costBasisPrice:     n(p.costBasisPrice),
+          positionValue:      n(p.positionValue),
+          positionValueEUR:   valueEUR,
+          unrealizedPnl:      unrealRaw,
+          unrealizedPnlEUR:   unrealEUR,
+          realizedPnl:        realRaw,
+          costBasisMoneyEUR:  costEUR,
+          returnPct:          costMoney > 0 ? ((n(p.positionValue) - costMoney) / costMoney) * 100 : 0,
           percentOfAccountNAV: n(p.percentOfNAV),
-          fxRateToBase:    fxRate,
+          fxRateToBase:       fxRate,
+          // YTD performance
+          ytdPnl:             n(ytd.markToMarketYTD),
+          mtdPnl:             n(ytd.markToMarketMTD),
+          realizedYTD:        n(ytd.realizedPLYTD),
+          realizedMTD:        n(ytd.realizedPLMTD),
         };
       }),
       fxRates,
@@ -163,7 +187,10 @@ async function buildPortfolio(force = false) {
           assetCategory:   p.assetCategory,
           totalValueEUR:   0,
           totalUnrealEUR:  0,
+          totalRealEUR:    0,
           totalCostEUR:    0,
+          totalYtdPnl:     0,
+          totalMtdPnl:     0,
           legs: [],
         };
       }
@@ -193,17 +220,27 @@ async function buildPortfolio(force = false) {
       returnPct: s.totalCostEUR > 0 ? ((s.totalValueEUR - s.totalCostEUR) / s.totalCostEUR) * 100 : 0,
     }));
 
+  const totalUnrealEUR = +combinedPositions.reduce((s, p) => s + p.totalUnrealEUR, 0).toFixed(2);
+  const totalRealEUR   = +combinedPositions.reduce((s, p) => s + p.totalRealEUR, 0).toFixed(2);
+  const totalYtdPnl    = +combinedPositions.reduce((s, p) => s + p.totalYtdPnl, 0).toFixed(2);
+  const totalMtdPnl    = +combinedPositions.reduce((s, p) => s + p.totalMtdPnl, 0).toFixed(2);
+
   return {
     accounts,
     combined: {
-      totalNetLiquidation: +totalNLV.toFixed(2),
-      totalCash:           +accounts.reduce((s, a) => s + a.cash, 0).toFixed(2),
-      totalStockValue:     +accounts.reduce((s, a) => s + a.stockValue, 0).toFixed(2),
-      totalUnrealizedPnlEUR: +combinedPositions.reduce((s, p) => s + p.totalUnrealEUR, 0).toFixed(2),
-      totalCommissions:    +accounts.reduce((s, a) => s + a.commissions, 0).toFixed(2),
-      totalDividends:      +accounts.reduce((s, a) => s + a.dividends, 0).toFixed(2),
-      positionCount:       combinedPositions.length,
-      positions:           combinedPositions,
+      totalNetLiquidation:   +totalNLV.toFixed(2),
+      totalCash:             +accounts.reduce((s, a) => s + a.cash, 0).toFixed(2),
+      totalStockValue:       +accounts.reduce((s, a) => s + a.stockValue, 0).toFixed(2),
+      totalUnrealizedPnlEUR: totalUnrealEUR,
+      totalRealizedPnlEUR:   totalRealEUR,
+      totalPnlEUR:           +(totalUnrealEUR + totalRealEUR).toFixed(2),
+      totalYtdPnlEUR:        totalYtdPnl,
+      totalMtdPnlEUR:        totalMtdPnl,
+      totalCommissions:      +accounts.reduce((s, a) => s + a.commissions, 0).toFixed(2),
+      totalDividends:        +accounts.reduce((s, a) => s + a.dividends, 0).toFixed(2),
+      totalBrokerInterest:   +accounts.reduce((s, a) => s + a.brokerInterest, 0).toFixed(2),
+      positionCount:         combinedPositions.length,
+      positions:             combinedPositions,
     },
   };
 }

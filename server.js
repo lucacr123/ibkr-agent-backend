@@ -349,6 +349,109 @@ async function executeTool(name, input) {
       return { ok: true, message: "Data refreshed from IBKR", accounts: portfolio.accounts.map(a => a.accountId) };
     }
 
+    case "get_market_data": {
+      // Yahoo Finance v8 quote endpoint — works for any global symbol
+      const sym = input.symbol.toUpperCase();
+      const res = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
+        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
+      );
+      const data = await res.json();
+      const meta = data?.chart?.result?.[0]?.meta;
+      if (!meta) return { error: `No data found for ${sym}` };
+      return {
+        symbol:           meta.symbol,
+        shortName:        meta.shortName,
+        currency:         meta.currency,
+        exchange:         meta.exchangeName,
+        regularMarketPrice:     meta.regularMarketPrice,
+        previousClose:          meta.chartPreviousClose,
+        change:                 +(meta.regularMarketPrice - meta.chartPreviousClose).toFixed(4),
+        changePct:              +(((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose) * 100).toFixed(2),
+        regularMarketDayHigh:   meta.regularMarketDayHigh,
+        regularMarketDayLow:    meta.regularMarketDayLow,
+        regularMarketVolume:    meta.regularMarketVolume,
+        fiftyTwoWeekHigh:       meta.fiftyTwoWeekHigh,
+        fiftyTwoWeekLow:        meta.fiftyTwoWeekLow,
+        marketCap:              meta.marketCap,
+        timezone:               meta.timezone,
+      };
+    }
+
+    case "get_historical_data": {
+      // OHLCV history for any symbol — used for charting
+      const sym      = input.symbol.toUpperCase();
+      const range    = input.range    || "1y";   // 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
+      const interval = input.interval || "1d";   // 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
+      const res = await fetch(
+        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=${interval}&range=${range}`,
+        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
+      );
+      const data   = await res.json();
+      const result = data?.chart?.result?.[0];
+      if (!result) return { error: `No historical data for ${sym}` };
+      const { timestamp, indicators } = result;
+      const q = indicators?.quote?.[0] || {};
+      const bars = (timestamp || []).map((t, i) => ({
+        date:   new Date(t * 1000).toISOString().slice(0, 10),
+        open:   q.open?.[i]   ? +q.open[i].toFixed(4)   : null,
+        high:   q.high?.[i]   ? +q.high[i].toFixed(4)   : null,
+        low:    q.low?.[i]    ? +q.low[i].toFixed(4)     : null,
+        close:  q.close?.[i]  ? +q.close[i].toFixed(4)  : null,
+        volume: q.volume?.[i] || null,
+      })).filter(b => b.close !== null);
+      return {
+        symbol:   sym,
+        currency: result.meta?.currency,
+        range,
+        interval,
+        count:    bars.length,
+        bars,
+      };
+    }
+
+    case "get_multiple_quotes": {
+      // Batch quotes for multiple symbols
+      const symbols = (input.symbols || []).map(s => s.toUpperCase()).join(",");
+      const res = await fetch(
+        `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}`,
+        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
+      );
+      const data = await res.json();
+      const quotes = data?.quoteResponse?.result || [];
+      return quotes.map(q => ({
+        symbol:       q.symbol,
+        shortName:    q.shortName,
+        currency:     q.currency,
+        price:        q.regularMarketPrice,
+        change:       +((q.regularMarketPrice - q.regularMarketPreviousClose) || 0).toFixed(4),
+        changePct:    q.regularMarketChangePercent ? +q.regularMarketChangePercent.toFixed(2) : 0,
+        dayHigh:      q.regularMarketDayHigh,
+        dayLow:       q.regularMarketDayLow,
+        volume:       q.regularMarketVolume,
+        marketCap:    q.marketCap,
+        pe:           q.trailingPE,
+        week52High:   q.fiftyTwoWeekHigh,
+        week52Low:    q.fiftyTwoWeekLow,
+      }));
+    }
+
+    case "search_symbol": {
+      // Search for a ticker symbol by name
+      const res = await fetch(
+        `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(input.query)}&quotesCount=10&newsCount=0`,
+        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
+      );
+      const data = await res.json();
+      return (data?.quotes || []).map(q => ({
+        symbol:   q.symbol,
+        shortName: q.shortname,
+        longName:  q.longname,
+        exchange:  q.exchange,
+        type:      q.quoteType,
+      }));
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -381,6 +484,38 @@ const TOOLS = [
     description: "Force fresh data pull from IBKR.",
     input_schema: { type: "object", properties: {}, required: [] },
   },
+  {
+    name: "get_market_data",
+    description: "Get real-time quote for any stock or ETF worldwide (price, change, 52w high/low, volume, market cap). Works for any Yahoo Finance symbol e.g. AAPL, CSPX.L, CSSX5E.SW, BTC-USD.",
+    input_schema: { type: "object", properties: { symbol: { type: "string", description: "Yahoo Finance ticker e.g. AAPL, CSPX.L, ^GSPC" } }, required: ["symbol"] },
+  },
+  {
+    name: "get_historical_data",
+    description: "Get OHLCV price history for any symbol for charting. Use range: 1d,5d,1mo,3mo,6mo,1y,2y,5y,ytd,max. Use interval: 1m,5m,1h,1d,1wk,1mo.",
+    input_schema: {
+      type: "object",
+      properties: {
+        symbol:   { type: "string" },
+        range:    { type: "string", description: "Time range: 1d,5d,1mo,3mo,6mo,1y,2y,5y,ytd,max. Default: 1y" },
+        interval: { type: "string", description: "Bar interval: 1m,5m,15m,1h,1d,1wk,1mo. Default: 1d" },
+      },
+      required: ["symbol"],
+    },
+  },
+  {
+    name: "get_multiple_quotes",
+    description: "Get live quotes for multiple symbols at once. Good for comparing portfolio holdings.",
+    input_schema: {
+      type: "object",
+      properties: { symbols: { type: "array", items: { type: "string" }, description: "Array of Yahoo Finance tickers" } },
+      required: ["symbols"],
+    },
+  },
+  {
+    name: "search_symbol",
+    description: "Search for a ticker symbol by company or ETF name.",
+    input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
+  },
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
@@ -390,6 +525,11 @@ const SYSTEM = `You are a professional finance AI agent managing TWO Interactive
 Data is read-only via IBKR Flex Web Service. All combined figures are converted to EUR.
 
 Portfolio holdings: CSNDX (Nasdaq 100 USD), CSPX (S&P 500 USD), CSSX5E (Euro Stoxx 50 EUR), IEEM (MSCI EM USD), IUSE (S&P 500 EUR-hedged), NQSE (Nasdaq 100 EUR-hedged), SPCX (SpaceX), VUAG (Vanguard S&P500 GBP), VWRL (Vanguard All-World GBP), VFEM (Vanguard EM GBP).
+
+Yahoo Finance symbol mapping for your holdings:
+CSPX → CSPX.L, CSNDX → IUSA.L (or use CNDX.SW), CSSX5E → CSSX5E.SW, IEEM → IEEM.L, IUSE → IUSE.L, NQSE → NQSE.DE, VUAG → VUAG.L, VWRL → VWRL.L, VFEM → VFEM.L, SPCX → use RKLB or SpaceX is private.
+
+You can fetch market data and charts for ANY stock or ETF worldwide. When asked to show a chart, use get_historical_data and tell the user a chart will be displayed in the app. For portfolio-wide quotes use get_multiple_quotes with all holding symbols.
 
 When showing allocations, ALWAYS use the combined portfolio percentages from get_allocation or get_portfolio combined.positions, NOT per-account percentOfNAV.
 
@@ -524,6 +664,31 @@ app.post("/api/tasks/:id/run", async (req, res) => {
 });
 
 app.get("/api/log", (req, res) => res.json(taskLog.slice(0, 50)));
+
+// Market data endpoints — used by frontend charts directly
+app.get("/api/chart/:symbol", async (req, res) => {
+  try {
+    const { symbol } = req.params;
+    const { range = "1y", interval = "1d" } = req.query;
+    const data = await executeTool("get_historical_data", { symbol, range, interval });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/quote/:symbol", async (req, res) => {
+  try {
+    const data = await executeTool("get_market_data", { symbol: req.params.symbol });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get("/api/quotes", async (req, res) => {
+  try {
+    const symbols = (req.query.symbols || "").split(",").filter(Boolean);
+    const data = await executeTool("get_multiple_quotes", { symbols });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 app.get("/api/push/vapid-key", (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
 app.post("/api/push/subscribe", (req, res) => {

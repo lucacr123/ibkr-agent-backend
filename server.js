@@ -300,29 +300,61 @@ async function executeTool(name, input) {
       const closes = bars.map(b => b.close);
       const r      = rets(closes);
 
-      // Rolling series
-      const priceZscore    = rollingFn(closes, win, arr => { const last = arr[arr.length-1], m = mean(arr), s = std(arr); return s === 0 ? 0 : (last - m) / s; });
-      const rollingSharpe  = rollingFn(r, win, arr => sharpe(arr));
-      const rollingVol     = rollingFn(r, win, arr => std(arr) * Math.sqrt(252) * 100);
-      const drawdownSeries = (() => { let peak = -Infinity; return closes.map(c => { if (c > peak) peak = c; return ((c - peak) / peak) * 100; }); })();
+      // ── Rolling series ──────────────────────────────────────────
+      // Dates for returns are shifted by 1 (returns[i] = date[i+1])
+      const retDates = dates.slice(1);
 
-      // Benchmark
-      let betaVal = null, corrVal = null;
+      // Z-score of RETURNS (not price) — window=252 like pandas
+      const WIN_Z = 252;
+      const returnZscore = rollingFn(r, WIN_Z, arr => {
+        const last = arr[arr.length - 1], m = mean(arr), s = std(arr);
+        return s === 0 ? 0 : +((last - m) / s).toFixed(4);
+      });
+      // Pad front so it aligns with retDates
+      const priceZscore = new Array(1).fill(null).concat(returnZscore); // align back to dates[]
+
+      // Rolling Sharpe — exactly like pandas: mean(returns)/std(returns), window=252, no annualisation
+      const WIN_SHARPE = 252;
+      const rollingSharpeRaw = rollingFn(r, WIN_SHARPE, arr => {
+        const m = mean(arr), s = std(arr);
+        return s === 0 ? 0 : +(m / s).toFixed(4);
+      });
+      const rollingSharpe = new Array(1).fill(null).concat(rollingSharpeRaw);
+
+      // Rolling Vol — annualised std of returns × √252, window=30
+      const WIN_VOL = 30;
+      const rollingVolRaw = rollingFn(r, WIN_VOL, arr => +(std(arr) * Math.sqrt(252) * 100).toFixed(4));
+      const rollingVol = new Array(1).fill(null).concat(rollingVolRaw);
+
+      // Drawdown on closes (peaks use price, result is %)
+      const drawdownSeries = (() => {
+        let peak = -Infinity;
+        return closes.map(c => { if (c > peak) peak = c; return +((c - peak) / peak * 100).toFixed(4); });
+      })();
+
+      // Benchmark for scalar beta/corr
+      let betaVal = null, corrVal = null, benchRets = null;
       try {
         const { bars: bb } = await fetchYahooCloses(bench, range);
-        const bc = bb.map(b => b.close);
-        const len = Math.min(r.length, rets(bc).length);
-        const ar_ = r.slice(-len), br_ = rets(bc).slice(-len);
-        betaVal = betaFn(ar_, br_);
-        corrVal = corrFn(ar_, br_);
+        const bc  = bb.map(b => b.close);
+        const br  = rets(bc);
+        const len = Math.min(r.length, br.length);
+        const ar_ = r.slice(-len), br_ = br.slice(-len);
+        betaVal   = betaFn(ar_, br_);
+        corrVal   = corrFn(ar_, br_);
+        benchRets = br_;
       } catch {}
 
       const summary = {
-        currentPrice: closes[closes.length-1], totalReturn: ((closes[closes.length-1]/closes[0])-1)*100,
-        annualizedVol: std(r) * Math.sqrt(252) * 100, sharpe: sharpe(r), sortino: sortino(r),
-        maxDrawdown: maxDD(closes), beta: betaVal, correlation: corrVal,
-        currentPriceZscore: priceZscore[priceZscore.length-1],
-        skewness: (() => { const m=mean(r),s=std(r); return s===0?0:mean(r.map(v=>((v-m)/s)**3)); })(),
+        currentPrice:       closes[closes.length - 1],
+        totalReturn:        +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
+        annualizedVol:      +(std(r) * Math.sqrt(252) * 100).toFixed(2),
+        sharpe:             +(mean(r) / std(r)).toFixed(4),   // same formula as pandas (no annualisation)
+        sortino:            +sortino(r).toFixed(4),
+        maxDrawdown:        +maxDD(closes).toFixed(2),
+        beta:               betaVal !== null ? +betaVal.toFixed(4) : null,
+        correlation:        corrVal !== null ? +corrVal.toFixed(4) : null,
+        currentReturnZscore: returnZscore[returnZscore.length - 1],
       };
 
       const series = { dates, closes, priceZscore, rollingSharpe, rollingVol, drawdownSeries };

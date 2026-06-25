@@ -10,52 +10,46 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY  || "";
-const FLEX_TOKEN    = process.env.IBKR_FLEX_TOKEN    || "";
-const FLEX_QUERY_ID = process.env.IBKR_FLEX_QUERY_ID || "";
-const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY   || "";
-const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY  || "";
-const VAPID_EMAIL   = process.env.VAPID_EMAIL        || "mailto:you@example.com";
+// ─── Config ───────────────────────────────────────────────────────
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || "";
+const FLEX_TOKEN    = process.env.IBKR_FLEX_TOKEN   || "";
+const FLEX_QUERY_ID = process.env.IBKR_FLEX_QUERY_ID|| "";
+const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || "";
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "";
+const VAPID_EMAIL   = process.env.VAPID_EMAIL       || "mailto:you@example.com";
 
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
-
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
 
 // ─── Helpers ──────────────────────────────────────────────────────
-const toArr = v  => Array.isArray(v) ? v : v ? [v] : [];
-const n     = v  => parseFloat(v || 0);
-const fmt   = v  => n(v).toFixed(2);
+const toArr = v => Array.isArray(v) ? v : v ? [v] : [];
+const n     = v => parseFloat(v || 0);
+const fmt   = v => n(v).toFixed(2);
 
 // ─── Flex Web Service ─────────────────────────────────────────────
 const FLEX_BASE = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService";
 
 async function fetchFlex() {
   if (!FLEX_TOKEN || !FLEX_QUERY_ID) throw new Error("Missing IBKR_FLEX_TOKEN or IBKR_FLEX_QUERY_ID");
-
-  // Step 1 — request report generation
   const sendRes  = await fetch(`${FLEX_BASE}/SendRequest?t=${FLEX_TOKEN}&q=${FLEX_QUERY_ID}&v=3`, { headers: { "User-Agent": "Node/18" } });
   const sendData = parser.parse(await sendRes.text());
   if (sendData?.FlexStatementResponse?.Status !== "Success")
     throw new Error(`Flex SendRequest failed: ${JSON.stringify(sendData)}`);
-
   const refCode = sendData.FlexStatementResponse.ReferenceCode;
   const url     = sendData.FlexStatementResponse.Url;
-
-  // Step 2 — retrieve report (wait for IBKR to generate it)
   await new Promise(r => setTimeout(r, 8000));
   for (let i = 0; i < 10; i++) {
-    const res     = await fetch(`${url}?t=${FLEX_TOKEN}&q=${refCode}&v=3`, { headers: { "User-Agent": "Node/18" } });
-    const getData = parser.parse(await res.text());
-    const raw     = getData?.FlexQueryResponse?.FlexStatements?.FlexStatement
-                 ?? getData?.FlexStatementResponse?.FlexStatements?.FlexStatement;
+    const res  = await fetch(`${url}?t=${FLEX_TOKEN}&q=${refCode}&v=3`, { headers: { "User-Agent": "Node/18" } });
+    const data = parser.parse(await res.text());
+    const raw  = data?.FlexQueryResponse?.FlexStatements?.FlexStatement
+              ?? data?.FlexStatementResponse?.FlexStatements?.FlexStatement;
     if (raw) return Array.isArray(raw) ? raw : [raw];
     await new Promise(r => setTimeout(r, 3000 + i * 1000));
   }
   throw new Error("Flex report never became available after retries");
 }
 
-// Cache 15 min
 let _cache = null, _cacheTime = 0;
 async function getStatements(force = false) {
   if (!force && _cache && Date.now() - _cacheTime < 15 * 60 * 1000) return _cache;
@@ -64,9 +58,6 @@ async function getStatements(force = false) {
   return _cache;
 }
 
-// ─── Data layer ───────────────────────────────────────────────────
-// Deduplicate statements: IBKR returns one FlexStatement per day per account.
-// We want only the LATEST statement per account.
 function latestPerAccount(stmts) {
   const map = {};
   for (const s of stmts) {
@@ -76,65 +67,40 @@ function latestPerAccount(stmts) {
   return Object.values(map);
 }
 
-// Get FX rates from statements (currency → rate to base EUR)
 function getFxRates(stmt) {
   const rates = { EUR: 1 };
-  toArr(stmt?.ConversionRates?.ConversionRate).forEach(r => {
-    rates[r.fromCurrency] = n(r.rate);
-  });
+  toArr(stmt?.ConversionRates?.ConversionRate).forEach(r => { rates[r.fromCurrency] = n(r.rate); });
   return rates;
 }
 
-// Convert value to EUR using fx rates
-function toEUR(value, currency, fxRates) {
-  const rate = fxRates[currency] ?? 1;
-  return n(value) * rate;
-}
-
-// ─── Build portfolio object ───────────────────────────────────────
+// ─── Build portfolio ──────────────────────────────────────────────
 async function buildPortfolio(force = false) {
   const all   = await getStatements(force);
   const stmts = latestPerAccount(all);
 
-  // Per-account data
-  // Build master EUR-based FX rates from the EUR account (most reliable)
-  const eurStmt    = stmts.find(s => (s?.AccountInformation?.currency || "EUR") === "EUR") || stmts[0];
-  const masterFxRates = getFxRates(eurStmt); // EUR-based: GBP=1.1601, USD=0.87861, etc.
+  const eurStmt       = stmts.find(s => (s?.AccountInformation?.currency || "EUR") === "EUR") || stmts[0];
+  const masterFxRates = getFxRates(eurStmt);
 
   const accounts = stmts.map(stmt => {
     const info      = stmt?.AccountInformation || {};
     const fxRates   = getFxRates(stmt);
     const equityRows = toArr(stmt?.EquitySummaryInBase?.EquitySummaryByReportDateInBase);
     const equity    = equityRows[equityRows.length - 1] || {};
-    const positions = toArr(stmt?.OpenPositions?.OpenPosition)
-      .filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
-
-    // MTM Performance Summary — has priorOpenMtm (unrealized P&L) per symbol
+    const positions = toArr(stmt?.OpenPositions?.OpenPosition).filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
     const mtmBySymbol = {};
-    toArr(stmt?.MTMPerformanceSummaryInBase?.MTMPerformanceSummaryUnderlying)
-      .filter(p => p.symbol).forEach(p => { mtmBySymbol[p.symbol] = p; });
-
-    // MTD/YTD Performance Summary
+    toArr(stmt?.MTMPerformanceSummaryInBase?.MTMPerformanceSummaryUnderlying).filter(p => p.symbol).forEach(p => { mtmBySymbol[p.symbol] = p; });
     const ytdBySymbol = {};
-    toArr(stmt?.MTDYTDPerformanceSummary?.MTDYTDPerformanceSummaryUnderlying)
-      .filter(p => p.symbol).forEach(p => { ytdBySymbol[p.symbol] = p; });
-
-    // Change in NAV — account-level YTD return
+    toArr(stmt?.MTDYTDPerformanceSummary?.MTDYTDPerformanceSummaryUnderlying).filter(p => p.symbol).forEach(p => { ytdBySymbol[p.symbol] = p; });
+    const cashRows = toArr(stmt?.CashReport?.CashReportCurrency);
+    const baseCash = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
     const changeInNAV = stmt?.ChangeInNAV || {};
-
-    const cashRows  = toArr(stmt?.CashReport?.CashReportCurrency);
-    const baseCash  = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
-
-    // Convert account base currency to EUR using master (EUR-based) FX rates
-    // e.g. U9733561 is GBP — masterFxRates["GBP"] = 1.1601 meaning 1 GBP = 1.1601 EUR
     const baseCurrency = info.currency || "EUR";
     const acctFxToEUR  = baseCurrency === "EUR" ? 1 : (masterFxRates[baseCurrency] || 1);
 
     return {
-      accountId:    stmt.accountId,
-      accountName:  info.name || "",
+      accountId:         stmt.accountId,
+      accountName:       info.name || "",
       baseCurrency,
-      // Balances in account base currency
       netLiquidation:    n(equity.total),
       netLiquidationEUR: n(equity.total) * acctFxToEUR,
       cash:              n(equity.cash),
@@ -143,109 +109,63 @@ async function buildPortfolio(force = false) {
       stockValueEUR:     n(equity.stock) * acctFxToEUR,
       dividendAccruals:  n(equity.dividendAccruals),
       acctFxToEUR,
-      // Account-level performance from ChangeInNAV
-      ytdReturn:      n(changeInNAV.twr),          // time-weighted return %
-      startingValue:  n(changeInNAV.startingValue) * acctFxToEUR,
-      endingValue:    n(changeInNAV.endingValue)   * acctFxToEUR,
-      ytdGainEUR:     (n(changeInNAV.endingValue) - n(changeInNAV.startingValue)) * acctFxToEUR,
-      // Cash report
-      commissions:  n(baseCash.commissions),
-      deposits:     n(baseCash.deposits),
-      withdrawals:  n(baseCash.withdrawals),
-      dividends:    n(baseCash.dividends),
+      ytdReturn:     n(changeInNAV.twr),
+      startingValue: n(changeInNAV.startingValue) * acctFxToEUR,
+      endingValue:   n(changeInNAV.endingValue)   * acctFxToEUR,
+      ytdGainEUR:    (n(changeInNAV.endingValue) - n(changeInNAV.startingValue)) * acctFxToEUR,
+      commissions:   n(baseCash.commissions),
+      deposits:      n(baseCash.deposits),
+      withdrawals:   n(baseCash.withdrawals),
+      dividends:     n(baseCash.dividends),
       brokerInterest: n(baseCash.brokerInterest),
-      // Positions
       positions: positions.map(p => {
         const fxRate    = n(p.fxRateToBase) || fxRates[p.currency] || 1;
         const mtm       = mtmBySymbol[p.symbol] || {};
         const ytd       = ytdBySymbol[p.symbol] || {};
         const valueEUR  = n(p.positionValue) * fxRate;
-        // priorOpenMtm = unrealized P&L on open positions (mark-to-market)
-        // It is in base currency (EUR for U11354150)
         const unrealEUR = n(mtm.priorOpenMtm);
         const unrealRaw = fxRate > 0 ? unrealEUR / fxRate : unrealEUR;
-        const realRaw   = 0; // realized P&L not available in Flex for this account
         const costMoney = n(p.costBasisMoney);
         const costEUR   = costMoney * fxRate;
         return {
-          symbol:             p.symbol,
-          description:        p.description,
-          assetCategory:      p.assetCategory,
-          currency:           p.currency,
-          quantity:           n(p.position),
-          markPrice:          n(p.markPrice),
-          costBasisPrice:     n(p.costBasisPrice),
-          positionValue:      n(p.positionValue),
-          positionValueEUR:   valueEUR,
-          unrealizedPnl:      unrealRaw,
-          unrealizedPnlEUR:   unrealEUR,
-          realizedPnl:        realRaw,
-          costBasisMoneyEUR:  costEUR,
-          returnPct:          costMoney > 0 ? ((n(p.positionValue) - costMoney) / costMoney) * 100 : 0,
-          percentOfAccountNAV: n(p.percentOfNAV),
-          fxRateToBase:       fxRate,
-          // YTD performance
-          ytdPnl:             n(ytd.markToMarketYTD),
-          mtdPnl:             n(ytd.markToMarketMTD),
-          realizedYTD:        n(ytd.realizedPLYTD),
-          realizedMTD:        n(ytd.realizedPLMTD),
+          symbol: p.symbol, description: p.description, assetCategory: p.assetCategory,
+          currency: p.currency, quantity: n(p.position), markPrice: n(p.markPrice),
+          costBasisPrice: n(p.costBasisPrice), positionValue: n(p.positionValue),
+          positionValueEUR: valueEUR, unrealizedPnl: unrealRaw, unrealizedPnlEUR: unrealEUR,
+          costBasisMoneyEUR: costEUR, returnPct: costMoney > 0 ? ((n(p.positionValue) - costMoney) / costMoney) * 100 : 0,
+          percentOfAccountNAV: n(p.percentOfNAV), fxRateToBase: fxRate,
+          ytdPnl: n(ytd.markToMarketYTD), mtdPnl: n(ytd.markToMarketMTD),
         };
       }),
       fxRates,
     };
   });
 
-  // Combined portfolio — aggregate across accounts in EUR
   const totalNLV = accounts.reduce((s, a) => s + a.netLiquidationEUR, 0);
-
-  // Merge positions by symbol across accounts
   const symbolMap = {};
   for (const acct of accounts) {
     for (const p of acct.positions) {
       if (!symbolMap[p.symbol]) {
-        symbolMap[p.symbol] = {
-          symbol:          p.symbol,
-          description:     p.description,
-          assetCategory:   p.assetCategory,
-          totalValueEUR:   0,
-          totalUnrealEUR:  0,
-          totalRealEUR:    0,
-          totalCostEUR:    0,
-          totalYtdPnl:     0,
-          totalMtdPnl:     0,
-          legs: [],
-        };
+        symbolMap[p.symbol] = { symbol: p.symbol, description: p.description, assetCategory: p.assetCategory,
+          totalValueEUR: 0, totalUnrealEUR: 0, totalCostEUR: 0, totalYtdPnl: 0, legs: [] };
       }
       symbolMap[p.symbol].totalValueEUR  += p.positionValueEUR;
       symbolMap[p.symbol].totalUnrealEUR += p.unrealizedPnlEUR;
       symbolMap[p.symbol].totalCostEUR   += p.costBasisMoneyEUR;
-      symbolMap[p.symbol].legs.push({
-        accountId:     acct.accountId,
-        currency:      p.currency,
-        quantity:      p.quantity,
-        markPrice:     p.markPrice,
-        positionValue: p.positionValue,
-        unrealizedPnl: p.unrealizedPnl,
-        costBasisPrice: p.costBasisPrice,
-      });
+      symbolMap[p.symbol].totalYtdPnl    += (p.ytdPnl || 0);
+      symbolMap[p.symbol].legs.push({ accountId: acct.accountId, currency: p.currency, quantity: p.quantity,
+        markPrice: p.markPrice, positionValue: p.positionValue, unrealizedPnl: p.unrealizedPnl, costBasisPrice: p.costBasisPrice });
     }
   }
 
   const combinedPositions = Object.values(symbolMap)
     .sort((a, b) => b.totalValueEUR - a.totalValueEUR)
-    .map(s => ({
-      ...s,
-      allocationPct: totalNLV > 0 ? (s.totalValueEUR / totalNLV) * 100 : 0,
-      totalValueEUR:  +s.totalValueEUR.toFixed(2),
-      totalUnrealEUR: +s.totalUnrealEUR.toFixed(2),
-      totalCostEUR:   +s.totalCostEUR.toFixed(2),
-      returnPct: s.totalCostEUR > 0 ? ((s.totalValueEUR - s.totalCostEUR) / s.totalCostEUR) * 100 : 0,
-    }));
+    .map(s => ({ ...s, allocationPct: totalNLV > 0 ? (s.totalValueEUR / totalNLV) * 100 : 0,
+      totalValueEUR: +s.totalValueEUR.toFixed(2), totalUnrealEUR: +s.totalUnrealEUR.toFixed(2),
+      totalCostEUR: +s.totalCostEUR.toFixed(2), returnPct: s.totalCostEUR > 0 ? ((s.totalValueEUR - s.totalCostEUR) / s.totalCostEUR) * 100 : 0 }));
 
   const totalUnrealEUR = +combinedPositions.reduce((s, p) => s + p.totalUnrealEUR, 0).toFixed(2);
-  const totalRealEUR   = +combinedPositions.reduce((s, p) => s + p.totalRealEUR, 0).toFixed(2);
-  const totalYtdPnl    = +combinedPositions.reduce((s, p) => s + p.totalYtdPnl, 0).toFixed(2);
-  const totalMtdPnl    = +combinedPositions.reduce((s, p) => s + p.totalMtdPnl, 0).toFixed(2);
+  const totalYtdGainEUR = +accounts.reduce((s, a) => s + (a.ytdGainEUR || 0), 0).toFixed(2);
 
   return {
     accounts,
@@ -254,399 +174,184 @@ async function buildPortfolio(force = false) {
       totalCash:             +accounts.reduce((s, a) => s + a.cashEUR, 0).toFixed(2),
       totalStockValue:       +accounts.reduce((s, a) => s + a.stockValueEUR, 0).toFixed(2),
       totalUnrealizedPnlEUR: totalUnrealEUR,
-      totalRealizedPnlEUR:   totalRealEUR,
-      totalPnlEUR:           +(totalUnrealEUR + totalRealEUR).toFixed(2),
-      totalYtdPnlEUR:        totalYtdPnl,
-      totalMtdPnlEUR:        totalMtdPnl,
+      totalYtdGainEUR,
+      avgYtdReturnPct:       +(accounts.reduce((s, a) => s + (a.ytdReturn || 0), 0) / accounts.length).toFixed(2),
       totalCommissions:      +accounts.reduce((s, a) => s + a.commissions, 0).toFixed(2),
       totalDividends:        +accounts.reduce((s, a) => s + a.dividends, 0).toFixed(2),
       totalBrokerInterest:   +accounts.reduce((s, a) => s + a.brokerInterest, 0).toFixed(2),
-      totalYtdGainEUR:       +accounts.reduce((s, a) => s + (a.ytdGainEUR || 0), 0).toFixed(2),
-      avgYtdReturnPct:       +(accounts.reduce((s, a) => s + (a.ytdReturn || 0), 0) / accounts.length).toFixed(2),
       positionCount:         combinedPositions.length,
       positions:             combinedPositions,
     },
   };
 }
 
-// ─── Tool executor ────────────────────────────────────────────────
-
 // ─── Quant Analytics Engine ───────────────────────────────────────
-// Pure JS — no extra dependencies needed.
+function rets(closes)    { return closes.slice(1).map((v, i) => (v - closes[i]) / closes[i]); }
+function mean(arr)       { return arr.reduce((s, v) => s + v, 0) / arr.length; }
+function std(arr)        { const m = mean(arr); return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length); }
+function rollingFn(arr, w, fn) { const out = new Array(w - 1).fill(null); for (let i = w - 1; i < arr.length; i++) out.push(fn(arr.slice(i - w + 1, i + 1))); return out; }
+function sharpe(r, period = 252) { const m = mean(r), s = std(r); return s === 0 ? 0 : (m / s) * Math.sqrt(period); }
+function sortino(r, period = 252) { const m = mean(r); const neg = r.filter(v => v < 0); const ds = neg.length ? Math.sqrt(neg.reduce((s, v) => s + v * v, 0) / neg.length) : 0; return ds === 0 ? 0 : (m / ds) * Math.sqrt(period); }
+function maxDD(closes)   { let peak = -Infinity, dd = 0; for (const c of closes) { if (c > peak) peak = c; const d = (c - peak) / peak * 100; if (d < dd) dd = d; } return dd; }
+function betaFn(a, b)    { if (!a.length || a.length !== b.length) return null; const ma = mean(a), mb = mean(b); const cov = a.reduce((s, v, i) => s + (v - ma) * (b[i] - mb), 0) / a.length; const vb = b.reduce((s, v) => s + (v - mb) ** 2, 0) / b.length; return vb === 0 ? null : cov / vb; }
+function corrFn(a, b)    { if (!a.length || a.length !== b.length) return null; const ma = mean(a), mb = mean(b), sa = std(a), sb = std(b); if (sa === 0 || sb === 0) return null; return a.reduce((s, v, i) => s + (v - ma) * (b[i] - mb), 0) / (a.length * sa * sb); }
 
-function returns(closes) {
-  const r = [];
-  for (let i = 1; i < closes.length; i++) r.push((closes[i] - closes[i-1]) / closes[i-1]);
-  return r;
-}
-function mean(arr) { return arr.reduce((s, v) => s + v, 0) / arr.length; }
-function std(arr) {
-  const m = mean(arr);
-  return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
-}
-function zscore(arr) {
-  const m = mean(arr), s = std(arr);
-  return arr.map(v => s === 0 ? 0 : (v - m) / s);
-}
-function rollingWindow(arr, window, fn) {
-  const out = new Array(window - 1).fill(null);
-  for (let i = window - 1; i < arr.length; i++) out.push(fn(arr.slice(i - window + 1, i + 1)));
-  return out;
-}
-function annualizedSharpe(rets, rf = 0, period = 252) {
-  const excess = rets.map(r => r - rf / period);
-  const m = mean(excess), s = std(excess);
-  return s === 0 ? 0 : (m / s) * Math.sqrt(period);
-}
-function beta(assetRets, benchRets) {
-  if (assetRets.length !== benchRets.length || assetRets.length < 2) return null;
-  const ma = mean(assetRets), mb = mean(benchRets);
-  const cov  = assetRets.reduce((s, r, i) => s + (r - ma) * (benchRets[i] - mb), 0) / assetRets.length;
-  const varB = benchRets.reduce((s, r) => s + (r - mb) ** 2, 0) / benchRets.length;
-  return varB === 0 ? null : cov / varB;
-}
-function correlation(a, b) {
-  if (a.length !== b.length || a.length < 2) return null;
-  const ma = mean(a), mb = mean(b), sa = std(a), sb = std(b);
-  if (sa === 0 || sb === 0) return null;
-  return a.reduce((s, v, i) => s + (v - ma) * (b[i] - mb), 0) / (a.length * sa * sb);
-}
-function maxDrawdown(closes) {
-  let peak = -Infinity, maxDD = 0;
-  for (const c of closes) {
-    if (c > peak) peak = c;
-    const dd = (c - peak) / peak;
-    if (dd < maxDD) maxDD = dd;
-  }
-  return maxDD;
-}
-function cagr(closes, days) {
-  if (closes.length < 2 || days <= 0) return null;
-  return (closes[closes.length - 1] / closes[0]) ** (365 / days) - 1;
-}
-function sortino(rets, rf = 0, period = 252) {
-  const excess = rets.map(r => r - rf / period);
-  const negRets = excess.filter(r => r < 0);
-  const downstd = negRets.length > 0 ? Math.sqrt(negRets.reduce((s, r) => s + r ** 2, 0) / negRets.length) : 0;
-  return downstd === 0 ? 0 : (mean(excess) / downstd) * Math.sqrt(period);
-}
-
-async function fetchCloses(symbol, range = "1y") {
+async function fetchYahooCloses(symbol, range = "1y") {
   const interval = range === "1d" ? "5m" : "1d";
-  const res = await fetch(
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`,
-    { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
-  );
-  const data   = await res.json();
+  const res  = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`, { headers: { "User-Agent": "Mozilla/5.0" } });
+  const data = await res.json();
   const result = data?.chart?.result?.[0];
   if (!result) throw new Error(`No data for ${symbol}`);
   const { timestamp, indicators } = result;
   const q = indicators?.quote?.[0] || {};
-  const bars = (timestamp || []).map((t, i) => ({
-    date:  new Date(t * 1000).toISOString().slice(0, 10),
-    close: q.close?.[i] ?? null,
-  })).filter(b => b.close !== null);
+  const bars = (timestamp || []).map((t, i) => ({ date: new Date(t * 1000).toISOString().slice(0, 10), close: q.close?.[i] ?? null })).filter(b => b.close !== null);
   return { bars, meta: result.meta };
 }
 
-
+// ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {
   switch (name) {
 
-    case "get_portfolio": {
-      return buildPortfolio(input?.refresh || false);
-    }
+    case "get_portfolio":   return buildPortfolio(input?.refresh || false);
+    case "refresh_data":    { _cache = null; const p = await buildPortfolio(true); return { ok: true, accounts: p.accounts.map(a => a.accountId) }; }
 
     case "get_trades": {
-      const all   = await getStatements();
+      const all = await getStatements();
       const stmts = latestPerAccount(all);
-      const trades = stmts.flatMap(s =>
-        toArr(s?.Trades?.Trade).map(t => ({
-          accountId:   s.accountId,
-          symbol:      t.symbol,
-          description: t.description,
-          dateTime:    t.dateTime,
-          side:        t.buySell,
-          quantity:    n(t.quantity),
-          price:       n(t.tradePrice),
-          currency:    t.currency,
-          proceeds:    n(t.proceeds),
-          commission:  n(t.ibCommission),
-          realizedPnl: n(t.fifoPnlRealized),
-          exchange:    t.exchange,
-        }))
-      );
-      const filtered = input?.symbol
-        ? trades.filter(t => t.symbol?.toUpperCase() === input.symbol.toUpperCase())
-        : trades;
-      // Sort by date descending
+      const trades = stmts.flatMap(s => toArr(s?.Trades?.Trade).map(t => ({
+        accountId: s.accountId, symbol: t.symbol, description: t.description, dateTime: t.dateTime,
+        side: t.buySell, quantity: n(t.quantity), price: n(t.tradePrice), currency: t.currency,
+        proceeds: n(t.proceeds), commission: n(t.ibCommission), realizedPnl: n(t.fifoPnlRealized),
+      })));
+      const filtered = input?.symbol ? trades.filter(t => t.symbol?.toUpperCase() === input.symbol.toUpperCase()) : trades;
       filtered.sort((a, b) => (b.dateTime || "").localeCompare(a.dateTime || ""));
       return { count: filtered.length, trades: filtered.slice(0, 100) };
     }
 
     case "get_pnl": {
-      const portfolio = await buildPortfolio();
-      const { combined, accounts } = portfolio;
-      const sorted = [...combined.positions].sort((a, b) => b.totalUnrealEUR - a.totalUnrealEUR);
+      const p = await buildPortfolio();
+      const sorted = [...p.combined.positions].sort((a, b) => b.totalUnrealEUR - a.totalUnrealEUR);
       return {
-        combined: {
-          totalUnrealizedPnlEUR: combined.totalUnrealizedPnlEUR,
-          totalCommissions:      combined.totalCommissions,
-          totalDividends:        combined.totalDividends,
-          bestPositions:  sorted.slice(0, 5).map(p => ({ symbol: p.symbol, unrealizedPnlEUR: p.totalUnrealEUR, allocationPct: +p.allocationPct.toFixed(2) })),
-          worstPositions: sorted.slice(-5).reverse().map(p => ({ symbol: p.symbol, unrealizedPnlEUR: p.totalUnrealEUR, allocationPct: +p.allocationPct.toFixed(2) })),
-        },
-        perAccount: accounts.map(a => ({
-          accountId:    a.accountId,
-          baseCurrency: a.baseCurrency,
-          unrealizedPnl: a.positions.reduce((s, p) => s + p.unrealizedPnl, 0).toFixed(2),
-          commissions:  a.commissions.toFixed(2),
-          dividends:    a.dividends.toFixed(2),
-          brokerInterest: a.brokerInterest.toFixed(2),
-        })),
+        combined: { totalUnrealizedPnlEUR: p.combined.totalUnrealizedPnlEUR, totalCommissions: p.combined.totalCommissions, totalDividends: p.combined.totalDividends,
+          bestPositions: sorted.slice(0, 5).map(x => ({ symbol: x.symbol, unrealizedPnlEUR: x.totalUnrealEUR, allocationPct: +x.allocationPct.toFixed(2) })),
+          worstPositions: sorted.slice(-5).reverse().map(x => ({ symbol: x.symbol, unrealizedPnlEUR: x.totalUnrealEUR, allocationPct: +x.allocationPct.toFixed(2) })) },
+        perAccount: p.accounts.map(a => ({ accountId: a.accountId, baseCurrency: a.baseCurrency, unrealizedPnl: a.positions.reduce((s, x) => s + x.unrealizedPnl, 0).toFixed(2), commissions: a.commissions.toFixed(2), dividends: a.dividends.toFixed(2) })),
       };
     }
 
     case "get_allocation": {
-      const portfolio = await buildPortfolio();
-      return {
-        totalNLV_EUR: portfolio.combined.totalNetLiquidation,
-        allocations: portfolio.combined.positions.map(p => ({
-          symbol:       p.symbol,
-          description:  p.description,
-          valueEUR:     p.totalValueEUR,
-          allocationPct: +p.allocationPct.toFixed(2),
-          unrealizedPnlEUR: p.totalUnrealEUR,
-          returnPct:    +p.returnPct.toFixed(2),
-          legs:         p.legs,
-        })),
-      };
-    }
-
-    case "refresh_data": {
-      _cache = null;
-      const portfolio = await buildPortfolio(true);
-      return { ok: true, message: "Data refreshed from IBKR", accounts: portfolio.accounts.map(a => a.accountId) };
+      const p = await buildPortfolio();
+      return { totalNLV_EUR: p.combined.totalNetLiquidation, allocations: p.combined.positions.map(x => ({ symbol: x.symbol, description: x.description, valueEUR: x.totalValueEUR, allocationPct: +x.allocationPct.toFixed(2), unrealizedPnlEUR: x.totalUnrealEUR, legs: x.legs })) };
     }
 
     case "get_market_data": {
-      // Yahoo Finance v8 quote endpoint — works for any global symbol
       const sym = input.symbol.toUpperCase();
-      const res = await fetch(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`,
-        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
-      );
+      const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=1d`, { headers: { "User-Agent": "Mozilla/5.0" } });
       const data = await res.json();
       const meta = data?.chart?.result?.[0]?.meta;
-      if (!meta) return { error: `No data found for ${sym}` };
-      return {
-        symbol:           meta.symbol,
-        shortName:        meta.shortName,
-        currency:         meta.currency,
-        exchange:         meta.exchangeName,
-        regularMarketPrice:     meta.regularMarketPrice,
-        previousClose:          meta.chartPreviousClose,
-        change:                 +(meta.regularMarketPrice - meta.chartPreviousClose).toFixed(4),
-        changePct:              +(((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose) * 100).toFixed(2),
-        regularMarketDayHigh:   meta.regularMarketDayHigh,
-        regularMarketDayLow:    meta.regularMarketDayLow,
-        regularMarketVolume:    meta.regularMarketVolume,
-        fiftyTwoWeekHigh:       meta.fiftyTwoWeekHigh,
-        fiftyTwoWeekLow:        meta.fiftyTwoWeekLow,
-        marketCap:              meta.marketCap,
-        timezone:               meta.timezone,
-      };
+      if (!meta) return { error: `No data for ${sym}` };
+      return { symbol: meta.symbol, shortName: meta.shortName, currency: meta.currency, exchange: meta.exchangeName,
+        regularMarketPrice: meta.regularMarketPrice, previousClose: meta.chartPreviousClose,
+        change: +(meta.regularMarketPrice - meta.chartPreviousClose).toFixed(4),
+        changePct: +(((meta.regularMarketPrice - meta.chartPreviousClose) / meta.chartPreviousClose) * 100).toFixed(2),
+        regularMarketDayHigh: meta.regularMarketDayHigh, regularMarketDayLow: meta.regularMarketDayLow,
+        regularMarketVolume: meta.regularMarketVolume, fiftyTwoWeekHigh: meta.fiftyTwoWeekHigh, fiftyTwoWeekLow: meta.fiftyTwoWeekLow };
     }
 
     case "get_historical_data": {
-      // OHLCV history for any symbol — used for charting
       const sym      = input.symbol.toUpperCase();
-      const range    = input.range    || "1y";   // 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max
-      const interval = input.interval || "1d";   // 1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo
-      const res = await fetch(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=${interval}&range=${range}`,
-        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
-      );
-      const data   = await res.json();
+      const range    = input.range    || "1y";
+      const interval = input.interval || "1d";
+      const res  = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=${interval}&range=${range}`, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const data = await res.json();
       const result = data?.chart?.result?.[0];
-      if (!result) return { error: `No historical data for ${sym}` };
+      if (!result) return { error: `No data for ${sym}` };
       const { timestamp, indicators } = result;
       const q = indicators?.quote?.[0] || {};
-      const bars = (timestamp || []).map((t, i) => ({
-        date:   new Date(t * 1000).toISOString().slice(0, 10),
-        open:   q.open?.[i]   ? +q.open[i].toFixed(4)   : null,
-        high:   q.high?.[i]   ? +q.high[i].toFixed(4)   : null,
-        low:    q.low?.[i]    ? +q.low[i].toFixed(4)     : null,
-        close:  q.close?.[i]  ? +q.close[i].toFixed(4)  : null,
-        volume: q.volume?.[i] || null,
-      })).filter(b => b.close !== null);
-      return {
-        symbol:   sym,
-        currency: result.meta?.currency,
-        range,
-        interval,
-        count:    bars.length,
-        bars,
-      };
+      const bars = (timestamp || []).map((t, i) => ({ date: new Date(t * 1000).toISOString().slice(0, 10), open: q.open?.[i] ? +q.open[i].toFixed(4) : null, high: q.high?.[i] ? +q.high[i].toFixed(4) : null, low: q.low?.[i] ? +q.low[i].toFixed(4) : null, close: q.close?.[i] ? +q.close[i].toFixed(4) : null, volume: q.volume?.[i] || null })).filter(b => b.close !== null);
+      return { symbol: sym, currency: result.meta?.currency, range, interval, count: bars.length, bars };
     }
 
     case "get_multiple_quotes": {
-      // Batch quotes for multiple symbols
       const symbols = (input.symbols || []).map(s => s.toUpperCase()).join(",");
-      const res = await fetch(
-        `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}`,
-        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
-      );
+      const res  = await fetch(`https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}`, { headers: { "User-Agent": "Mozilla/5.0" } });
       const data = await res.json();
-      const quotes = data?.quoteResponse?.result || [];
-      return quotes.map(q => ({
-        symbol:       q.symbol,
-        shortName:    q.shortName,
-        currency:     q.currency,
-        price:        q.regularMarketPrice,
-        change:       +((q.regularMarketPrice - q.regularMarketPreviousClose) || 0).toFixed(4),
-        changePct:    q.regularMarketChangePercent ? +q.regularMarketChangePercent.toFixed(2) : 0,
-        dayHigh:      q.regularMarketDayHigh,
-        dayLow:       q.regularMarketDayLow,
-        volume:       q.regularMarketVolume,
-        marketCap:    q.marketCap,
-        pe:           q.trailingPE,
-        week52High:   q.fiftyTwoWeekHigh,
-        week52Low:    q.fiftyTwoWeekLow,
-      }));
+      return (data?.quoteResponse?.result || []).map(q => ({ symbol: q.symbol, shortName: q.shortName, currency: q.currency,
+        price: q.regularMarketPrice, change: +((q.regularMarketPrice - q.regularMarketPreviousClose) || 0).toFixed(4),
+        changePct: q.regularMarketChangePercent ? +q.regularMarketChangePercent.toFixed(2) : 0,
+        dayHigh: q.regularMarketDayHigh, dayLow: q.regularMarketDayLow, volume: q.regularMarketVolume,
+        marketCap: q.marketCap, pe: q.trailingPE, week52High: q.fiftyTwoWeekHigh, week52Low: q.fiftyTwoWeekLow }));
     }
 
     case "search_symbol": {
-      // Search for a ticker symbol by name
-      const res = await fetch(
-        `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(input.query)}&quotesCount=10&newsCount=0`,
-        { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
-      );
+      const res  = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(input.query)}&quotesCount=10&newsCount=0`, { headers: { "User-Agent": "Mozilla/5.0" } });
       const data = await res.json();
-      return (data?.quotes || []).map(q => ({
-        symbol:   q.symbol,
-        shortName: q.shortname,
-        longName:  q.longname,
-        exchange:  q.exchange,
-        type:      q.quoteType,
-      }));
+      return (data?.quotes || []).map(q => ({ symbol: q.symbol, shortName: q.shortname, longName: q.longname, exchange: q.exchange, type: q.quoteType }));
     }
 
     case "compute_analytics": {
-      // Fetch price series and compute quant metrics
-      const sym     = input.symbol.toUpperCase();
-      const range   = input.range || "1y";
-      const bench   = input.benchmark || "^GSPC"; // default benchmark = S&P 500
-      const window  = input.rolling_window || 30;  // rolling window in days
+      const sym    = input.symbol.toUpperCase();
+      const range  = input.range   || "1y";
+      const bench  = input.benchmark || "^GSPC";
+      const win    = input.rolling_window || 30;
 
-      // Fetch asset
-      const { bars, meta } = await fetchCloses(sym, range);
+      const { bars, meta } = await fetchYahooCloses(sym, range);
       const dates  = bars.map(b => b.date);
       const closes = bars.map(b => b.close);
-      const rets   = returns(closes);
-      const days   = dates.length;
+      const r      = rets(closes);
 
-      // Fetch benchmark for beta/correlation
-      let benchRets = null, betaVal = null, corrVal = null;
+      // Rolling series
+      const priceZscore    = rollingFn(closes, win, arr => { const last = arr[arr.length-1], m = mean(arr), s = std(arr); return s === 0 ? 0 : (last - m) / s; });
+      const rollingSharpe  = rollingFn(r, win, arr => sharpe(arr));
+      const rollingVol     = rollingFn(r, win, arr => std(arr) * Math.sqrt(252) * 100);
+      const drawdownSeries = (() => { let peak = -Infinity; return closes.map(c => { if (c > peak) peak = c; return ((c - peak) / peak) * 100; }); })();
+
+      // Benchmark
+      let betaVal = null, corrVal = null;
       try {
-        const { bars: bb } = await fetchCloses(bench, range);
-        // Align lengths
-        const len = Math.min(rets.length, returns(bb.map(b => b.close)).length);
-        const ar  = rets.slice(-len);
-        const br  = returns(bb.map(b => b.close)).slice(-len);
-        betaVal = beta(ar, br);
-        corrVal = correlation(ar, br);
-        benchRets = br;
+        const { bars: bb } = await fetchYahooCloses(bench, range);
+        const bc = bb.map(b => b.close);
+        const len = Math.min(r.length, rets(bc).length);
+        const ar_ = r.slice(-len), br_ = rets(bc).slice(-len);
+        betaVal = betaFn(ar_, br_);
+        corrVal = corrFn(ar_, br_);
       } catch {}
 
-      // Rolling metrics (using daily returns)
-      const rollingSharpe = rollingWindow(rets, window, r => annualizedSharpe(r));
-      const rollingVol    = rollingWindow(rets, window, r => std(r) * Math.sqrt(252) * 100); // annualised %
-      const rollingMean   = rollingWindow(rets, window, r => mean(r) * 252 * 100); // annualised %
-
-      // Z-score of price (how many std devs from rolling mean)
-      const priceZscore   = rollingWindow(closes, window, arr => {
-        const last = arr[arr.length - 1];
-        const m = mean(arr), s = std(arr);
-        return s === 0 ? 0 : (last - m) / s;
-      });
-
-      // Current Z-score of price (last 1Y)
-      const allZscores    = zscore(closes);
-      const currentZscore = allZscores[allZscores.length - 1];
-
-      // Drawdown series
-      let peak = -Infinity;
-      const drawdownSeries = closes.map(c => {
-        if (c > peak) peak = c;
-        return ((c - peak) / peak) * 100;
-      });
-
-      const result = {
-        symbol:   sym,
-        benchmark: bench,
-        range,
-        currency: meta?.currency,
-        // Summary stats
-        summary: {
-          currentPrice:      closes[closes.length - 1],
-          totalReturn:       ((closes[closes.length - 1] / closes[0]) - 1) * 100,
-          cagr:              (cagr(closes, days) * 100),
-          annualizedVol:     std(rets) * Math.sqrt(252) * 100,
-          sharpe:            annualizedSharpe(rets),
-          sortino:           sortino(rets),
-          maxDrawdown:       maxDrawdown(closes) * 100,
-          beta:              betaVal,
-          correlation:       corrVal,
-          currentPriceZscore: currentZscore,
-          skewness:          (() => { const m=mean(rets),s=std(rets); return s===0?0:mean(rets.map(r=>((r-m)/s)**3)); })(),
-        },
-        // Time series for charting — include dates
-        series: {
-          dates,
-          closes,
-          priceZscore,      // [CHART_DATA:priceZscore]
-          rollingSharpe,    // [CHART_DATA:rollingSharpe]
-          rollingVol,       // [CHART_DATA:rollingVol]
-          rollingMean,      // [CHART_DATA:rollingMean]
-          drawdownSeries,   // [CHART_DATA:drawdown]
-          allZscores,       // z-score of all daily returns
-        },
-        chartTags: {
-          price:        `@@CHART:${sym}:${range}@@`,
-          zscore:       `@@QUANT:${sym}:priceZscore:${range}:Z-Score (${window}d rolling)@@`,
-          rollingSharpe:`@@QUANT:${sym}:rollingSharpe:${range}:Rolling Sharpe (${window}d)@@`,
-          rollingVol:   `@@QUANT:${sym}:rollingVol:${range}:Rolling Vol % ann. (${window}d)@@`,
-          drawdown:     `@@QUANT:${sym}:drawdownSeries:${range}:Drawdown %@@`,
-        },
+      const summary = {
+        currentPrice: closes[closes.length-1], totalReturn: ((closes[closes.length-1]/closes[0])-1)*100,
+        annualizedVol: std(r) * Math.sqrt(252) * 100, sharpe: sharpe(r), sortino: sortino(r),
+        maxDrawdown: maxDD(closes), beta: betaVal, correlation: corrVal,
+        currentPriceZscore: priceZscore[priceZscore.length-1],
+        skewness: (() => { const m=mean(r),s=std(r); return s===0?0:mean(r.map(v=>((v-m)/s)**3)); })(),
       };
 
-      // Cache the series data so frontend can fetch it by symbol
-      analyticsCache.set(`${sym}:${range}`, { ...result.series, computedAt: Date.now() });
+      const series = { dates, closes, priceZscore, rollingSharpe, rollingVol, drawdownSeries };
 
-      return result;
+      // Cache for GET endpoint
+      analyticsCache.set(`${sym}:${range}`, { ...series, summary, computedAt: Date.now() });
+
+      return {
+        symbol: sym, benchmark: bench, range, currency: meta?.currency, summary, series,
+        chartTags: {
+          price:         `@@CHART:${sym}:${range}@@`,
+          zscore:        `@@QUANT:${sym}:priceZscore:${range}:Z-Score (${win}d rolling)@@`,
+          rollingSharpe: `@@QUANT:${sym}:rollingSharpe:${range}:Rolling Sharpe (${win}d)@@`,
+          rollingVol:    `@@QUANT:${sym}:rollingVol:${range}:Rolling Vol % ann. (${win}d)@@`,
+          drawdown:      `@@QUANT:${sym}:drawdownSeries:${range}:Drawdown %@@`,
+        },
+      };
     }
 
     case "compute_correlation_matrix": {
-      // Correlation matrix for multiple symbols
       const symbols = input.symbols || [];
       const range   = input.range || "1y";
       const seriesMap = {};
       for (const sym of symbols) {
-        try {
-          const { bars } = await fetchCloses(sym, range);
-          seriesMap[sym] = returns(bars.map(b => b.close));
-        } catch {}
+        try { const { bars } = await fetchYahooCloses(sym, range); seriesMap[sym] = rets(bars.map(b => b.close)); } catch {}
       }
       const syms = Object.keys(seriesMap);
       const matrix = {};
-      for (const a of syms) {
-        matrix[a] = {};
-        for (const b of syms) {
-          const len = Math.min(seriesMap[a].length, seriesMap[b].length);
-          matrix[a][b] = a === b ? 1 : +(correlation(seriesMap[a].slice(-len), seriesMap[b].slice(-len)) || 0).toFixed(3);
-        }
-      }
+      for (const a of syms) { matrix[a] = {}; for (const b of syms) { const len = Math.min(seriesMap[a].length, seriesMap[b].length); matrix[a][b] = a === b ? 1 : +(corrFn(seriesMap[a].slice(-len), seriesMap[b].slice(-len)) || 0).toFixed(3); } }
       return { symbols: syms, matrix, range };
     }
 
@@ -655,142 +360,44 @@ async function executeTool(name, input) {
   }
 }
 
-// Analytics cache — stores computed series for frontend chart rendering
+// Analytics cache
 const analyticsCache = new Map();
 
 // ─── Claude agent ─────────────────────────────────────────────────
 const TOOLS = [
-  {
-    name: "get_portfolio",
-    description: "Get complete portfolio across BOTH accounts (U11354150 EUR + U9733561 GBP). Returns per-account breakdown AND combined positions with correct EUR-converted values and true allocation percentages.",
-    input_schema: { type: "object", properties: { refresh: { type: "boolean", description: "Force fresh data from IBKR" } }, required: [] },
-  },
-  {
-    name: "get_trades",
-    description: "Get trade history across both accounts. Optionally filter by symbol.",
-    input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: [] },
-  },
-  {
-    name: "get_pnl",
-    description: "Get P&L summary across both accounts: unrealized P&L in EUR, best/worst positions, commissions, dividends.",
-    input_schema: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "get_allocation",
-    description: "Get true portfolio allocation by symbol across both accounts, all values converted to EUR with correct percentages of total portfolio.",
-    input_schema: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "refresh_data",
-    description: "Force fresh data pull from IBKR.",
-    input_schema: { type: "object", properties: {}, required: [] },
-  },
-  {
-    name: "get_market_data",
-    description: "Get real-time quote for any stock or ETF worldwide (price, change, 52w high/low, volume, market cap). Works for any Yahoo Finance symbol e.g. AAPL, CSPX.L, CSSX5E.SW, BTC-USD.",
-    input_schema: { type: "object", properties: { symbol: { type: "string", description: "Yahoo Finance ticker e.g. AAPL, CSPX.L, ^GSPC" } }, required: ["symbol"] },
-  },
-  {
-    name: "get_historical_data",
-    description: "Get OHLCV price history for any symbol for charting. Use range: 1d,5d,1mo,3mo,6mo,1y,2y,5y,ytd,max. Use interval: 1m,5m,1h,1d,1wk,1mo.",
-    input_schema: {
-      type: "object",
-      properties: {
-        symbol:   { type: "string" },
-        range:    { type: "string", description: "Time range: 1d,5d,1mo,3mo,6mo,1y,2y,5y,ytd,max. Default: 1y" },
-        interval: { type: "string", description: "Bar interval: 1m,5m,15m,1h,1d,1wk,1mo. Default: 1d" },
-      },
-      required: ["symbol"],
-    },
-  },
-  {
-    name: "get_multiple_quotes",
-    description: "Get live quotes for multiple symbols at once. Good for comparing portfolio holdings.",
-    input_schema: {
-      type: "object",
-      properties: { symbols: { type: "array", items: { type: "string" }, description: "Array of Yahoo Finance tickers" } },
-      required: ["symbols"],
-    },
-  },
-  {
-    name: "search_symbol",
-    description: "Search for a ticker symbol by company or ETF name.",
-    input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
-  },
-  {
-    name: "compute_analytics",
-    description: "Compute full quant analytics for any symbol: Z-score, rolling Sharpe ratio, rolling volatility, beta vs benchmark, correlation, max drawdown, CAGR, Sortino ratio, skewness. Returns time series data for chart rendering AND chart tags to embed in response. Always use this when user asks for Z-score, Sharpe, beta, vol, drawdown, or any quant metric.",
-    input_schema: {
-      type: "object",
-      properties: {
-        symbol:          { type: "string", description: "Yahoo Finance symbol e.g. CSPX.L, AAPL, BTC-USD" },
-        range:           { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd. Default: 1y" },
-        benchmark:       { type: "string", description: "Benchmark symbol for beta/correlation. Default: ^GSPC (S&P 500)" },
-        rolling_window:  { type: "number", description: "Rolling window in days. Default: 30" },
-      },
-      required: ["symbol"],
-    },
-  },
-  {
-    name: "compute_correlation_matrix",
-    description: "Compute pairwise correlation matrix for multiple symbols. Use for portfolio diversification analysis.",
-    input_schema: {
-      type: "object",
-      properties: {
-        symbols: { type: "array", items: { type: "string" }, description: "Array of Yahoo Finance symbols" },
-        range:   { type: "string", description: "Time range. Default: 1y" },
-      },
-      required: ["symbols"],
-    },
-  },
+  { name: "get_portfolio",   description: "Get complete portfolio across BOTH IBKR accounts with combined positions, allocation %, unrealized P&L, 1Y return.", input_schema: { type: "object", properties: { refresh: { type: "boolean" } }, required: [] } },
+  { name: "get_trades",      description: "Get trade history across both accounts. Filter by symbol optionally.", input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: [] } },
+  { name: "get_pnl",         description: "Get P&L summary: unrealized P&L, best/worst positions, commissions, dividends.", input_schema: { type: "object", properties: {}, required: [] } },
+  { name: "get_allocation",  description: "Get portfolio allocation by symbol, all in EUR with correct combined percentages.", input_schema: { type: "object", properties: {}, required: [] } },
+  { name: "refresh_data",    description: "Force fresh data pull from IBKR.", input_schema: { type: "object", properties: {}, required: [] } },
+  { name: "get_market_data", description: "Real-time quote for any stock/ETF worldwide.", input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } },
+  { name: "get_historical_data", description: "OHLCV history for charting. range: 1mo,3mo,6mo,1y,2y,5y,ytd. interval: 1d,1wk,1mo.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string" }, interval: { type: "string" } }, required: ["symbol"] } },
+  { name: "get_multiple_quotes", description: "Live quotes for multiple symbols at once.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } } }, required: ["symbols"] } },
+  { name: "search_symbol",   description: "Search for a ticker by company name.", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
+  { name: "compute_analytics", description: "Compute quant analytics: Z-score, rolling Sharpe, rolling vol, beta, correlation, drawdown, CAGR, Sortino. Returns series data + chart tags. Use for ANY quant metric request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" } }, required: ["symbol"] } },
+  { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
-- U11354150: EUR-denominated account (main)
-- U9733561: GBP-denominated account (ISA/secondary)
+- U11354150: EUR-denominated (main)
+- U9733561: GBP-denominated (ISA)
 
-Data is read-only via IBKR Flex Web Service. All combined figures are converted to EUR.
+Data is read-only via IBKR Flex Web Service. All combined figures are in EUR.
 
-Portfolio holdings: CSNDX (Nasdaq 100 USD), CSPX (S&P 500 USD), CSSX5E (Euro Stoxx 50 EUR), IEEM (MSCI EM USD), IUSE (S&P 500 EUR-hedged), NQSE (Nasdaq 100 EUR-hedged), SPCX (SpaceX), VUAG (Vanguard S&P500 GBP), VWRL (Vanguard All-World GBP), VFEM (Vanguard EM GBP).
+Portfolio: CSNDX, CSPX, CSSX5E, IEEM, IUSE, NQSE, SPCX, VUAG, VWRL, VFEM.
+Yahoo Finance symbols: CSPX→CSPX.L, CSNDX→CNDX.SW, CSSX5E→CSSX5E.SW, IEEM→IEEM.L, IUSE→IUSE.L, NQSE→NQSE.DE, VUAG→VUAG.L, VWRL→VWRL.L, VFEM→VFEM.L.
 
-Yahoo Finance symbol mapping for your holdings:
-CSPX → CSPX.L, CSNDX → IUSA.L (or use CNDX.SW), CSSX5E → CSSX5E.SW, IEEM → IEEM.L, IUSE → IUSE.L, NQSE → NQSE.DE, VUAG → VUAG.L, VWRL → VWRL.L, VFEM → VFEM.L, SPCX → use RKLB or SpaceX is private.
-
-You can fetch market data and charts for ANY stock or ETF worldwide. 
-
-CHART RENDERING — embed these exact tags in your response and they will render as interactive charts:
-
+CHART TAGS — embed in responses to render charts inline:
 Price chart:  @@CHART:SYMBOL:RANGE@@
 Quant chart:  @@QUANT:SYMBOL:METRIC:RANGE:LABEL@@
+Metrics: priceZscore | rollingSharpe | rollingVol | drawdownSeries
 
-METRIC options: priceZscore | rollingSharpe | rollingVol | drawdownSeries
+QUANT WORKFLOW: call compute_analytics first, then paste the chartTags from result into your reply.
+Example: "Sharpe: 1.24 | Vol: 12% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@"
 
-WORKFLOW for any quant or chart request:
-1. Call compute_analytics first (fetches data and caches it server-side)
-2. In your text reply, paste the relevant tags from result.chartTags
-3. Explain the summary numbers
-
-Example — user asks "rolling Sharpe for CSPX":
-Call compute_analytics({symbol:"CSPX.L", range:"1y"})
-Then reply:
-"Sharpe ratio: 1.24 | Vol: 12.3% | Max DD: -8.2%
-@@CHART:CSPX.L:1y@@
-@@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@"
-
-Example — user asks "Z-score NQSE":
-Call compute_analytics({symbol:"NQSE.DE", range:"1y"})
-Then reply:
-"Current Z-score: +1.8 (overbought territory)
-@@QUANT:NQSE.DE:priceZscore:1y:Price Z-Score (30d rolling)@@"
-
-For portfolio-wide quotes use get_multiple_quotes with all holding symbols.
-For correlation matrix, show numbers as a markdown table — no chart tag needed.
-
-When showing allocations, ALWAYS use the combined portfolio percentages from get_allocation or get_portfolio combined.positions, NOT per-account percentOfNAV.
-
-Unrealized P&L comes from MTM Performance Summary (priorOpenMtm field, in base EUR). 1-year return comes from ChangeInNAV twr field (time-weighted return over last 365 days, NOT calendar YTD). Always label it as "1Y Return" not "YTD". Always show these when available.
-
-Format: EUR amounts with € sign, GBP with £, USD with $. 2 decimal places. Today: ${new Date().toDateString()}.`;
+Always use combined portfolio percentages, not per-account NAV%.
+1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
+Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.`;
 
 async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
@@ -798,13 +405,10 @@ async function runAgent(prompt, history = []) {
   let loop = [...messages], i = 0;
   while (response.stop_reason === "tool_use" && i++ < 10) {
     loop.push({ role: "assistant", content: response.content });
-    const results = await Promise.all(
-      response.content.filter(b => b.type === "tool_use").map(async b => {
-        let result;
-        try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
-        return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
-      })
-    );
+    const results = await Promise.all(response.content.filter(b => b.type === "tool_use").map(async b => {
+      let result; try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
+      return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
+    }));
     loop.push({ role: "user", content: results });
     response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 2000, system: SYSTEM, tools: TOOLS, messages: loop });
   }
@@ -826,36 +430,15 @@ async function sendPush(title, body, icon = "📈") {
 
 // ─── Scheduled tasks ──────────────────────────────────────────────
 const TASKS = [
-  {
-    id: "morning", label: "Morning briefing", icon: "🌅",
-    // 8:30am London BST (UTC+1) = 7:30 UTC. Use UTC to avoid Railway timezone issues.
-    cron: "30 7 * * 1-5",
-    cronDisplay: "8:30 AM London",
-    prompt: "Morning briefing across both accounts: get portfolio then get allocation. Show: combined NLV in EUR, top 5 positions by allocation %, combined unrealized P&L. Format clearly with sections.",
-  },
-  {
-    id: "midday", label: "Midday check", icon: "☀️",
-    // 12:00pm London BST = 11:00 UTC
-    cron: "0 11 * * 1-5",
-    cronDisplay: "12:00 PM London",
-    prompt: "Midday check: get portfolio. Show combined NLV, unrealized P&L across both accounts, any notable moves. Keep under 150 words.",
-  },
-  {
-    id: "eod", label: "End-of-day summary", icon: "🌆",
-    // 5:00pm London BST = 16:00 UTC
-    cron: "0 16 * * 1-5",
-    cronDisplay: "5:00 PM London",
-    prompt: "End of day: get portfolio and trades. Show combined NLV, unrealized P&L, trades executed today, biggest movers. Format as a daily report.",
-  },
-  {
-    id: "weekly", label: "Weekly review", icon: "⚖️",
-    // Friday 4:30pm London BST = 15:30 UTC
-    cron: "30 15 * * 5",
-    cronDisplay: "4:30 PM London (Fri)",
-    prompt: "Weekly review: get portfolio, allocation, P&L, and trades. Show combined NLV, full allocation % breakdown, unrealized P&L, trades this week, commissions paid, any concentration risk.",
-  },
+  { id: "morning", label: "Morning briefing",   icon: "🌅", cron: "30 7 * * 1-5", cronDisplay: "8:30 AM London",
+    prompt: "Morning briefing: get portfolio then allocation. Show combined NLV, top 5 positions by %, combined unrealized P&L. Concise." },
+  { id: "midday",  label: "Midday check",        icon: "☀️", cron: "0 11 * * 1-5",  cronDisplay: "12:00 PM London",
+    prompt: "Midday check: get portfolio. Combined NLV and unrealized P&L. Under 100 words." },
+  { id: "eod",     label: "End-of-day summary",  icon: "🌆", cron: "0 16 * * 1-5",  cronDisplay: "5:00 PM London",
+    prompt: "End of day: get portfolio and trades. Combined NLV, unrealized P&L, trades today, biggest movers." },
+  { id: "weekly",  label: "Weekly review",       icon: "⚖️", cron: "30 15 * * 5",   cronDisplay: "4:30 PM London (Fri)",
+    prompt: "Weekly review: get portfolio, allocation, P&L, trades. Combined NLV, full allocation breakdown, unrealized P&L, trades this week, commissions, concentration risk." },
 ];
-
 const taskState = {};
 TASKS.forEach(t => { taskState[t.id] = { enabled: true, lastRun: null, lastResult: null, running: false }; });
 const taskLog = [];
@@ -879,7 +462,7 @@ TASKS.forEach(task => {
   });
 });
 
-// ─── API Routes ───────────────────────────────────────────────────
+// ─── Routes ───────────────────────────────────────────────────────
 app.post("/api/chat", async (req, res) => {
   const { message, history = [] } = req.body;
   if (!message) return res.status(400).json({ error: "message required" });
@@ -888,18 +471,11 @@ app.post("/api/chat", async (req, res) => {
 });
 
 app.get("/api/account", async (req, res) => {
-  try { res.json(await buildPortfolio()); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await buildPortfolio()); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/api/tasks", (req, res) => res.json(TASKS.map(t => ({ ...t, ...taskState[t.id] }))));
-
-app.patch("/api/tasks/:id", (req, res) => {
-  if (!taskState[req.params.id]) return res.status(404).json({ error: "Not found" });
-  taskState[req.params.id].enabled = req.body.enabled;
-  res.json({ ok: true });
-});
-
+app.patch("/api/tasks/:id", (req, res) => { if (!taskState[req.params.id]) return res.status(404).json({ error: "Not found" }); taskState[req.params.id].enabled = req.body.enabled; res.json({ ok: true }); });
 app.post("/api/tasks/:id/run", async (req, res) => {
   const task = TASKS.find(t => t.id === req.params.id);
   if (!task) return res.status(404).json({ error: "Not found" });
@@ -912,108 +488,55 @@ app.post("/api/tasks/:id/run", async (req, res) => {
     taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
     taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
     await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
-  } catch (e) {
-    taskState[task.id].running = false;
-    taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message };
-  }
+  } catch (e) { taskState[task.id].running = false; taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message }; }
 });
 
 app.get("/api/log", (req, res) => res.json(taskLog.slice(0, 50)));
 
-// Market data endpoints — used by frontend charts directly
+// Market data
 app.get("/api/chart/:symbol", async (req, res) => {
-  try {
-    const { symbol } = req.params;
-    const { range = "1y", interval = "1d" } = req.query;
-    const data = await executeTool("get_historical_data", { symbol, range, interval });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await executeTool("get_historical_data", { symbol: req.params.symbol, range: req.query.range || "1y", interval: req.query.interval || "1d" })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
-
 app.get("/api/quote/:symbol", async (req, res) => {
-  try {
-    const data = await executeTool("get_market_data", { symbol: req.params.symbol });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await executeTool("get_market_data", { symbol: req.params.symbol })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
-
 app.get("/api/quotes", async (req, res) => {
-  try {
-    const symbols = (req.query.symbols || "").split(",").filter(Boolean);
-    const data = await executeTool("get_multiple_quotes", { symbols });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await executeTool("get_multiple_quotes", { symbols: (req.query.symbols || "").split(",").filter(Boolean) })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Analytics series cache — frontend fetches computed quant data for charting
+// Analytics — compute and return series immediately
+app.post("/api/analytics/compute", async (req, res) => {
+  try {
+    const { symbol, range = "1y", benchmark = "^GSPC", rolling_window = 30 } = req.body;
+    if (!symbol) return res.status(400).json({ error: "symbol required" });
+    const result = await executeTool("compute_analytics", { symbol, range, benchmark, rolling_window });
+    if (result.error) return res.status(500).json(result);
+    // Return series fields at top level for easy frontend consumption
+    res.json({ ...result.series, summary: result.summary, symbol: result.symbol, range, currency: result.currency });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 app.get("/api/analytics/:symbol", (req, res) => {
-  const key = `${req.params.symbol.toUpperCase()}:${req.query.range || "1y"}`;
+  const key    = `${req.params.symbol.toUpperCase()}:${req.query.range || "1y"}`;
   const cached = analyticsCache.get(key);
-  if (!cached) return res.status(404).json({ error: "No analytics data cached. Ask the agent to compute analytics first." });
+  if (!cached) return res.status(404).json({ error: "Not cached yet" });
   res.json(cached);
 });
 
-app.get("/api/push/vapid-key", (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
-app.post("/api/push/subscribe", (req, res) => {
-  const sub = req.body;
-  if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" });
-  const id = Buffer.from(sub.endpoint).toString("base64").slice(0, 32);
-  pushSubs.set(id, sub);
-  res.json({ ok: true });
-});
-app.post("/api/push/unsubscribe", (req, res) => {
-  const id = Buffer.from(req.body.endpoint || "").toString("base64").slice(0, 32);
-  pushSubs.delete(id);
-  res.json({ ok: true });
-});
-app.post("/api/push/test", async (req, res) => {
-  await sendPush("✅ Test", "Push notifications working!", "✅");
-  res.json({ ok: true, subscribers: pushSubs.size });
-});
+// Push
+app.get("/api/push/vapid-key",    (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
+app.post("/api/push/subscribe",   (req, res) => { const sub = req.body; if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" }); pushSubs.set(Buffer.from(sub.endpoint).toString("base64").slice(0, 32), sub); res.json({ ok: true }); });
+app.post("/api/push/unsubscribe", (req, res) => { pushSubs.delete(Buffer.from(req.body.endpoint || "").toString("base64").slice(0, 32)); res.json({ ok: true }); });
+app.post("/api/push/test",        async (req, res) => { await sendPush("✅ Test", "Push notifications working!", "✅"); res.json({ ok: true }); });
 
 app.get("/api/ibkr/status", async (req, res) => {
-  try {
-    const portfolio = await buildPortfolio();
-    res.json({
-      authenticated: true,
-      mode: "flex_web_service",
-      accounts: portfolio.accounts.map(a => ({ id: a.accountId, currency: a.baseCurrency, nlv: a.netLiquidation })),
-      combinedNLV_EUR: portfolio.combined.totalNetLiquidation,
-    });
-  } catch (e) {
-    res.status(503).json({ authenticated: false, error: e.message });
-  }
+  try { const p = await buildPortfolio(); res.json({ authenticated: true, mode: "flex_web_service", accounts: p.accounts.map(a => ({ id: a.accountId, currency: a.baseCurrency, nlv: a.netLiquidation })), combinedNLV_EUR: p.combined.totalNetLiquidation }); }
+  catch (e) { res.status(503).json({ authenticated: false, error: e.message }); }
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
-
-// Debug: show raw XML field names for first position and first FIFO row
-app.get("/api/debug/fields", async (req, res) => {
-  try {
-    const all   = await getStatements();
-    const stmts = latestPerAccount(all);
-    const s     = stmts[0];
-    const pos   = toArr(s?.OpenPositions?.OpenPosition)[0] || {};
-    const fifo  = toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)[0] || {};
-    const mtd   = toArr(s?.MTDYTDPerformanceSummary?.MTDYTDPerformanceSummaryUnderlying)[0] || {};
-    const nav   = s?.ChangeInNAV || {};
-    const mtm   = toArr(s?.MTMPerformanceSummaryInBase?.MTMPerformanceSummaryUnderlying)[0] || {};
-    // Show all top-level section keys available
-    const allSections = Object.keys(s || {});
-    res.json({
-      allSections,
-      openPositionFields:  Object.keys(pos),
-      openPositionSample:  pos,
-      fifoFields:          Object.keys(fifo),
-      fifoSample:          fifo,
-      mtdFields:           Object.keys(mtd),
-      mtdSample:           mtd,
-      changeInNAV:         nav,
-      mtmFields:           Object.keys(mtm),
-      mtmSample:           mtm,
-    });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`🚀 IBKR Agent on port ${PORT}`));

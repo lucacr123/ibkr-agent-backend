@@ -559,13 +559,21 @@ app.get("/api/debug/fields", async (req, res) => {
     const pos   = toArr(s?.OpenPositions?.OpenPosition)[0] || {};
     const fifo  = toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)[0] || {};
     const mtd   = toArr(s?.MTDYTDPerformanceSummary?.MTDYTDPerformanceSummaryUnderlying)[0] || {};
+    const nav   = s?.ChangeInNAV || {};
+    const mtm   = toArr(s?.MTMPerformanceSummaryInBase?.MTMPerformanceSummaryUnderlying)[0] || {};
+    // Show all top-level section keys available
+    const allSections = Object.keys(s || {});
     res.json({
+      allSections,
       openPositionFields:  Object.keys(pos),
       openPositionSample:  pos,
       fifoFields:          Object.keys(fifo),
       fifoSample:          fifo,
       mtdFields:           Object.keys(mtd),
       mtdSample:           mtd,
+      changeInNAV:         nav,
+      mtmFields:           Object.keys(mtm),
+      mtmSample:           mtm,
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });

@@ -152,8 +152,12 @@ async function buildPortfolio(force = false) {
         const pnl       = pnlBySymbol[p.symbol] || {};
         const ytd       = ytdBySymbol[p.symbol] || {};
         const valueEUR  = n(p.positionValue) * fxRate;
-        // Use P&L from performance summary (more reliable than OpenPositions)
-        const unrealRaw = n(pnl.totalUnrealizedPnl) || n(p.fifoPnlUnrealized);
+        // Try all possible IBKR field names for unrealized P&L
+        const unrealRaw = n(pnl.totalUnrealizedPnl)    // FIFOPerformanceSummary
+                       || n(pnl.unrealizedProfit) - n(pnl.unrealizedLoss)  // alt field names
+                       || n(p.fifoPnlUnrealized)        // OpenPositions direct field
+                       || n(p.unrealizedPL)             // another variant
+                       || 0;
         const unrealEUR = unrealRaw * fxRate;
         const realRaw   = n(pnl.totalRealizedPnl);
         const costMoney = n(p.costBasisMoney);
@@ -420,23 +424,31 @@ async function sendPush(title, body, icon = "📈") {
 const TASKS = [
   {
     id: "morning", label: "Morning briefing", icon: "🌅",
-    cron: "30 8 * * 1-5",
-    prompt: "Morning briefing across both accounts: get portfolio. Show combined NLV in EUR, combined unrealized P&L, top 5 positions by allocation %, any position with unrealized loss > €500. Keep it concise.",
+    // 8:30am London BST (UTC+1) = 7:30 UTC. Use UTC to avoid Railway timezone issues.
+    cron: "30 7 * * 1-5",
+    cronDisplay: "8:30 AM London",
+    prompt: "Morning briefing across both accounts: get portfolio then get allocation. Show: combined NLV in EUR, top 5 positions by allocation %, combined unrealized P&L. Format clearly with sections.",
   },
   {
     id: "midday", label: "Midday check", icon: "☀️",
-    cron: "0 12 * * 1-5",
-    prompt: "Quick midday check: get P&L. Show combined unrealized P&L in EUR, best and worst performer today. 3 sentences.",
+    // 12:00pm London BST = 11:00 UTC
+    cron: "0 11 * * 1-5",
+    cronDisplay: "12:00 PM London",
+    prompt: "Midday check: get portfolio. Show combined NLV, unrealized P&L across both accounts, any notable moves. Keep under 150 words.",
   },
   {
     id: "eod", label: "End-of-day summary", icon: "🌆",
-    cron: "30 16 * * 1-5",
-    prompt: "End of day report: get portfolio and trades. Show combined NLV, unrealized P&L, any trades executed today across both accounts, top movers.",
+    // 5:00pm London BST = 16:00 UTC
+    cron: "0 16 * * 1-5",
+    cronDisplay: "5:00 PM London",
+    prompt: "End of day: get portfolio and trades. Show combined NLV, unrealized P&L, trades executed today, biggest movers. Format as a daily report.",
   },
   {
     id: "weekly", label: "Weekly review", icon: "⚖️",
-    cron: "0 15 * * 5",
-    prompt: "Weekly review: get portfolio, allocation, P&L, and trades. Show combined NLV, full allocation breakdown by symbol with %, total unrealized P&L, trades this week, commissions paid, and any concentration risk (any single position > 30%).",
+    // Friday 4:30pm London BST = 15:30 UTC
+    cron: "30 15 * * 5",
+    cronDisplay: "4:30 PM London (Fri)",
+    prompt: "Weekly review: get portfolio, allocation, P&L, and trades. Show combined NLV, full allocation % breakdown, unrealized P&L, trades this week, commissions paid, any concentration risk.",
   },
 ];
 
@@ -453,14 +465,14 @@ TASKS.forEach(task => {
     try {
       const result = await runAgent(task.prompt);
       taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
-      taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result: result.slice(0, 300) };
+      taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
       await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
     } catch (e) {
       taskState[task.id].running = false;
       taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message };
       await sendPush(`❌ ${task.label} failed`, e.message.slice(0, 120), "❌");
     }
-  }, { timezone: "America/New_York" });
+  });
 });
 
 // ─── API Routes ───────────────────────────────────────────────────
@@ -494,7 +506,7 @@ app.post("/api/tasks/:id/run", async (req, res) => {
   try {
     const result = await runAgent(task.prompt);
     taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
-    taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result: result.slice(0, 300) };
+    taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
     await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
   } catch (e) {
     taskState[task.id].running = false;
@@ -537,6 +549,26 @@ app.get("/api/ibkr/status", async (req, res) => {
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
+
+// Debug: show raw XML field names for first position and first FIFO row
+app.get("/api/debug/fields", async (req, res) => {
+  try {
+    const all   = await getStatements();
+    const stmts = latestPerAccount(all);
+    const s     = stmts[0];
+    const pos   = toArr(s?.OpenPositions?.OpenPosition)[0] || {};
+    const fifo  = toArr(s?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)[0] || {};
+    const mtd   = toArr(s?.MTDYTDPerformanceSummary?.MTDYTDPerformanceSummaryUnderlying)[0] || {};
+    res.json({
+      openPositionFields:  Object.keys(pos),
+      openPositionSample:  pos,
+      fifoFields:          Object.keys(fifo),
+      fifoSample:          fifo,
+      mtdFields:           Object.keys(mtd),
+      mtdSample:           mtd,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`🚀 IBKR Agent on port ${PORT}`));

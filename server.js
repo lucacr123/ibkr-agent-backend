@@ -529,7 +529,15 @@ Portfolio holdings: CSNDX (Nasdaq 100 USD), CSPX (S&P 500 USD), CSSX5E (Euro Sto
 Yahoo Finance symbol mapping for your holdings:
 CSPX → CSPX.L, CSNDX → IUSA.L (or use CNDX.SW), CSSX5E → CSSX5E.SW, IEEM → IEEM.L, IUSE → IUSE.L, NQSE → NQSE.DE, VUAG → VUAG.L, VWRL → VWRL.L, VFEM → VFEM.L, SPCX → use RKLB or SpaceX is private.
 
-You can fetch market data and charts for ANY stock or ETF worldwide. When asked to show a chart, use get_historical_data and tell the user a chart will be displayed in the app. For portfolio-wide quotes use get_multiple_quotes with all holding symbols.
+You can fetch market data and charts for ANY stock or ETF worldwide. 
+
+CRITICAL — When the user asks to see a chart or when you fetch historical data, you MUST include a chart tag in your response using this exact format:
+[CHART:SYMBOL:RANGE]
+Example: [CHART:CSPX.L:1y] or [CHART:AAPL:6mo] or [CHART:BTC-USD:ytd]
+
+Always fetch the data with get_historical_data first, then include the [CHART:...] tag in your text response so the chart renders inline. Use the Yahoo Finance symbol in the tag.
+
+For portfolio-wide quotes use get_multiple_quotes with all holding symbols.
 
 When showing allocations, ALWAYS use the combined portfolio percentages from get_allocation or get_portfolio combined.positions, NOT per-account percentOfNAV.
 

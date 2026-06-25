@@ -613,11 +613,11 @@ async function executeTool(name, input) {
           allZscores,       // z-score of all daily returns
         },
         chartTags: {
-          price:        `[CHART:${sym}:${range}]`,
-          zscore:       `[QUANT_CHART:${sym}:priceZscore:${range}:Z-Score (${window}d rolling)]`,
-          rollingSharpe:`[QUANT_CHART:${sym}:rollingSharpe:${range}:Rolling Sharpe (${window}d)]`,
-          rollingVol:   `[QUANT_CHART:${sym}:rollingVol:${range}:Rolling Vol % ann. (${window}d)]`,
-          drawdown:     `[QUANT_CHART:${sym}:drawdownSeries:${range}:Drawdown %]`,
+          price:        `@@CHART:${sym}:${range}@@`,
+          zscore:       `@@QUANT:${sym}:priceZscore:${range}:Z-Score (${window}d rolling)@@`,
+          rollingSharpe:`@@QUANT:${sym}:rollingSharpe:${range}:Rolling Sharpe (${window}d)@@`,
+          rollingVol:   `@@QUANT:${sym}:rollingVol:${range}:Rolling Vol % ann. (${window}d)@@`,
+          drawdown:     `@@QUANT:${sym}:drawdownSeries:${range}:Drawdown %@@`,
         },
       };
 
@@ -758,25 +758,33 @@ CSPX → CSPX.L, CSNDX → IUSA.L (or use CNDX.SW), CSSX5E → CSSX5E.SW, IEEM �
 
 You can fetch market data and charts for ANY stock or ETF worldwide. 
 
-CHART RENDERING RULES — always include these tags so charts render inline in chat:
+CHART RENDERING — embed these exact tags in your response and they will render as interactive charts:
 
-For price charts: [CHART:SYMBOL:RANGE]  e.g. [CHART:CSPX.L:1y]
-For quant charts: [QUANT_CHART:SYMBOL:METRIC:RANGE:LABEL]  e.g. [QUANT_CHART:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)]
+Price chart:  @@CHART:SYMBOL:RANGE@@
+Quant chart:  @@QUANT:SYMBOL:METRIC:RANGE:LABEL@@
 
-Available METRIC values (from compute_analytics): priceZscore, rollingSharpe, rollingVol, rollingMean, drawdownSeries, allZscores
+METRIC options: priceZscore | rollingSharpe | rollingVol | drawdownSeries
 
-WORKFLOW for quant requests:
-1. Call compute_analytics (it auto-generates the correct chart tags in result.chartTags)
-2. Copy the relevant chartTags into your text response
-3. Explain the numbers from result.summary
+WORKFLOW for any quant or chart request:
+1. Call compute_analytics first (fetches data and caches it server-side)
+2. In your text reply, paste the relevant tags from result.chartTags
+3. Explain the summary numbers
 
-Example response for "show me rolling Sharpe for CSPX":
-"Here is the rolling 30-day Sharpe ratio for CSPX.L over the past year. Current Sharpe: 1.24, annualized vol: 12.3%.
-[CHART:CSPX.L:1y]
-[QUANT_CHART:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)]"
+Example — user asks "rolling Sharpe for CSPX":
+Call compute_analytics({symbol:"CSPX.L", range:"1y"})
+Then reply:
+"Sharpe ratio: 1.24 | Vol: 12.3% | Max DD: -8.2%
+@@CHART:CSPX.L:1y@@
+@@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@"
 
-For correlation matrix, show the numbers as a table — no chart tag needed.
+Example — user asks "Z-score NQSE":
+Call compute_analytics({symbol:"NQSE.DE", range:"1y"})
+Then reply:
+"Current Z-score: +1.8 (overbought territory)
+@@QUANT:NQSE.DE:priceZscore:1y:Price Z-Score (30d rolling)@@"
+
 For portfolio-wide quotes use get_multiple_quotes with all holding symbols.
+For correlation matrix, show numbers as a markdown table — no chart tag needed.
 
 When showing allocations, ALWAYS use the combined portfolio percentages from get_allocation or get_portfolio combined.positions, NOT per-account percentOfNAV.
 

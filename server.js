@@ -109,15 +109,18 @@ async function buildPortfolio(force = false) {
     const positions = toArr(stmt?.OpenPositions?.OpenPosition)
       .filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
 
-    // P&L by symbol from Realized & Unrealized Performance Summary
-    const pnlBySymbol = {};
-    toArr(stmt?.FIFOPerformanceSummaryInBase?.FIFOPerformanceSummaryUnderlying)
-      .filter(p => p.symbol).forEach(p => { pnlBySymbol[p.symbol] = p; });
+    // MTM Performance Summary — has priorOpenMtm (unrealized P&L) per symbol
+    const mtmBySymbol = {};
+    toArr(stmt?.MTMPerformanceSummaryInBase?.MTMPerformanceSummaryUnderlying)
+      .filter(p => p.symbol).forEach(p => { mtmBySymbol[p.symbol] = p; });
 
-    // YTD by symbol from MTD/YTD Performance Summary
+    // MTD/YTD Performance Summary
     const ytdBySymbol = {};
     toArr(stmt?.MTDYTDPerformanceSummary?.MTDYTDPerformanceSummaryUnderlying)
       .filter(p => p.symbol).forEach(p => { ytdBySymbol[p.symbol] = p; });
+
+    // Change in NAV — account-level YTD return
+    const changeInNAV = stmt?.ChangeInNAV || {};
 
     const cashRows  = toArr(stmt?.CashReport?.CashReportCurrency);
     const baseCash  = cashRows.find(c => c.currency === "BASE_SUMMARY") || cashRows[0] || {};
@@ -140,6 +143,11 @@ async function buildPortfolio(force = false) {
       stockValueEUR:     n(equity.stock) * acctFxToEUR,
       dividendAccruals:  n(equity.dividendAccruals),
       acctFxToEUR,
+      // Account-level performance from ChangeInNAV
+      ytdReturn:      n(changeInNAV.twr),          // time-weighted return %
+      startingValue:  n(changeInNAV.startingValue) * acctFxToEUR,
+      endingValue:    n(changeInNAV.endingValue)   * acctFxToEUR,
+      ytdGainEUR:     (n(changeInNAV.endingValue) - n(changeInNAV.startingValue)) * acctFxToEUR,
       // Cash report
       commissions:  n(baseCash.commissions),
       deposits:     n(baseCash.deposits),
@@ -149,17 +157,14 @@ async function buildPortfolio(force = false) {
       // Positions
       positions: positions.map(p => {
         const fxRate    = n(p.fxRateToBase) || fxRates[p.currency] || 1;
-        const pnl       = pnlBySymbol[p.symbol] || {};
+        const mtm       = mtmBySymbol[p.symbol] || {};
         const ytd       = ytdBySymbol[p.symbol] || {};
         const valueEUR  = n(p.positionValue) * fxRate;
-        // Try all possible IBKR field names for unrealized P&L
-        const unrealRaw = n(pnl.totalUnrealizedPnl)    // FIFOPerformanceSummary
-                       || n(pnl.unrealizedProfit) - n(pnl.unrealizedLoss)  // alt field names
-                       || n(p.fifoPnlUnrealized)        // OpenPositions direct field
-                       || n(p.unrealizedPL)             // another variant
-                       || 0;
-        const unrealEUR = unrealRaw * fxRate;
-        const realRaw   = n(pnl.totalRealizedPnl);
+        // priorOpenMtm = unrealized P&L on open positions (mark-to-market)
+        // It is in base currency (EUR for U11354150)
+        const unrealEUR = n(mtm.priorOpenMtm);
+        const unrealRaw = fxRate > 0 ? unrealEUR / fxRate : unrealEUR;
+        const realRaw   = 0; // realized P&L not available in Flex for this account
         const costMoney = n(p.costBasisMoney);
         const costEUR   = costMoney * fxRate;
         return {
@@ -256,6 +261,8 @@ async function buildPortfolio(force = false) {
       totalCommissions:      +accounts.reduce((s, a) => s + a.commissions, 0).toFixed(2),
       totalDividends:        +accounts.reduce((s, a) => s + a.dividends, 0).toFixed(2),
       totalBrokerInterest:   +accounts.reduce((s, a) => s + a.brokerInterest, 0).toFixed(2),
+      totalYtdGainEUR:       +accounts.reduce((s, a) => s + (a.ytdGainEUR || 0), 0).toFixed(2),
+      avgYtdReturnPct:       +(accounts.reduce((s, a) => s + (a.ytdReturn || 0), 0) / accounts.length).toFixed(2),
       positionCount:         combinedPositions.length,
       positions:             combinedPositions,
     },
@@ -385,6 +392,8 @@ Data is read-only via IBKR Flex Web Service. All combined figures are converted 
 Portfolio holdings: CSNDX (Nasdaq 100 USD), CSPX (S&P 500 USD), CSSX5E (Euro Stoxx 50 EUR), IEEM (MSCI EM USD), IUSE (S&P 500 EUR-hedged), NQSE (Nasdaq 100 EUR-hedged), SPCX (SpaceX), VUAG (Vanguard S&P500 GBP), VWRL (Vanguard All-World GBP), VFEM (Vanguard EM GBP).
 
 When showing allocations, ALWAYS use the combined portfolio percentages from get_allocation or get_portfolio combined.positions, NOT per-account percentOfNAV.
+
+Unrealized P&L comes from MTM Performance Summary (priorOpenMtm field, in base EUR). 1-year return comes from ChangeInNAV twr field (time-weighted return over last 365 days, NOT calendar YTD). Always label it as "1Y Return" not "YTD". Always show these when available.
 
 Format: EUR amounts with € sign, GBP with £, USD with $. 2 decimal places. Today: ${new Date().toDateString()}.`;
 

@@ -186,13 +186,19 @@ async function buildPortfolio(force = false) {
 }
 
 // ─── Quant Analytics Engine ───────────────────────────────────────
-function rets(closes)    { return closes.slice(1).map((v, i) => (v - closes[i]) / closes[i]); }
-function mean(arr)       { return arr.reduce((s, v) => s + v, 0) / arr.length; }
-function std(arr)        { const m = mean(arr); return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length); }
-function rollingFn(arr, w, fn) { const out = new Array(w - 1).fill(null); for (let i = w - 1; i < arr.length; i++) out.push(fn(arr.slice(i - w + 1, i + 1))); return out; }
+function rets(closes)    { return closes.slice(1).map((v, i) => (v - closes[i]) / closes[i]).filter(v => Number.isFinite(v)); }
+function mean(arr)       { return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : 0; }
+function std(arr)        { if (!arr.length) return 0; const m = mean(arr); return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length); }
+function rollingFn(arr, w, fn) { if (arr.length < w) return new Array(arr.length).fill(null); const out = new Array(Math.max(w - 1, 0)).fill(null); for (let i = w - 1; i < arr.length; i++) out.push(fn(arr.slice(i - w + 1, i + 1))); return out; }
 function sharpe(r, period = 252) { const m = mean(r), s = std(r); return s === 0 ? 0 : (m / s) * Math.sqrt(period); }
 function sortino(r, period = 252) { const m = mean(r); const neg = r.filter(v => v < 0); const ds = neg.length ? Math.sqrt(neg.reduce((s, v) => s + v * v, 0) / neg.length) : 0; return ds === 0 ? 0 : (m / ds) * Math.sqrt(period); }
 function maxDD(closes)   { let peak = -Infinity, dd = 0; for (const c of closes) { if (c > peak) peak = c; const d = (c - peak) / peak * 100; if (d < dd) dd = d; } return dd; }
+function quantile(arr, q) { const xs = arr.filter(Number.isFinite).sort((a,b)=>a-b); if (!xs.length) return null; const pos = (xs.length - 1) * q; const base = Math.floor(pos), rest = pos - base; return xs[base + 1] !== undefined ? xs[base] + rest * (xs[base + 1] - xs[base]) : xs[base]; }
+function histVaR(r, level = 0.95) { const q = quantile(r, 1 - level); return q === null ? null : -q; }
+function histCVaR(r, level = 0.95) { const q = quantile(r, 1 - level); if (q === null) return null; const tail = r.filter(v => v <= q); return tail.length ? -mean(tail) : -q; }
+function skewness(r) { const s = std(r), m = mean(r); return !r.length || s === 0 ? 0 : mean(r.map(v => ((v - m) / s) ** 3)); }
+function kurtosis(r) { const s = std(r), m = mean(r); return !r.length || s === 0 ? 0 : mean(r.map(v => ((v - m) / s) ** 4)) - 3; }
+function returnDistribution(r, bins = 20) { const vals = r.filter(Number.isFinite); if (!vals.length) return []; const min = Math.min(...vals), max = Math.max(...vals); const width = (max - min) / bins || 1; const out = Array.from({ length: bins }, (_, i) => ({ binStart: +(100 * (min + i * width)).toFixed(2), binEnd: +(100 * (min + (i + 1) * width)).toFixed(2), count: 0 })); vals.forEach(v => { const idx = Math.min(Math.floor((v - min) / width), bins - 1); out[idx].count += 1; }); return out; }
 function betaFn(a, b)    { if (!a.length || a.length !== b.length) return null; const ma = mean(a), mb = mean(b); const cov = a.reduce((s, v, i) => s + (v - ma) * (b[i] - mb), 0) / a.length; const vb = b.reduce((s, v) => s + (v - mb) ** 2, 0) / b.length; return vb === 0 ? null : cov / vb; }
 function corrFn(a, b)    { if (!a.length || a.length !== b.length) return null; const ma = mean(a), mb = mean(b), sa = std(a), sb = std(b); if (sa === 0 || sb === 0) return null; return a.reduce((s, v, i) => s + (v - ma) * (b[i] - mb), 0) / (a.length * sa * sb); }
 
@@ -325,9 +331,15 @@ async function executeTool(name, input) {
       });
       const rollingSharpe = [null, ...rollingSharpeRaw];
 
-      // Rolling Vol: annualised std × √252, window=30
-      const rollingVolRaw = rollingFn(r, 30, arr => +(std(arr) * Math.sqrt(252) * 100).toFixed(4));
+      // Rolling Vol: annualised std × √252, configurable window
+      const rollingVolRaw = rollingFn(r, win, arr => +(std(arr) * Math.sqrt(252) * 100).toFixed(4));
       const rollingVol = [null, ...rollingVolRaw];
+
+      // Rolling historical VaR: positive loss percentage, configurable window
+      const rollingVaR95Raw = rollingFn(r, win, arr => { const v = histVaR(arr, 0.95); return v === null ? null : +(v * 100).toFixed(4); });
+      const rollingVaR99Raw = rollingFn(r, win, arr => { const v = histVaR(arr, 0.99); return v === null ? null : +(v * 100).toFixed(4); });
+      const rollingVaR95 = [null, ...rollingVaR95Raw];
+      const rollingVaR99 = [null, ...rollingVaR99Raw];
 
       // Drawdown on closes
       const drawdownSeries = (() => {
@@ -349,15 +361,23 @@ async function executeTool(name, input) {
         currentPrice:        closes[closes.length - 1],
         totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
-        sharpe:              std(r) === 0 ? 0 : +((mean(r) / std(r)) * Math.sqrt(252)).toFixed(4),
+        meanDailyReturn:     +(mean(r) * 100).toFixed(4),
+        sharpe:              +sharpe(r).toFixed(4),
         sortino:             +sortino(r).toFixed(4),
         maxDrawdown:         +maxDD(closes).toFixed(2),
+        var95:               (() => { const v = histVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),
+        var99:               (() => { const v = histVaR(r, 0.99); return v === null ? null : +(v * 100).toFixed(2); })(),
+        cvar95:              (() => { const v = histCVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),
+        cvar99:              (() => { const v = histCVaR(r, 0.99); return v === null ? null : +(v * 100).toFixed(2); })(),
+        skewness:            +skewness(r).toFixed(4),
+        kurtosis:            +kurtosis(r).toFixed(4),
         beta:                betaVal !== null ? +betaVal.toFixed(4) : null,
         correlation:         corrVal !== null ? +corrVal.toFixed(4) : null,
         currentReturnZscore: zs252raw[zs252raw.length - 1],
       };
 
-      const series = { dates, closes, priceZscore, priceZscore30, rollingSharpe, rollingVol, drawdownSeries };
+      const distribution = returnDistribution(r, input.bins || 20);
+      const series = { dates, closes, returns: [null, ...r.map(v => +(v * 100).toFixed(4))], priceZscore, priceZscore30, rollingSharpe, rollingVol, rollingVaR95, rollingVaR99, drawdownSeries, distribution };
 
       // Cache for GET endpoint
       analyticsCache.set(`${sym}:${range}`, { ...series, summary, computedAt: Date.now() });
@@ -368,7 +388,11 @@ async function executeTool(name, input) {
           price:         `@@CHART:${sym}:${range}@@`,
           zscore:        `@@QUANT:${sym}:priceZscore:${range}:Z-Score (${win}d rolling)@@`,
           rollingSharpe: `@@QUANT:${sym}:rollingSharpe:${range}:Rolling Sharpe (${win}d)@@`,
+          returns:       `@@QUANT:${sym}:returns:${range}:Daily Returns %@@`,
+          distribution:  `@@QUANT:${sym}:distribution:${range}:Return Distribution@@`,
           rollingVol:    `@@QUANT:${sym}:rollingVol:${range}:Rolling Vol % ann. (${win}d)@@`,
+          rollingVaR95:  `@@QUANT:${sym}:rollingVaR95:${range}:Rolling VaR 95% (${win}d)@@`,
+          rollingVaR99:  `@@QUANT:${sym}:rollingVaR99:${range}:Rolling VaR 99% (${win}d)@@`,
           drawdown:      `@@QUANT:${sym}:drawdownSeries:${range}:Drawdown %@@`,
         },
       };
@@ -406,7 +430,7 @@ const TOOLS = [
   { name: "get_historical_data", description: "OHLCV history for charting. range: 1mo,3mo,6mo,1y,2y,5y,ytd. interval: 1d,1wk,1mo.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string" }, interval: { type: "string" } }, required: ["symbol"] } },
   { name: "get_multiple_quotes", description: "Live quotes for multiple symbols at once.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } } }, required: ["symbols"] } },
   { name: "search_symbol",   description: "Search for a ticker by company name.", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
-  { name: "compute_analytics", description: "Compute quant analytics: Z-score, rolling Sharpe, rolling vol, beta, correlation, drawdown, CAGR, Sortino. Returns series data + chart tags. Use for ANY quant metric request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" } }, required: ["symbol"] } },
+  { name: "compute_analytics", description: "Compute quant analytics: returns, return distribution, historical VaR 95/99, CVaR 95/99, skewness, kurtosis, rolling VaR, Z-score, rolling Sharpe, rolling vol, beta, correlation and drawdown. Returns series data + chart tags. Use for ANY quant, risk, distribution, VaR/CVaR, skew/kurtosis, or chart request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" }, bins: { type: "number", description: "Histogram bins for return distribution, default 20" } }, required: ["symbol"] } },
   { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
 ];
 
@@ -422,10 +446,10 @@ Yahoo Finance symbols: CSPX→CSPX.L, CSNDX→CNDX.SW, CSSX5E→CSSX5E.SW, IEEM�
 CHART TAGS — embed in responses to render charts inline:
 Price chart:  @@CHART:SYMBOL:RANGE@@
 Quant chart:  @@QUANT:SYMBOL:METRIC:RANGE:LABEL@@
-Metrics: priceZscore | rollingSharpe | rollingVol | drawdownSeries
+Metrics: returns | distribution | priceZscore | priceZscore30 | rollingSharpe | rollingVol | rollingVaR95 | rollingVaR99 | drawdownSeries
 
 QUANT WORKFLOW: call compute_analytics first, then paste the chartTags from result into your reply.
-Example: "Sharpe: 1.24 | Vol: 12% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@"
+Example: "Sharpe: 1.24 | Vol: 12% | VaR95: 1.8% | CVaR95: 2.4% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@ @@QUANT:CSPX.L:rollingVaR95:1y:Rolling VaR 95% (30d)@@"
 
 Always use combined portfolio percentages, not per-account NAV%.
 1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
@@ -547,7 +571,7 @@ app.post("/api/analytics/compute", async (req, res) => {
     const result = await executeTool("compute_analytics", { symbol, range, benchmark, rolling_window });
     if (result.error) return res.status(500).json(result);
     // Return series fields at top level for easy frontend consumption
-    res.json({ ...result.series, summary: result.summary, symbol: result.symbol, range, currency: result.currency });
+    res.json({ ...result.series, summary: result.summary, symbol: result.symbol, range, currency: result.currency, chartTags: result.chartTags });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.get("/api/analytics/:symbol", (req, res) => {

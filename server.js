@@ -321,7 +321,7 @@ async function executeTool(name, input) {
       // Rolling Sharpe: mean(r)/std(r) window=252, no annualisation (matches pandas)
       const rollingSharpeRaw = rollingFn(r, 252, arr => {
         const m = mean(arr), s = std(arr);
-        return s === 0 ? 0 : +(m / s).toFixed(4);
+        return s === 0 ? 0 : +((m / s) * Math.sqrt(252)).toFixed(4);
       });
       const rollingSharpe = [null, ...rollingSharpeRaw];
 
@@ -349,7 +349,7 @@ async function executeTool(name, input) {
         currentPrice:        closes[closes.length - 1],
         totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
-        sharpe:              std(r) === 0 ? 0 : +(mean(r) / std(r)).toFixed(4),
+        sharpe:              std(r) === 0 ? 0 : +((mean(r) / std(r)) * Math.sqrt(252)).toFixed(4),
         sortino:             +sortino(r).toFixed(4),
         maxDrawdown:         +maxDD(closes).toFixed(2),
         beta:                betaVal !== null ? +betaVal.toFixed(4) : null,

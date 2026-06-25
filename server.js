@@ -270,6 +270,86 @@ async function buildPortfolio(force = false) {
 }
 
 // ─── Tool executor ────────────────────────────────────────────────
+
+// ─── Quant Analytics Engine ───────────────────────────────────────
+// Pure JS — no extra dependencies needed.
+
+function returns(closes) {
+  const r = [];
+  for (let i = 1; i < closes.length; i++) r.push((closes[i] - closes[i-1]) / closes[i-1]);
+  return r;
+}
+function mean(arr) { return arr.reduce((s, v) => s + v, 0) / arr.length; }
+function std(arr) {
+  const m = mean(arr);
+  return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length);
+}
+function zscore(arr) {
+  const m = mean(arr), s = std(arr);
+  return arr.map(v => s === 0 ? 0 : (v - m) / s);
+}
+function rollingWindow(arr, window, fn) {
+  const out = new Array(window - 1).fill(null);
+  for (let i = window - 1; i < arr.length; i++) out.push(fn(arr.slice(i - window + 1, i + 1)));
+  return out;
+}
+function annualizedSharpe(rets, rf = 0, period = 252) {
+  const excess = rets.map(r => r - rf / period);
+  const m = mean(excess), s = std(excess);
+  return s === 0 ? 0 : (m / s) * Math.sqrt(period);
+}
+function beta(assetRets, benchRets) {
+  if (assetRets.length !== benchRets.length || assetRets.length < 2) return null;
+  const ma = mean(assetRets), mb = mean(benchRets);
+  const cov  = assetRets.reduce((s, r, i) => s + (r - ma) * (benchRets[i] - mb), 0) / assetRets.length;
+  const varB = benchRets.reduce((s, r) => s + (r - mb) ** 2, 0) / benchRets.length;
+  return varB === 0 ? null : cov / varB;
+}
+function correlation(a, b) {
+  if (a.length !== b.length || a.length < 2) return null;
+  const ma = mean(a), mb = mean(b), sa = std(a), sb = std(b);
+  if (sa === 0 || sb === 0) return null;
+  return a.reduce((s, v, i) => s + (v - ma) * (b[i] - mb), 0) / (a.length * sa * sb);
+}
+function maxDrawdown(closes) {
+  let peak = -Infinity, maxDD = 0;
+  for (const c of closes) {
+    if (c > peak) peak = c;
+    const dd = (c - peak) / peak;
+    if (dd < maxDD) maxDD = dd;
+  }
+  return maxDD;
+}
+function cagr(closes, days) {
+  if (closes.length < 2 || days <= 0) return null;
+  return (closes[closes.length - 1] / closes[0]) ** (365 / days) - 1;
+}
+function sortino(rets, rf = 0, period = 252) {
+  const excess = rets.map(r => r - rf / period);
+  const negRets = excess.filter(r => r < 0);
+  const downstd = negRets.length > 0 ? Math.sqrt(negRets.reduce((s, r) => s + r ** 2, 0) / negRets.length) : 0;
+  return downstd === 0 ? 0 : (mean(excess) / downstd) * Math.sqrt(period);
+}
+
+async function fetchCloses(symbol, range = "1y") {
+  const interval = range === "1d" ? "5m" : "1d";
+  const res = await fetch(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`,
+    { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" } }
+  );
+  const data   = await res.json();
+  const result = data?.chart?.result?.[0];
+  if (!result) throw new Error(`No data for ${symbol}`);
+  const { timestamp, indicators } = result;
+  const q = indicators?.quote?.[0] || {};
+  const bars = (timestamp || []).map((t, i) => ({
+    date:  new Date(t * 1000).toISOString().slice(0, 10),
+    close: q.close?.[i] ?? null,
+  })).filter(b => b.close !== null);
+  return { bars, meta: result.meta };
+}
+
+
 async function executeTool(name, input) {
   switch (name) {
 
@@ -452,10 +532,131 @@ async function executeTool(name, input) {
       }));
     }
 
+    case "compute_analytics": {
+      // Fetch price series and compute quant metrics
+      const sym     = input.symbol.toUpperCase();
+      const range   = input.range || "1y";
+      const bench   = input.benchmark || "^GSPC"; // default benchmark = S&P 500
+      const window  = input.rolling_window || 30;  // rolling window in days
+
+      // Fetch asset
+      const { bars, meta } = await fetchCloses(sym, range);
+      const dates  = bars.map(b => b.date);
+      const closes = bars.map(b => b.close);
+      const rets   = returns(closes);
+      const days   = dates.length;
+
+      // Fetch benchmark for beta/correlation
+      let benchRets = null, betaVal = null, corrVal = null;
+      try {
+        const { bars: bb } = await fetchCloses(bench, range);
+        // Align lengths
+        const len = Math.min(rets.length, returns(bb.map(b => b.close)).length);
+        const ar  = rets.slice(-len);
+        const br  = returns(bb.map(b => b.close)).slice(-len);
+        betaVal = beta(ar, br);
+        corrVal = correlation(ar, br);
+        benchRets = br;
+      } catch {}
+
+      // Rolling metrics (using daily returns)
+      const rollingSharpe = rollingWindow(rets, window, r => annualizedSharpe(r));
+      const rollingVol    = rollingWindow(rets, window, r => std(r) * Math.sqrt(252) * 100); // annualised %
+      const rollingMean   = rollingWindow(rets, window, r => mean(r) * 252 * 100); // annualised %
+
+      // Z-score of price (how many std devs from rolling mean)
+      const priceZscore   = rollingWindow(closes, window, arr => {
+        const last = arr[arr.length - 1];
+        const m = mean(arr), s = std(arr);
+        return s === 0 ? 0 : (last - m) / s;
+      });
+
+      // Current Z-score of price (last 1Y)
+      const allZscores    = zscore(closes);
+      const currentZscore = allZscores[allZscores.length - 1];
+
+      // Drawdown series
+      let peak = -Infinity;
+      const drawdownSeries = closes.map(c => {
+        if (c > peak) peak = c;
+        return ((c - peak) / peak) * 100;
+      });
+
+      const result = {
+        symbol:   sym,
+        benchmark: bench,
+        range,
+        currency: meta?.currency,
+        // Summary stats
+        summary: {
+          currentPrice:      closes[closes.length - 1],
+          totalReturn:       ((closes[closes.length - 1] / closes[0]) - 1) * 100,
+          cagr:              (cagr(closes, days) * 100),
+          annualizedVol:     std(rets) * Math.sqrt(252) * 100,
+          sharpe:            annualizedSharpe(rets),
+          sortino:           sortino(rets),
+          maxDrawdown:       maxDrawdown(closes) * 100,
+          beta:              betaVal,
+          correlation:       corrVal,
+          currentPriceZscore: currentZscore,
+          skewness:          (() => { const m=mean(rets),s=std(rets); return s===0?0:mean(rets.map(r=>((r-m)/s)**3)); })(),
+        },
+        // Time series for charting — include dates
+        series: {
+          dates,
+          closes,
+          priceZscore,      // [CHART_DATA:priceZscore]
+          rollingSharpe,    // [CHART_DATA:rollingSharpe]
+          rollingVol,       // [CHART_DATA:rollingVol]
+          rollingMean,      // [CHART_DATA:rollingMean]
+          drawdownSeries,   // [CHART_DATA:drawdown]
+          allZscores,       // z-score of all daily returns
+        },
+        chartTags: {
+          price:        `[CHART:${sym}:${range}]`,
+          zscore:       `[QUANT_CHART:${sym}:priceZscore:${range}:Z-Score (${window}d rolling)]`,
+          rollingSharpe:`[QUANT_CHART:${sym}:rollingSharpe:${range}:Rolling Sharpe (${window}d)]`,
+          rollingVol:   `[QUANT_CHART:${sym}:rollingVol:${range}:Rolling Vol % ann. (${window}d)]`,
+          drawdown:     `[QUANT_CHART:${sym}:drawdownSeries:${range}:Drawdown %]`,
+        },
+      };
+
+      // Cache the series data so frontend can fetch it by symbol
+      analyticsCache.set(`${sym}:${range}`, { ...result.series, computedAt: Date.now() });
+
+      return result;
+    }
+
+    case "compute_correlation_matrix": {
+      // Correlation matrix for multiple symbols
+      const symbols = input.symbols || [];
+      const range   = input.range || "1y";
+      const seriesMap = {};
+      for (const sym of symbols) {
+        try {
+          const { bars } = await fetchCloses(sym, range);
+          seriesMap[sym] = returns(bars.map(b => b.close));
+        } catch {}
+      }
+      const syms = Object.keys(seriesMap);
+      const matrix = {};
+      for (const a of syms) {
+        matrix[a] = {};
+        for (const b of syms) {
+          const len = Math.min(seriesMap[a].length, seriesMap[b].length);
+          matrix[a][b] = a === b ? 1 : +(correlation(seriesMap[a].slice(-len), seriesMap[b].slice(-len)) || 0).toFixed(3);
+        }
+      }
+      return { symbols: syms, matrix, range };
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
 }
+
+// Analytics cache — stores computed series for frontend chart rendering
+const analyticsCache = new Map();
 
 // ─── Claude agent ─────────────────────────────────────────────────
 const TOOLS = [
@@ -516,6 +717,32 @@ const TOOLS = [
     description: "Search for a ticker symbol by company or ETF name.",
     input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] },
   },
+  {
+    name: "compute_analytics",
+    description: "Compute full quant analytics for any symbol: Z-score, rolling Sharpe ratio, rolling volatility, beta vs benchmark, correlation, max drawdown, CAGR, Sortino ratio, skewness. Returns time series data for chart rendering AND chart tags to embed in response. Always use this when user asks for Z-score, Sharpe, beta, vol, drawdown, or any quant metric.",
+    input_schema: {
+      type: "object",
+      properties: {
+        symbol:          { type: "string", description: "Yahoo Finance symbol e.g. CSPX.L, AAPL, BTC-USD" },
+        range:           { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd. Default: 1y" },
+        benchmark:       { type: "string", description: "Benchmark symbol for beta/correlation. Default: ^GSPC (S&P 500)" },
+        rolling_window:  { type: "number", description: "Rolling window in days. Default: 30" },
+      },
+      required: ["symbol"],
+    },
+  },
+  {
+    name: "compute_correlation_matrix",
+    description: "Compute pairwise correlation matrix for multiple symbols. Use for portfolio diversification analysis.",
+    input_schema: {
+      type: "object",
+      properties: {
+        symbols: { type: "array", items: { type: "string" }, description: "Array of Yahoo Finance symbols" },
+        range:   { type: "string", description: "Time range. Default: 1y" },
+      },
+      required: ["symbols"],
+    },
+  },
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
@@ -531,12 +758,24 @@ CSPX → CSPX.L, CSNDX → IUSA.L (or use CNDX.SW), CSSX5E → CSSX5E.SW, IEEM �
 
 You can fetch market data and charts for ANY stock or ETF worldwide. 
 
-CRITICAL — When the user asks to see a chart or when you fetch historical data, you MUST include a chart tag in your response using this exact format:
-[CHART:SYMBOL:RANGE]
-Example: [CHART:CSPX.L:1y] or [CHART:AAPL:6mo] or [CHART:BTC-USD:ytd]
+CHART RENDERING RULES — always include these tags so charts render inline in chat:
 
-Always fetch the data with get_historical_data first, then include the [CHART:...] tag in your text response so the chart renders inline. Use the Yahoo Finance symbol in the tag.
+For price charts: [CHART:SYMBOL:RANGE]  e.g. [CHART:CSPX.L:1y]
+For quant charts: [QUANT_CHART:SYMBOL:METRIC:RANGE:LABEL]  e.g. [QUANT_CHART:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)]
 
+Available METRIC values (from compute_analytics): priceZscore, rollingSharpe, rollingVol, rollingMean, drawdownSeries, allZscores
+
+WORKFLOW for quant requests:
+1. Call compute_analytics (it auto-generates the correct chart tags in result.chartTags)
+2. Copy the relevant chartTags into your text response
+3. Explain the numbers from result.summary
+
+Example response for "show me rolling Sharpe for CSPX":
+"Here is the rolling 30-day Sharpe ratio for CSPX.L over the past year. Current Sharpe: 1.24, annualized vol: 12.3%.
+[CHART:CSPX.L:1y]
+[QUANT_CHART:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)]"
+
+For correlation matrix, show the numbers as a table — no chart tag needed.
 For portfolio-wide quotes use get_multiple_quotes with all holding symbols.
 
 When showing allocations, ALWAYS use the combined portfolio percentages from get_allocation or get_portfolio combined.positions, NOT per-account percentOfNAV.
@@ -696,6 +935,14 @@ app.get("/api/quotes", async (req, res) => {
     const data = await executeTool("get_multiple_quotes", { symbols });
     res.json(data);
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Analytics series cache — frontend fetches computed quant data for charting
+app.get("/api/analytics/:symbol", (req, res) => {
+  const key = `${req.params.symbol.toUpperCase()}:${req.query.range || "1y"}`;
+  const cached = analyticsCache.get(key);
+  if (!cached) return res.status(404).json({ error: "No analytics data cached. Ask the agent to compute analytics first." });
+  res.json(cached);
 });
 
 app.get("/api/push/vapid-key", (req, res) => res.json({ publicKey: VAPID_PUBLIC }));

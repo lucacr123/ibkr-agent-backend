@@ -604,15 +604,14 @@ function standardize(series) {
   return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
 }
 async function computeRegimeModel(portfolioRetMap) {
-  const [vixData,ovxData,hygData]=await Promise.all([fetchYahooCloses("^VIX","5y"),fetchYahooCloses("^OVX","5y"),fetchYahooCloses("HYG","5y")]);
+  const [vixData,ovxData,xtc5Data]=await Promise.all([fetchYahooCloses("^VIX","5y"),fetchYahooCloses("^OVX","5y"),fetchYahooCloses("XTC5.DE","5y")]);
   const vixMap=new Map(vixData.bars.map(b=>[b.date,b.close]));
   const ovxMap=new Map(ovxData.bars.map(b=>[b.date,b.close]));
-  const hygBars=hygData.bars;
+  const xtc5Bars=xtc5Data.bars;
   const hygStressMap=new Map();
-  // Use absolute HYG price level — lower price = higher credit stress
-  // Invert so higher value = more stress (consistent with VIX/OVX)
-  const hygMax=Math.max(...hygBars.map(b=>b.close));
-  for (const b of hygBars) hygStressMap.set(b.date, hygMax - b.close);
+  // XTC5 is SHORT iTraxx Crossover — higher price = wider spreads = more credit stress
+  // Use absolute price level directly as stress signal (high = stressed)
+  for (const b of xtc5Bars) hygStressMap.set(b.date, b.close);
   const allDates=[...vixMap.keys()].filter(d=>ovxMap.has(d)&&hygStressMap.has(d)).sort();
   if (allDates.length<252) throw new Error("Need at least 252 trading days");
   const rawFeatures=allDates.map(d=>[vixMap.get(d),ovxMap.get(d),hygStressMap.get(d)]);
@@ -642,10 +641,10 @@ async function computeRegimeModel(portfolioRetMap) {
   let cumVal=100;
   const portfolioIndex=allDates.map((d,i)=>({d,i})).filter(({d})=>d>=cutoffStr).map(({d,i})=>{if(portRets[i]!==null)cumVal*=(1+portRets[i]);return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]};});
   const stressProbFull=allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]})).filter(x=>x.date>=cutoffStr);
-  const featureNames=["VIX","OVX","HYG_stress"];
+  const featureNames=["VIX","OVX","XTC5(iTraxx_short)"];
   const stateMeans=[0,1].map(r=>{const obj={};featureNames.forEach((f,d)=>{const pts=rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;});return obj;});
   const lastI=allDates.length-1;
-  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=0.1) on VIX+OVX+HYG(level) — chart & stats: last 1Y"};
+  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=0.1) on VIX+OVX+XTC5.DE(iTraxx Crossover Short level) — chart & stats: last 1Y"};
 }
 
 // ─── Tool executor ────────────────────────────────────────────────

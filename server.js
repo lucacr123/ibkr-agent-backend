@@ -322,7 +322,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       annualizedReturnPct: +(annRet * 100).toFixed(2),
       averageDailyReturnPct: +(mean(pr) * 100).toFixed(4),
       annualizedVolPct: +(annVol * 100).toFixed(2),
-      sharpe: std(pr) === 0 ? null : +(mean(pr) / std(pr)).toFixed(3),  // pandas: mean/std no annualisation
+      sharpe: annVol === 0 ? null : +(annRet / annVol).toFixed(3),  // annualized: annRet / sqrt(w'Σw)*sqrt(252)
       sortino: downsideVol === 0 ? null : +(annRet / downsideVol).toFixed(3),
       maxDrawdownPct: +mdd.toFixed(2),
       var95Pct: var95 === null ? null : +(var95 * 100).toFixed(2),
@@ -337,7 +337,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       dates,
       portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
-      rollingSharpe30: rollingFn(pr, 30, arr => { const ar = annualizedReturn(arr); const av = std(arr) * Math.sqrt(252); return av === 0 ? null : +(ar / av).toFixed(4); }),
+      // rollingSharpe30 removed
       weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
@@ -581,7 +581,7 @@ async function executeTool(name, input) {
         weights: m.weights,
         correlationMatrix: m.correlationMatrix,
         chartTag: "@@PORTFOLIO:1y@@",
-        rollingSharpeTag: "@@QUANT:PORTFOLIO:rollingSharpe30:1y:Portfolio Rolling Sharpe (30d)@@"
+        // rollingSharpeTag removed
       };
     }
 
@@ -713,7 +713,7 @@ async function executeTool(name, input) {
       };
 
       const distribution = returnDistribution(r, input.bins || 20);
-      const series = { dates, closes, returns: [null, ...r.map(v => +(v * 100).toFixed(4))], priceZscore, priceZscore30, rollingSharpe, rollingVol, rollingVaR95, rollingVaR99, drawdownSeries, distribution };
+      const series = { dates, closes, returns: [null, ...r.map(v => +(v * 100).toFixed(4))], priceZscore, priceZscore30, rollingVol, rollingVaR95, rollingVaR99, drawdownSeries, distribution };
 
       // Cache for GET endpoint
       analyticsCache.set(`${sym}:${range}`, { ...series, summary, computedAt: Date.now() });
@@ -723,7 +723,7 @@ async function executeTool(name, input) {
         chartTags: {
           price:         `@@CHART:${sym}:${range}@@`,
           zscore:        `@@QUANT:${sym}:priceZscore:${range}:Z-Score (${win}d rolling)@@`,
-          rollingSharpe: `@@QUANT:${sym}:rollingSharpe:${range}:Rolling Sharpe (${win}d)@@`,
+          // rollingSharpe chart tag removed
           returns:       `@@QUANT:${sym}:returns:${range}:Daily Returns %@@`,
           distribution:  `@@QUANT:${sym}:distribution:${range}:Return Distribution@@`,
           rollingVol:    `@@QUANT:${sym}:rollingVol:${range}:Rolling Vol % ann. (${win}d)@@`,
@@ -791,11 +791,11 @@ Yahoo Finance symbols: CSPX→CSPX.L, CSNDX→CNDX.L (Nasdaq 100 UCITS ETF proxy
 CHART TAGS — embed in responses to render charts inline:
 Price chart:  @@CHART:SYMBOL:RANGE@@
 Quant chart:  @@QUANT:SYMBOL:METRIC:RANGE:LABEL@@
-Metrics: returns | distribution | priceZscore | priceZscore30 | rollingSharpe | rollingVol | rollingVaR95 | rollingVaR99 | drawdownSeries
+Metrics: returns | distribution | priceZscore | priceZscore30 | rollingVol | rollingVaR95 | rollingVaR99 | drawdownSeries
 
 QUANT WORKFLOW: call compute_analytics first, then paste the chartTags from result into your reply.
 PORTFOLIO ANALYTICS WORKFLOW: call get_portfolio_analytics for portfolio overview, risk, VaR, matrices, weights, or reconstructed portfolio chart requests. Show weights/correlation matrices as markdown tables, not JSON. Include @@PORTFOLIO:1y@@ when the user asks for portfolio reconstruction or a single portfolio chart.
-Example: "Sharpe: 1.24 | Vol: 12% | VaR95: 1.8% | CVaR95: 2.4% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@ @@QUANT:CSPX.L:rollingVaR95:1y:Rolling VaR 95% (30d)@@"
+Example: "Sharpe: 1.24 | Vol: 12% | VaR95: 1.8% | CVaR95: 2.4% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingVaR95:1y:Rolling VaR 95% (30d)@@"
 
 MARKET NEWS WORKFLOW: for morning, midday, end-of-day, latest news, headlines, asset-class moves, or scheduled briefings, call get_market_news and get_macro_snapshot, then combine with portfolio data.
 

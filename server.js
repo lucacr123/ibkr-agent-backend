@@ -983,22 +983,17 @@ function standardize(series) {
 }
 
 async function computeRegimeModel(portfolioRetMap) {
-  const RANGE = "2y";
-  // Fetch all 4 features
-  const [vixData, ovxData, hygData, tnxData] = await Promise.all([
-    fetchYahooCloses("^VIX",  RANGE),
-    fetchYahooCloses("^OVX",  RANGE),
-    fetchYahooCloses("HYG",   RANGE),
-    fetchYahooCloses("^TNX",  RANGE),
+  // Fetch 5Y of features: VIX, OVX, HYG (3 features, no TNX)
+  const [vixData, ovxData, hygData] = await Promise.all([
+    fetchYahooCloses("^VIX", "5y"),
+    fetchYahooCloses("^OVX", "5y"),
+    fetchYahooCloses("HYG",  "5y"),
   ]);
 
-  // Build maps
   const vixMap = new Map(vixData.bars.map(b => [b.date, b.close]));
   const ovxMap = new Map(ovxData.bars.map(b => [b.date, b.close]));
-  const hygMap = new Map(hygData.bars.map(b => [b.date, b.close]));
-  const tnxMap = new Map(tnxData.bars.map(b => [b.date, b.close]));
 
-  // HYG: negative daily return = credit stress proxy
+  // HYG: negative daily return = credit stress (price down = spread up = stress)
   const hygBars = hygData.bars;
   const hygStressMap = new Map();
   for (let i = 1; i < hygBars.length; i++) {
@@ -1006,66 +1001,74 @@ async function computeRegimeModel(portfolioRetMap) {
     hygStressMap.set(hygBars[i].date, -ret * 100);
   }
 
-  // TNX: rolling 10-day realised vol as rates vol proxy
-  const tnxBars = tnxData.bars;
-  const tnxVolMap = new Map();
-  const WIN_TNXVOL = 10;
-  for (let i = WIN_TNXVOL; i < tnxBars.length; i++) {
-    const slice = tnxBars.slice(i - WIN_TNXVOL, i).map(b => b.close);
-    const m = slice.reduce((a,b) => a+b, 0) / slice.length;
-    const v = Math.sqrt(slice.reduce((a,b) => a + (b-m)**2, 0) / slice.length);
-    tnxVolMap.set(tnxBars[i].date, v);
-  }
-
-  // Common dates
+  // Align common dates across all 3 features
   const allDates = [...vixMap.keys()]
-    .filter(d => ovxMap.has(d) && hygStressMap.has(d) && tnxVolMap.has(d))
+    .filter(d => ovxMap.has(d) && hygStressMap.has(d))
     .sort();
 
-  if (allDates.length < 100) throw new Error("Insufficient data — need at least 100 common trading days");
+  if (allDates.length < 252) throw new Error("Need at least 252 trading days of feature data");
 
   const rawFeatures = allDates.map(d => [
-    vixMap.get(d),         // VIX level
-    ovxMap.get(d),         // OVX (WTI vol)
-    hygStressMap.get(d),   // HYG negative return (credit stress)
-    tnxVolMap.get(d),      // TNX rolling vol (rates vol)
+    vixMap.get(d),        // VIX level
+    ovxMap.get(d),        // OVX (WTI vol)
+    hygStressMap.get(d),  // HYG negative return (credit stress proxy)
   ]);
 
-  // Standardize (StandardScaler equivalent)
-  const { scaled } = standardize(rawFeatures);
+  const K = 2, D = 3;
 
-  // Fit full-sample HMM
-  const K = 2, D = 4;
-  const model = fitHMM(scaled, K, 100);
-  if (!model) throw new Error("HMM fitting failed");
+  // ── Walk-forward: train 252d, predict next day ──────────────────
+  // For each day t >= 252: fit HMM on [t-252..t-1], label day t
+  // Label alignment: stress = whichever state has higher mean VIX
+  const TRAIN_WIN = 252;
+  const wfRegimes     = new Array(allDates.length).fill(null);
+  const wfStressProbs = new Array(allDates.length).fill(null);
 
-  const { pi, A, mu, covInv, gamma } = model;
-  const covDetArr = covInv.map(c => c.det);
-  const covInvArr = covInv.map(c => c.inv);
+  for (let t = TRAIN_WIN; t < allDates.length; t++) {
+    const trainRaw = rawFeatures.slice(t - TRAIN_WIN, t);
+    const { scaled: trainScaled, stats: scaleStats } = standardize(trainRaw);
 
-  // Hard labels via Viterbi
-  const states = viterbi(scaled, pi, A, mu, covInvArr, covDetArr, K);
+    const model = fitHMM(trainScaled, K, 50);  // 50 iters per window — fast enough
+    if (!model) continue;
 
-  // Identify stress state: higher mean VIX (feature 0) = stress
-  const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
+    const { pi, A, mu, covInv } = model;
+    const covInvArr = covInv.map(c => c.inv);
+    const covDetArr = covInv.map(c => c.det);
 
-  // Align stress so regime 1 = stress
-  const regimes    = states.map(s => s === stressState ? 1 : 0);
-  const stressProbs = gamma.map(g => +g[stressState].toFixed(4));
+    // Scale today's observation with training stats
+    const todayRaw = rawFeatures[t];
+    const todayScaled = [todayRaw.map((v, d) => (v - scaleStats[d].mu) / scaleStats[d].sigma)];
 
-  // Portfolio returns aligned to feature dates
-  const portRets = allDates.map(d => portfolioRetMap?.get(d) ?? null);
+    // Forward prob for today
+    const fwdProb = forwardBackward(todayScaled, pi, A, mu, covInvArr, covDetArr, K);
 
-  // For stats/distributions: only last 365 calendar days
+    // Stress state = higher mean VIX in standardized space (feature 0)
+    const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
+
+    wfRegimes[t]     = fwdProb.gamma[0][stressState] > 0.5 ? 1 : 0;
+    wfStressProbs[t] = +fwdProb.gamma[0][stressState].toFixed(4);
+  }
+
+  // Filter to dates that have regime labels (burn-in complete)
+  const labeledIdx = allDates.map((_, i) => i).filter(i => wfRegimes[i] !== null);
+  const labeledDates    = labeledIdx.map(i => allDates[i]);
+  const regimes         = labeledIdx.map(i => wfRegimes[i]);
+  const stressProbs     = labeledIdx.map(i => wfStressProbs[i]);
+  const rawFeaturesLabeled = labeledIdx.map(i => rawFeatures[i]);
+
+  // ── 1-year cutoff for portfolio stats and chart ─────────────────
   const cutoff1Y = new Date(); cutoff1Y.setDate(cutoff1Y.getDate() - 365);
   const cutoffStr = cutoff1Y.toISOString().slice(0, 10);
-  const normalRets = portRets.filter((r, i) => r !== null && regimes[i] === 0 && allDates[i] >= cutoffStr);
-  const stressRets = portRets.filter((r, i) => r !== null && regimes[i] === 1 && allDates[i] >= cutoffStr);
+
+  const portRets = labeledDates.map(d => portfolioRetMap?.get(d) ?? null);
+
+  // Stats: only last 1Y with portfolio data
+  const normalRets = portRets.filter((r, i) => r !== null && regimes[i] === 0 && labeledDates[i] >= cutoffStr);
+  const stressRets = portRets.filter((r, i) => r !== null && regimes[i] === 1 && labeledDates[i] >= cutoffStr);
 
   function regimeStats(rets) {
     if (!rets.length) return null;
     const s = std(rets), annVol = s * Math.sqrt(252) * 100;
-    const annRet = mean(rets) * 252 * 100;  // mean daily ret × 252 (correct for non-contiguous regime days)
+    const annRet = mean(rets) * 252 * 100;
     const var95  = histVaR(rets, 0.95);
     const cvar95 = histCVaR(rets, 0.95);
     let peak = 1, cum = 1, sumDD = 0, ddN = 0;
@@ -1083,27 +1086,30 @@ async function computeRegimeModel(portfolioRetMap) {
     };
   }
 
-  // Portfolio cumulative index
+  // Portfolio cumulative index — only last 1Y
   let cumVal = 100;
-  const portfolioIndex = allDates.map((d, i) => {
-    if (portRets[i] !== null) cumVal *= (1 + portRets[i]);
-    return { date: d, value: +cumVal.toFixed(3), regime: regimes[i] };
-  });
+  const portfolioIndex = labeledDates
+    .map((d, i) => ({ d, i }))
+    .filter(({ d }) => d >= cutoffStr)
+    .map(({ d, i }) => {
+      if (portRets[i] !== null) cumVal *= (1 + portRets[i]);
+      return { date: d, value: +cumVal.toFixed(3), regime: regimes[i] };
+    });
 
-  // Feature means per state (for interpretation)
-  const featureNames = ["VIX","OVX","HYG_stress","TNX_vol"];
-  const stateMeans = Array.from({ length: K }, (_, s) => {
+  // Feature means per regime (for interpretation)
+  const featureNames = ["VIX", "OVX", "HYG_stress"];
+  const stateMeans = [0, 1].map(r => {
     const obj = {};
     featureNames.forEach((f, d) => {
-      const pts = allDates.map((_, i) => rawFeatures[i][d]).filter((_, i) => regimes[i] === (s === stressState ? 1 : 0));
+      const pts = rawFeaturesLabeled.filter((_, i) => regimes[i] === r).map(x => x[d]);
       obj[f] = pts.length ? +(pts.reduce((a,b) => a+b, 0)/pts.length).toFixed(2) : null;
     });
     return obj;
   });
 
-  const lastI = allDates.length - 1;
+  const lastI = regimes.length - 1;
   return {
-    dates:             allDates,
+    dates:             labeledDates,
     regimes,
     stressProbs,
     portfolioIndex,
@@ -1113,13 +1119,13 @@ async function computeRegimeModel(portfolioRetMap) {
     stressDist:        returnDistribution(stressRets, 20),
     currentRegime:     regimes[lastI],
     currentStressProb: stressProbs[lastI],
-    currentVix:        rawFeatures[lastI][0],
+    currentVix:        rawFeaturesLabeled[lastI]?.[0] ?? null,
     normalDays:        normalRets.length,
     stressDays:        stressRets.length,
-    featureDays:       allDates.length,
+    featureDays:       labeledDates.length,
     stateMeans,
-    transitionMatrix:  A,
-    method: "Full-sample 2-state Gaussian HMM (full covariance, 100 EM iterations, persistence prior=10) on VIX + OVX + HYG credit stress + TNX realised vol",
+    transitionMatrix:  null,
+    method: "Walk-forward 2-state Gaussian HMM (252d rolling train, 50 EM iters, 5Y history) on VIX + OVX + HYG — stats and chart: last 1Y only",
   };
 }
 

@@ -332,6 +332,11 @@ async function computePortfolioMetrics(positions, totalNLV) {
       trackingErrorVsSPXPct: trackingError === null ? null : +(trackingError * 100).toFixed(2),
       skewness: +skewness(pr).toFixed(3),
       kurtosis: +kurtosis(pr).toFixed(3),
+      dates,
+      portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
+      portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
+      rollingSharpe30: rollingFn(pr, 30, arr => { const ar = annualizedReturn(arr); const av = std(arr) * Math.sqrt(252); return av === 0 ? null : +(ar / av).toFixed(4); }),
+      weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
       method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix; Sharpe = annualized return / covariance-based annualized volatility"
@@ -399,6 +404,31 @@ async function executeTool(name, input) {
     case "get_allocation": {
       const p = await buildPortfolio();
       return { totalNLV_EUR: p.combined.totalNetLiquidation, allocations: p.combined.positions.map(x => ({ symbol: x.symbol, description: x.description, valueEUR: x.totalValueEUR, allocationPct: +x.allocationPct.toFixed(2), unrealizedPnlEUR: x.totalUnrealEUR, legs: x.legs })) };
+    }
+
+    case "get_portfolio_analytics": {
+      const p = await buildPortfolio(input?.refresh || false);
+      const m = p.combined.metrics1Y;
+      if (!m) return { error: "Portfolio analytics unavailable" };
+      return {
+        method: m.method,
+        metrics: {
+          totalReturnPct: m.totalReturnPct,
+          annualizedReturnPct: m.annualizedReturnPct,
+          annualizedVolPct: m.annualizedVolPct,
+          sharpe: m.sharpe,
+          maxDrawdownPct: m.maxDrawdownPct,
+          var95Pct: m.var95Pct,
+          cvar95Pct: m.cvar95Pct,
+          informationRatioVsSPX: m.informationRatioVsSPX,
+          calmar: m.calmar,
+          averageDailyReturnPct: m.averageDailyReturnPct
+        },
+        weights: m.weights,
+        correlationMatrix: m.correlationMatrix,
+        chartTag: "@@PORTFOLIO:1y@@",
+        rollingSharpeTag: "@@QUANT:PORTFOLIO:rollingSharpe30:1y:Portfolio Rolling Sharpe (30d)@@"
+      };
     }
 
     case "get_market_data": {
@@ -583,6 +613,7 @@ const TOOLS = [
   { name: "get_trades",      description: "Get trade history across both accounts. Filter by symbol optionally.", input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: [] } },
   { name: "get_pnl",         description: "Get P&L summary: unrealized P&L, best/worst positions, commissions, dividends.", input_schema: { type: "object", properties: {}, required: [] } },
   { name: "get_allocation",  description: "Get portfolio allocation by symbol, all in EUR with correct combined percentages.", input_schema: { type: "object", properties: {}, required: [] } },
+  { name: "get_portfolio_analytics", description: "Reconstruct the current-weight portfolio from 1Y Yahoo returns, return risk metrics, weights, correlation matrix, and inline portfolio chart tag. Use for Combined Portfolio Overview and VaR & Risk report.", input_schema: { type: "object", properties: { refresh: { type: "boolean" } }, required: [] } },
   { name: "refresh_data",    description: "Force fresh data pull from IBKR.", input_schema: { type: "object", properties: {}, required: [] } },
   { name: "get_market_data", description: "Real-time quote for any stock/ETF worldwide.", input_schema: { type: "object", properties: { symbol: { type: "string" } }, required: ["symbol"] } },
   { name: "get_historical_data", description: "OHLCV history for charting. range: 1mo,3mo,6mo,1y,2y,5y,ytd. interval: 1d,1wk,1mo.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string" }, interval: { type: "string" } }, required: ["symbol"] } },
@@ -609,11 +640,12 @@ Quant chart:  @@QUANT:SYMBOL:METRIC:RANGE:LABEL@@
 Metrics: returns | distribution | priceZscore | priceZscore30 | rollingSharpe | rollingVol | rollingVaR95 | rollingVaR99 | drawdownSeries
 
 QUANT WORKFLOW: call compute_analytics first, then paste the chartTags from result into your reply.
+PORTFOLIO ANALYTICS WORKFLOW: call get_portfolio_analytics for portfolio overview, risk, VaR, matrices, weights, or reconstructed portfolio chart requests. Show weights/correlation matrices as markdown tables, not JSON. Include @@PORTFOLIO:1y@@ when the user asks for portfolio reconstruction or a single portfolio chart.
 Example: "Sharpe: 1.24 | Vol: 12% | VaR95: 1.8% | CVaR95: 2.4% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@ @@QUANT:CSPX.L:rollingVaR95:1y:Rolling VaR 95% (30d)@@"
 
 MARKET NEWS WORKFLOW: for morning, midday, end-of-day, latest news, headlines, asset-class moves, or scheduled briefings, call get_market_news and get_macro_snapshot, then combine with portfolio data.
 
-Always use combined portfolio percentages, not per-account NAV%.
+Always use combined portfolio percentages, not per-account NAV%. Format matrices and tabular data as markdown tables with concise columns; never dump raw JSON objects into the chat.
 1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
 Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.`;
 
@@ -732,6 +764,16 @@ app.get("/api/quote/:symbol", async (req, res) => {
 app.get("/api/quotes", async (req, res) => {
   try { res.json(await executeTool("get_multiple_quotes", { symbols: (req.query.symbols || "").split(",").filter(Boolean) })); }
   catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+
+app.get("/api/portfolio/analytics", async (req, res) => {
+  try {
+    const p = await buildPortfolio(req.query.refresh === "true");
+    const m = p.combined.metrics1Y;
+    if (!m) return res.status(404).json({ error: "Portfolio analytics unavailable" });
+    res.json(m);
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Analytics — compute and return series immediately

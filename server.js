@@ -18,8 +18,8 @@ const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || "";
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "";
 const VAPID_EMAIL   = process.env.VAPID_EMAIL       || "mailto:you@example.com";
 
-const RESEND_API_KEY   = process.env.RESEND_API_KEY  || "";
-const REPORT_EMAIL_TO  = process.env.REPORT_EMAIL_TO || "rodriguez.albacar.joaquin@gmail.com";
+const RESEND_KEY   = process.env.RESEND_API_KEY  || "";
+const REPORT_TO    = process.env.REPORT_EMAIL_TO || "rodriguez.albacar.joaquin@gmail.com";
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
@@ -322,7 +322,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       annualizedReturnPct: +(annRet * 100).toFixed(2),
       averageDailyReturnPct: +(mean(pr) * 100).toFixed(4),
       annualizedVolPct: +(annVol * 100).toFixed(2),
-      sharpe: annVol === 0 ? null : +(annRet / annVol).toFixed(3),
+      sharpe: std(pr) === 0 ? null : +(mean(pr) / std(pr)).toFixed(3),  // pandas: mean/std no annualisation
       sortino: downsideVol === 0 ? null : +(annRet / downsideVol).toFixed(3),
       maxDrawdownPct: +mdd.toFixed(2),
       var95Pct: var95 === null ? null : +(var95 * 100).toFixed(2),
@@ -372,198 +372,157 @@ async function marketSnapshot() {
   return { asOf: new Date().toISOString(), quotes };
 }
 
+
 // ─── Symbol news ──────────────────────────────────────────────────
 async function fetchSymbolNews(symbol, limit = 5) {
   try {
-    // Use Yahoo Finance search API to get news for the symbol
-    const yfSym = yfSymbol(symbol);
     const res = await fetch(
-      `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(yfSym)}&quotesCount=0&newsCount=${limit}`,
+      `https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(symbol)}&quotesCount=0&newsCount=${limit}`,
       { headers: { "User-Agent": "Mozilla/5.0" } }
     );
-    const data = await res.json();
-    const news = (data?.news || []).slice(0, limit).map(n => ({
-      title: n.title,
-      publisher: n.publisher,
+    const d = await res.json();
+    const news = (d?.news || []).slice(0, limit).map(n => ({
+      title: n.title, publisher: n.publisher,
       published: n.providerPublishTime ? new Date(n.providerPublishTime * 1000).toISOString() : null,
       link: n.link,
     }));
     if (news.length) return news;
   } catch {}
-  // Fallback: RSS headline feed
-  try {
-    const yfSym = yfSymbol(symbol);
-    const xml = await (await fetch(`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(yfSym)}&region=US&lang=en-US`, { headers: { "User-Agent": "Mozilla/5.0" } })).text();
-    const data = parser.parse(xml);
-    return toArr(data?.rss?.channel?.item).slice(0, limit).map(n => ({
-      title: n.title, publisher: data?.rss?.channel?.title || "Yahoo Finance",
-      published: n.pubDate, link: n.link,
-    }));
-  } catch {}
   return [];
 }
 
 // ─── Email report ─────────────────────────────────────────────────
-async function sendEmailReport(to, subject, htmlBody) {
-  if (!RESEND_API_KEY) {
-    console.log("📧 RESEND_API_KEY not set — email not sent. Subject:", subject);
-    return { ok: false, reason: "RESEND_API_KEY not configured" };
-  }
+async function sendEmail(to, subject, html) {
+  if (!RESEND_KEY) { console.log("📧 No RESEND_API_KEY — email skipped:", subject); return { ok: false }; }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
-    headers: { "Authorization": `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ from: "IBKR Agent <onboarding@resend.dev>", to, subject, html: htmlBody }),
+    headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: "IBKR Agent <onboarding@resend.dev>", to, subject, html }),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(`Resend error: ${JSON.stringify(data)}`);
+  if (!res.ok) throw new Error(`Resend: ${JSON.stringify(data)}`);
+  console.log("📧 Email sent:", subject, "→", to, "id:", data.id);
   return { ok: true, id: data.id };
 }
 
-async function buildEmailReport(portfolio, marketNews, macroSnap) {
+async function buildAndSendReport(to) {
+  const [portfolio, newsData, macro] = await Promise.all([
+    buildPortfolio().catch(() => null),
+    fetchMarketNews({}).catch(() => ({ headlines: [] })),
+    marketSnapshot().catch(() => ({ quotes: [] })),
+  ]);
   const combined = portfolio?.combined || {};
   const positions = combined.positions || [];
   const metrics = combined.metrics1Y;
 
-  // Mini sparkline as data URI (simple SVG bar chart for allocation)
-  const allocationBars = positions.slice(0, 8).map(p => ({
-    symbol: p.symbol, pct: p.allocationPct?.toFixed(1), val: p.totalValueEUR
-  }));
-  const maxPct = Math.max(...allocationBars.map(b => parseFloat(b.pct)));
-  const barsHTML = allocationBars.map(b => {
-    const w = Math.round((parseFloat(b.pct) / maxPct) * 200);
-    const col = parseFloat(b.pct) > 20 ? "#C9A84C" : "#4A9EFF";
-    return `<tr><td style="padding:3px 8px 3px 0;font-family:monospace;font-size:13px;white-space:nowrap;color:#EDF0F7">${b.symbol}</td><td><div style="background:${col};height:14px;width:${w}px;border-radius:3px;display:inline-block"></div></td><td style="padding-left:8px;font-family:monospace;font-size:13px;color:#C9A84C">${b.pct}%</td></tr>`;
-  }).join("");
-
-  const headlines = (marketNews?.headlines || []).slice(0, 5).map(h =>
-    `<li style="margin-bottom:8px;line-height:1.5"><a href="${h.link||"#"}" style="color:#4A9EFF;text-decoration:none">${h.title}</a> <span style="color:#5A6280;font-size:11px">(${h.publisher||""}, ${h.published ? new Date(h.published).toLocaleDateString() : ""})</span></li>`
-  ).join("");
-
-  const macroRows = (macroSnap?.quotes || []).map(q => {
-    const chgCol = q.changePct >= 0 ? "#2ECC71" : "#E74C3C";
-    const chgStr = `${q.changePct >= 0 ? "+" : ""}${(q.changePct || 0).toFixed(2)}%`;
-    return `<tr style="border-bottom:1px solid #252A38"><td style="padding:6px 8px;color:#EDF0F7;font-size:13px">${q.symbol}</td><td style="padding:6px 8px;font-family:monospace;font-size:13px;color:#EDF0F7">${q.price?.toFixed(2) || "—"}</td><td style="padding:6px 8px;font-family:monospace;font-size:13px;color:${chgCol}">${chgStr}</td></tr>`;
-  }).join("");
-
-  const nlv = `€${(combined.totalNetLiquidation || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const nlv = `€${(combined.totalNetLiquidation||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
   const unrealPnl = combined.totalUnrealizedPnlEUR || 0;
   const unrealCol = unrealPnl >= 0 ? "#2ECC71" : "#E74C3C";
-  const unrealStr = `${unrealPnl >= 0 ? "+" : ""}€${Math.abs(unrealPnl).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  const unrealStr = `${unrealPnl>=0?"+":""}€${Math.abs(unrealPnl).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
   const twr = combined.avgYtdReturnPct || 0;
   const twrCol = twr >= 0 ? "#2ECC71" : "#E74C3C";
 
-  // Simple gauge SVG for portfolio return
-  const gaugeAngle = Math.min(Math.max(twr / 50 * 90, -90), 90); // -90 to +90 deg
-  const rad = (gaugeAngle - 90) * Math.PI / 180;
-  const needleX = 50 + 35 * Math.cos(rad), needleY = 50 + 35 * Math.sin(rad);
+  const headlinesHtml = (newsData?.headlines||[]).slice(0,5).map(h =>
+    `<li style="margin-bottom:10px;line-height:1.5"><a href="${h.link||"#"}" style="color:#4A9EFF;text-decoration:none;font-size:14px">${h.title}</a><br><span style="color:#5A6280;font-size:11px">${h.publisher||""} ${h.published?`· ${new Date(h.published).toLocaleDateString()}`:""}}</span></li>`
+  ).join("") || "<li style='color:#5A6280'>No headlines available</li>";
 
-  const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+  const macroRows = (macro?.quotes||[]).slice(0,10).map(q => {
+    const c = q.changePct>=0?"#2ECC71":"#E74C3C";
+    const arrow = q.changePct>=0?"▲":"▼";
+    return `<tr style="border-bottom:1px solid #1A1E2A"><td style="padding:7px 8px;color:#EDF0F7;font-size:13px">${q.symbol}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:#EDF0F7">${(q.price||0).toFixed(2)}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:${c}">${arrow} ${(q.changePct||0).toFixed(2)}%</td></tr>`;
+  }).join("");
+
+  const maxPct = Math.max(...positions.map(p=>p.allocationPct||0), 1);
+  const allocBars = positions.slice(0,8).map(p => {
+    const w = Math.round((p.allocationPct/maxPct)*180);
+    const col = p.allocationPct > 20 ? "#C9A84C" : "#4A9EFF";
+    return `<tr><td style="padding:4px 8px 4px 0;font-family:monospace;font-size:12px;color:#EDF0F7;white-space:nowrap">${p.symbol}</td><td><div style="background:${col};height:12px;width:${w}px;border-radius:3px;display:inline-block"></div></td><td style="padding-left:8px;font-family:monospace;font-size:12px;color:#C9A84C">${p.allocationPct.toFixed(1)}%</td></tr>`;
+  }).join("");
+
+  const concentration = positions.filter(p=>p.allocationPct>25);
+  const risks = [
+    concentration.length ? `<div style="background:#2A1A1A;border-left:4px solid #E74C3C;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#E74C3C">⚠️ Concentration risk</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">${concentration.map(p=>`${p.symbol} is ${p.allocationPct.toFixed(1)}% of the portfolio — a lot of eggs in one basket.`).join(" ")}</p></div>` : "",
+    `<div style="background:#1A1E2A;border-left:4px solid #F59E0B;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#F59E0B">💱 Currency risk</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">The portfolio holds funds in EUR, GBP and USD. When these currencies move against each other, it affects the total value — even if nothing else changes.</p></div>`,
+    `<div style="background:#1A1E2A;border-left:4px solid #4A9EFF;border-radius:0 10px 10px 0;padding:12px"><strong style="color:#4A9EFF">📊 Normal market swings</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">Short-term ups and downs are completely normal. This portfolio is spread across thousands of companies worldwide, which helps smooth things out over time. No need to panic on red days!</p></div>`,
+  ].join("");
+
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7">
 <div style="max-width:600px;margin:0 auto;padding:24px 16px">
 
-  <!-- Header -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:24px;margin-bottom:20px;text-align:center">
-    <div style="font-size:28px;margin-bottom:8px">📊</div>
-    <h1 style="margin:0;font-size:22px;color:#E8C87A;font-weight:700">Your Portfolio Morning Report</h1>
-    <p style="margin:8px 0 0;color:#5A6280;font-size:14px">${new Date().toLocaleDateString("en-GB", { weekday:"long", year:"numeric", month:"long", day:"numeric" })}</p>
+    <div style="font-size:32px;margin-bottom:8px">📊</div>
+    <h1 style="margin:0;font-size:22px;color:#E8C87A;font-weight:700">Your Morning Portfolio Report</h1>
+    <p style="margin:8px 0 0;color:#5A6280;font-size:14px">${new Date().toLocaleDateString("en-GB",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
   </div>
 
-  <!-- Simple explanation banner -->
   <div style="background:#1A1E2A;border-left:4px solid #C9A84C;border-radius:0 12px 12px 0;padding:14px 16px;margin-bottom:20px">
-    <p style="margin:0;font-size:13px;color:#EDF0F7;line-height:1.6">👋 <strong>Good morning!</strong> This is your daily portfolio snapshot. Think of it like a health check for your money — we'll cover what's happening in the world, how your investments are doing, and anything worth watching today.</p>
+    <p style="margin:0;font-size:14px;color:#EDF0F7;line-height:1.6">👋 <strong>Good morning!</strong> Here's your daily portfolio health check. We'll cover what's happening in the world, how your money is doing, and anything worth keeping an eye on.</p>
   </div>
 
   <!-- 1. Market News -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">🌍 What's happening in the world today?</h2>
-    <p style="margin:0 0 12px;font-size:13px;color:#5A6280">The main news stories that could affect financial markets:</p>
-    <ul style="margin:0;padding-left:20px;color:#EDF0F7;font-size:14px">${headlines||"<li>No news headlines available</li>"}</ul>
+    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">🌍 1. Market News Overview</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">Top stories that could affect financial markets today:</p>
+    <ul style="margin:0;padding-left:18px">${headlinesHtml}</ul>
   </div>
 
-  <!-- 2. Market Snapshot -->
+  <!-- 2. Portfolio Overview -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">📈 How are markets doing today?</h2>
-    <p style="margin:0 0 12px;font-size:13px;color:#5A6280">Think of these like the "weather forecast" for different types of investments:</p>
+    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">💼 2. Portfolio Overview</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">You own shares in investment funds spread across two accounts. Think of each fund as a basket of many company shares.</p>
+    <div style="background:#1A1E2A;border-radius:12px;padding:16px;margin-bottom:16px;text-align:center">
+      <div style="font-size:11px;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">Total Value of Your Portfolio</div>
+      <div style="font-size:34px;font-weight:700;color:#E8C87A;font-family:monospace">${nlv}</div>
+      <div style="font-size:13px;color:${twrCol};margin-top:6px">12-month return: ${twr>=0?"+":""}${twr}% ${twr>=0?"📈":"📉"}</div>
+    </div>
+    <div style="font-size:11px;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px">How your money is split:</div>
+    <table style="width:100%">${allocBars}</table>
+    <p style="font-size:11px;color:#5A6280;margin:10px 0 0">Each bar = percentage of your total money. Bigger bar = more money there.</p>
+  </div>
+
+  <!-- 3. Market Snapshot -->
+  <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
+    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">📈 Markets at a glance</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">Like a weather forecast for different types of investments:</p>
     <table style="width:100%;border-collapse:collapse">
       <thead><tr style="border-bottom:1px solid #252A38"><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px;text-transform:uppercase">Market</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Price</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Today</th></tr></thead>
-      <tbody>${macroRows||"<tr><td colspan='3' style='padding:8px;color:#5A6280'>No snapshot available</td></tr>"}</tbody>
+      <tbody>${macroRows||"<tr><td colspan='3' style='padding:8px;color:#5A6280;font-size:13px'>No data available</td></tr>"}</tbody>
     </table>
   </div>
 
-  <!-- 3. Portfolio Overview -->
+  <!-- 4. PnL -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">💼 How is your portfolio doing?</h2>
-    <p style="margin:0 0 14px;font-size:13px;color:#5A6280">You own shares in different funds spread across two investment accounts:</p>
-    
-    <!-- Total value box -->
-    <div style="background:#1A1E2A;border-radius:12px;padding:16px;margin-bottom:16px;text-align:center">
-      <div style="font-size:12px;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">Total Portfolio Value</div>
-      <div style="font-size:32px;font-weight:700;color:#E8C87A;font-family:monospace">${nlv}</div>
-      <div style="font-size:13px;color:${twrCol};margin-top:4px">1-year return: ${twr >= 0 ? "+" : ""}${twr}% ${twr >= 0 ? "📈" : "📉"}</div>
-    </div>
-
-    <!-- Allocation bars -->
-    <div style="font-size:12px;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px">How your money is split (simplified):</div>
-    <table style="width:100%">${barsHTML}</table>
-    <p style="font-size:12px;color:#5A6280;margin:12px 0 0">Each bar shows what percentage of your total money is in that fund. A bigger bar = more of your money there.</p>
-  </div>
-
-  <!-- 4. PnL and Performance -->
-  <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">💰 Are you making or losing money?</h2>
-    <p style="margin:0 0 14px;font-size:13px;color:#5A6280">The difference between what your investments are worth now vs what you paid for them:</p>
-    
-    <div style="display:flex;gap:12px;flex-wrap:wrap">
-      <div style="flex:1;min-width:140px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center">
-        <div style="font-size:11px;color:#5A6280;margin-bottom:6px">UNREALISED GAIN/LOSS</div>
+    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">💰 3. P&amp;L and Performance Summary</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">The difference between what your investments are worth now vs what was paid for them:</p>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px">
+      <div style="flex:1;min-width:130px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center">
+        <div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Unrealised Gain/Loss</div>
         <div style="font-size:20px;font-weight:700;color:${unrealCol};font-family:monospace">${unrealStr}</div>
-        <div style="font-size:11px;color:#5A6280;margin-top:4px">On paper (not cashed in yet)</div>
+        <div style="font-size:10px;color:#5A6280;margin-top:4px">On paper — not cashed in</div>
       </div>
-      ${metrics ? `
-      <div style="flex:1;min-width:140px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center">
-        <div style="font-size:11px;color:#5A6280;margin-bottom:6px">1Y SHARPE RATIO</div>
-        <div style="font-size:20px;font-weight:700;color:${(metrics.sharpe||0)>0?"#2ECC71":"#E74C3C"};font-family:monospace">${(metrics.sharpe||0).toFixed(2)}</div>
-        <div style="font-size:11px;color:#5A6280;margin-top:4px">Return quality (>0.5 is good)</div>
-      </div>` : ""}
+      ${metrics?`<div style="flex:1;min-width:130px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center"><div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Sharpe Ratio</div><div style="font-size:20px;font-weight:700;color:${(metrics.sharpe||0)>0.5?"#2ECC71":"#F59E0B"};font-family:monospace">${(metrics.sharpe||0).toFixed(2)}</div><div style="font-size:10px;color:#5A6280;margin-top:4px">Return quality (>0.5 = good)</div></div>`:""}
+      ${metrics?`<div style="flex:1;min-width:130px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center"><div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Max Drawdown</div><div style="font-size:20px;font-weight:700;color:#E74C3C;font-family:monospace">${(metrics.maxDrawdownPct||0).toFixed(1)}%</div><div style="font-size:10px;color:#5A6280;margin-top:4px">Worst dip from peak</div></div>`:""}
     </div>
-    ${metrics ? `
-    <div style="margin-top:14px;background:#1A1E2A;border-radius:10px;padding:12px">
-      <div style="font-size:12px;color:#5A6280;margin-bottom:8px">📊 <strong style="color:#EDF0F7">In plain English:</strong> Over the past year, your portfolio returned <strong style="color:${(metrics.annualizedReturnPct||0)>=0?"#2ECC71":"#E74C3C"}">${(metrics.annualizedReturnPct||0).toFixed(1)}%</strong> with a typical daily swing of about <strong style="color:#EDF0F7">${(metrics.annualizedVolPct||0).toFixed(1)}%</strong> annualised. The worst stretch was a <strong style="color:#E74C3C">${(metrics.maxDrawdownPct||0).toFixed(1)}%</strong> drop from peak.</div>
-    </div>` : ""}
+    ${metrics?`<div style="background:#1A1E2A;border-radius:10px;padding:12px"><p style="margin:0;font-size:13px;color:#EDF0F7;line-height:1.6">📖 <strong>In plain English:</strong> Over the past year, the portfolio returned <strong style="color:${(metrics.annualizedReturnPct||0)>=0?"#2ECC71":"#E74C3C"}">${(metrics.annualizedReturnPct||0).toFixed(1)}%</strong>. The typical daily up/down was about <strong style="color:#EDF0F7">${(metrics.annualizedVolPct||0).toFixed(1)}%</strong> when annualised. The worst stretch was a <strong style="color:#E74C3C">${(metrics.maxDrawdownPct||0).toFixed(1)}%</strong> drop from the highest point.</p></div>`:""}
   </div>
 
-  <!-- 5. Risks to watch -->
+  <!-- 5. Risks -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">⚠️ Things to keep an eye on</h2>
-    <p style="margin:0 0 12px;font-size:13px;color:#5A6280">These are not reasons to panic — just things worth being aware of:</p>
-    <div style="display:flex;flex-direction:column;gap:10px">
-      ${positions.some(p => p.allocationPct > 25) ? `
-      <div style="background:#2A1A1A;border-left:4px solid #E74C3C;border-radius:0 10px 10px 0;padding:12px">
-        <strong style="color:#E74C3C;font-size:13px">⚠️ Concentration</strong>
-        <p style="margin:4px 0 0;font-size:13px;color:#EDF0F7">${positions.filter(p=>p.allocationPct>25).map(p=>`${p.symbol} is ${p.allocationPct.toFixed(1)}% of your portfolio`).join(", ")}. That's a lot of eggs in one basket.</p>
-      </div>` : ""}
-      <div style="background:#1A1E2A;border-left:4px solid #F59E0B;border-radius:0 10px 10px 0;padding:12px">
-        <strong style="color:#F59E0B;font-size:13px">💱 Currency risk</strong>
-        <p style="margin:4px 0 0;font-size:13px;color:#EDF0F7">You hold funds in EUR, GBP and USD. When currencies move against each other, it can affect your returns even if the underlying stocks don't move.</p>
-      </div>
-      <div style="background:#1A1E2A;border-left:4px solid #4A9EFF;border-radius:0 10px 10px 0;padding:12px">
-        <strong style="color:#4A9EFF;font-size:13px">📊 Market volatility</strong>
-        <p style="margin:4px 0 0;font-size:13px;color:#EDF0F7">Short-term ups and downs are normal. Your portfolio is broadly diversified across global stocks which helps smooth out the bumps over time.</p>
-      </div>
-    </div>
+    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">⚠️ 4. Risks to be Watched</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">Not reasons to panic — just things worth being aware of:</p>
+    ${risks}
   </div>
 
-  <!-- Footer -->
-  <div style="text-align:center;padding:16px;color:#5A6280;font-size:12px">
-    <p style="margin:0">Generated by your IBKR Agent • ${new Date().toISOString()}</p>
-    <p style="margin:6px 0 0">Data from IBKR Flex Web Service + Yahoo Finance. Not financial advice.</p>
+  <div style="text-align:center;padding:16px;color:#5A6280;font-size:11px">
+    <p style="margin:0">Generated by IBKR Agent · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC</p>
+    <p style="margin:6px 0 0">Data: IBKR Flex + Yahoo Finance. Not financial advice.</p>
   </div>
-
 </div></body></html>`;
 
-  return html;
+  return sendEmail(to, `📊 Morning Portfolio Report — ${new Date().toLocaleDateString("en-GB")}`, html);
 }
+
 
 // ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {
@@ -703,7 +662,7 @@ async function executeTool(name, input) {
       // Rolling Sharpe: mean(r)/std(r) window=252, no annualisation (matches pandas)
       const rollingSharpeRaw = rollingFn(r, 252, arr => {
         const m = mean(arr), s = std(arr);
-        return s === 0 ? 0 : +(m / s).toFixed(4);  // pandas: mean/std, no annualisation
+        return s === 0 ? 0 : +(m / s).toFixed(4);  // pandas: mean/std no annualisation
       });
       const rollingSharpe = [null, ...rollingSharpeRaw];
 
@@ -738,7 +697,7 @@ async function executeTool(name, input) {
         totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
         meanDailyReturn:     +(mean(r) * 100).toFixed(4),
-        sharpe:              +(mean(r) / std(r)).toFixed(4),  // pandas-style: mean/std, no annualisation
+        sharpe:              std(r)===0 ? 0 : +(mean(r)/std(r)).toFixed(4),
         sortino:             +sortino(r).toFixed(4),
         maxDrawdown:         +maxDD(closes).toFixed(2),
         var95:               (() => { const v = histVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),
@@ -764,7 +723,7 @@ async function executeTool(name, input) {
         chartTags: {
           price:         `@@CHART:${sym}:${range}@@`,
           zscore:        `@@QUANT:${sym}:priceZscore:${range}:Z-Score (${win}d rolling)@@`,
-          // rollingSharpe chart removed - use Z-score instead
+          rollingSharpe: `@@QUANT:${sym}:rollingSharpe:${range}:Rolling Sharpe (${win}d)@@`,
           returns:       `@@QUANT:${sym}:returns:${range}:Daily Returns %@@`,
           distribution:  `@@QUANT:${sym}:distribution:${range}:Return Distribution@@`,
           rollingVol:    `@@QUANT:${sym}:rollingVol:${range}:Rolling Vol % ann. (${win}d)@@`,
@@ -863,8 +822,8 @@ async function runAgent(prompt, history = []) {
 // ─── Push ─────────────────────────────────────────────────────────
 const pushSubs = new Map();
 async function sendPush(title, body, icon = "📈") {
-  console.log(`🔔 Push attempt: "${title}" to ${pushSubs.size} subscribers`);
-  if (!VAPID_PUBLIC || !VAPID_PRIVATE || !pushSubs.size) { console.log("  ↳ skipped:", !VAPID_PUBLIC?"no VAPID_PUBLIC":!VAPID_PRIVATE?"no VAPID_PRIVATE":"no subscribers"); return; }
+  console.log(`🔔 sendPush: "${title}" | subs=${pushSubs.size} | vapid=${!!VAPID_PUBLIC&&!!VAPID_PRIVATE}`);
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE || !pushSubs.size) return;
   const payload = JSON.stringify({ title, body, icon, timestamp: Date.now() });
   const expired = [];
   for (const [id, sub] of pushSubs.entries()) {
@@ -876,7 +835,7 @@ async function sendPush(title, body, icon = "📈") {
 
 // ─── Scheduled tasks ──────────────────────────────────────────────
 const TASKS = [
-  { id: "morning", label: "Morning briefing",   icon: "🌅", cron: "30 7 * * 1-5", cronDisplay: "8:30 AM London", sendEmail: true,
+  { id: "morning", label: "Morning briefing",   icon: "🌅", cron: "30 7 * * 1-5", cronDisplay: "8:30 AM London",
     prompt: "Morning briefing: get market news, macro snapshot, portfolio and allocation. Cover main overnight headlines, movements in indices/rates/FX/commodities, combined NLV, top 5 positions by %, combined unrealized P&L, and key portfolio risks. Concise." },
   { id: "midday",  label: "Midday check",        icon: "☀️", cron: "0 11 * * 1-5",  cronDisplay: "12:00 PM London",
     prompt: "Midday check: get market news, macro snapshot and portfolio. Mention any new market news since the morning, asset-class/index movements, combined NLV and unrealized P&L. Under 150 words." },
@@ -901,13 +860,8 @@ TASKS.forEach(task => {
       taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
       await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
       // Send email for morning briefing
-      if (task.sendEmail) {
-        try {
-          const [portfolio, marketNews, macroSnap] = await Promise.all([buildPortfolio(), fetchMarketNews({}), marketSnapshot()]);
-          const html = await buildEmailReport(portfolio, marketNews, macroSnap);
-          await sendEmailReport(REPORT_EMAIL_TO, `📊 Morning Portfolio Report — ${new Date().toLocaleDateString("en-GB")}`, html);
-          console.log("📧 Morning email sent to", REPORT_EMAIL_TO);
-        } catch (e) { console.error("Email error:", e.message); }
+      if (task.id === "morning") {
+        buildAndSendReport(REPORT_TO).catch(e => console.error("Morning email failed:", e.message));
       }
     } catch (e) {
       taskState[task.id].running = false;
@@ -943,30 +897,27 @@ app.post("/api/tasks/:id/run", async (req, res) => {
     taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
     taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
     await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
+    if (task.id === "morning") {
+      buildAndSendReport(REPORT_TO).catch(e => console.error("Email failed:", e.message));
+    }
   } catch (e) { taskState[task.id].running = false; taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message }; }
 });
 
 app.get("/api/log", (req, res) => res.json(taskLog.slice(0, 50)));
 
-// Symbol-specific news for chart tab
+// Symbol news for chart tab headlines
 app.get("/api/news/symbol/:symbol", async (req, res) => {
   try {
-    const news = await fetchSymbolNews(req.params.symbol, +(req.query.limit || 5));
-    res.json({ symbol: req.params.symbol, news });
+    const news = await fetchSymbolNews(req.params.symbol, +(req.query.limit||5));
+    res.json({ news });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Send email report manually
+// Send email report on demand
 app.post("/api/email/report", async (req, res) => {
   try {
-    const [portfolio, marketNews, macroSnap] = await Promise.all([
-      buildPortfolio(),
-      fetchMarketNews({}),
-      marketSnapshot(),
-    ]);
-    const html = await buildEmailReport(portfolio, marketNews, macroSnap);
-    const to = req.body?.to || REPORT_EMAIL_TO;
-    const result = await sendEmailReport(to, `📊 Portfolio Report — ${new Date().toLocaleDateString("en-GB")}`, html);
+    const to = req.body?.to || REPORT_TO;
+    const result = await buildAndSendReport(to);
     res.json(result);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1024,7 +975,7 @@ app.get("/api/analytics/:symbol", (req, res) => {
 
 // Push
 app.get("/api/push/vapid-key",    (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
-app.post("/api/push/subscribe",   (req, res) => { const sub = req.body; if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" }); const id = Buffer.from(sub.endpoint).toString("base64").slice(0, 32); pushSubs.set(id, sub); console.log(`📱 Push registered: ${id.slice(0,8)}… (total: ${pushSubs.size})`); res.json({ ok: true }); });
+app.post("/api/push/subscribe",   (req, res) => { const sub = req.body; if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" }); const id=Buffer.from(sub.endpoint).toString("base64").slice(0,32); pushSubs.set(id,sub); console.log(`📱 Push registered id=${id.slice(0,8)} total=${pushSubs.size}`); res.json({ ok: true }); });
 app.post("/api/push/unsubscribe", (req, res) => { pushSubs.delete(Buffer.from(req.body.endpoint || "").toString("base64").slice(0, 32)); res.json({ ok: true }); });
 app.post("/api/push/test",        async (req, res) => { await sendPush("✅ Test", "Push notifications working!", "✅"); res.json({ ok: true }); });
 

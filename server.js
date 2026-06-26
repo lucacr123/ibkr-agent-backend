@@ -26,6 +26,8 @@ if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PU
 const toArr = v => Array.isArray(v) ? v : v ? [v] : [];
 const n     = v => parseFloat(v || 0);
 const fmt   = v => n(v).toFixed(2);
+const YAHOO_SYMBOLS = { CSPX:"CSPX.L", CSNDX:"CNDX.L", CSSX5E:"CSSX5E.SW", IEEM:"IEEM.L", IUSE:"IUSE.L", NQSE:"NQSE.DE", SPCX:"SPCX.L", VUAG:"VUAG.L", VWRL:"VWRL.L", VFEM:"VFEM.L" };
+const yfSymbol = s => YAHOO_SYMBOLS[(s || "").toUpperCase()] || s;
 
 // ─── Flex Web Service ─────────────────────────────────────────────
 const FLEX_BASE = "https://ndcdyn.interactivebrokers.com/AccountManagement/FlexWebService";
@@ -166,6 +168,7 @@ async function buildPortfolio(force = false) {
 
   const totalUnrealEUR = +combinedPositions.reduce((s, p) => s + p.totalUnrealEUR, 0).toFixed(2);
   const totalYtdGainEUR = +accounts.reduce((s, a) => s + (a.ytdGainEUR || 0), 0).toFixed(2);
+  const portfolioMetrics = await computePortfolioMetrics(combinedPositions, totalNLV);
 
   return {
     accounts,
@@ -181,6 +184,7 @@ async function buildPortfolio(force = false) {
       totalBrokerInterest:   +accounts.reduce((s, a) => s + a.brokerInterest, 0).toFixed(2),
       positionCount:         combinedPositions.length,
       positions:             combinedPositions,
+      metrics1Y:             portfolioMetrics,
     },
   };
 }
@@ -203,6 +207,7 @@ function betaFn(a, b)    { if (!a.length || a.length !== b.length) return null; 
 function corrFn(a, b)    { if (!a.length || a.length !== b.length) return null; const ma = mean(a), mb = mean(b), sa = std(a), sb = std(b); if (sa === 0 || sb === 0) return null; return a.reduce((s, v, i) => s + (v - ma) * (b[i] - mb), 0) / (a.length * sa * sb); }
 
 async function fetchYahooCloses(symbol, range = "1y") {
+  symbol = yfSymbol(symbol);
   const interval = range === "1d" ? "5m" : "1d";
   const res  = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`, { headers: { "User-Agent": "Mozilla/5.0" } });
   const data = await res.json();
@@ -212,6 +217,78 @@ async function fetchYahooCloses(symbol, range = "1y") {
   const q = indicators?.quote?.[0] || {};
   const bars = (timestamp || []).map((t, i) => ({ date: new Date(t * 1000).toISOString().slice(0, 10), close: q.close?.[i] ?? null })).filter(b => b.close !== null);
   return { bars, meta: result.meta };
+}
+
+function cumulativeFromReturns(r) { let v = 1; return r.map(x => (v *= (1 + x))); }
+function maxDDFromReturns(r) { const c = cumulativeFromReturns(r); return maxDD(c.map(v => v * 100)); }
+function annualizedReturn(r) { if (!r.length) return 0; const total = r.reduce((s,v)=>s*(1+v),1); return Math.pow(total, 252 / r.length) - 1; }
+function informationRatio(a, b) { const len = Math.min(a.length, b.length); if (!len) return null; const active = a.slice(-len).map((v,i)=>v - b.slice(-len)[i]); const te = std(active); return te === 0 ? null : (mean(active) / te) * Math.sqrt(252); }
+async function computePortfolioMetrics(positions, totalNLV) {
+  try {
+    const weighted = [];
+    for (const p of positions) {
+      const weight = totalNLV > 0 ? p.totalValueEUR / totalNLV : 0;
+      if (!weight) continue;
+      try {
+        const { bars } = await fetchYahooCloses(yfSymbol(p.symbol), "1y");
+        const r = rets(bars.map(x => x.close));
+        weighted.push({ symbol: p.symbol, weight, returns: r });
+      } catch {}
+    }
+    if (!weighted.length) return null;
+    const len = Math.min(...weighted.map(x => x.returns.length));
+    if (!len) return null;
+    const pr = Array.from({ length: len }, (_, i) => weighted.reduce((s, x) => s + x.weight * x.returns[x.returns.length - len + i], 0));
+    let br = [];
+    try { const { bars } = await fetchYahooCloses("^GSPC", "1y"); br = rets(bars.map(x => x.close)).slice(-len); } catch {}
+    const mdd = maxDDFromReturns(pr);
+    const annRet = annualizedReturn(pr);
+    const var95 = histVaR(pr, 0.95), var99 = histVaR(pr, 0.99), cvar95 = histCVaR(pr, 0.95);
+    return {
+      period: "1y",
+      days: pr.length,
+      annualizedReturnPct: +(annRet * 100).toFixed(2),
+      averageDailyReturnPct: +(mean(pr) * 100).toFixed(4),
+      annualizedVolPct: +(std(pr) * Math.sqrt(252) * 100).toFixed(2),
+      sharpe: +sharpe(pr).toFixed(3),
+      sortino: +sortino(pr).toFixed(3),
+      maxDrawdownPct: +mdd.toFixed(2),
+      var95Pct: var95 === null ? null : +(var95 * 100).toFixed(2),
+      var99Pct: var99 === null ? null : +(var99 * 100).toFixed(2),
+      cvar95Pct: cvar95 === null ? null : +(cvar95 * 100).toFixed(2),
+      calmar: mdd === 0 ? null : +(annRet / Math.abs(mdd / 100)).toFixed(3),
+      informationRatioVsSPX: br.length ? +(informationRatio(pr, br) ?? 0).toFixed(3) : null,
+      skewness: +skewness(pr).toFixed(3),
+      kurtosis: +kurtosis(pr).toFixed(3),
+      method: "allocation-weighted current holdings, 1Y daily Yahoo returns"
+    };
+  } catch { return null; }
+}
+
+async function fetchMarketNews(input = {}) {
+  const symbols = (input.symbols && input.symbols.length ? input.symbols : ["^GSPC","^IXIC","^DJI","^STOXX50E","^FTSE","^TNX","EURUSD=X","GC=F","CL=F"]).map(yfSymbol);
+  const feeds = [
+    `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(symbols.join(","))}&region=US&lang=en-US`,
+    "https://www.investing.com/rss/news_25.rss",
+    "https://www.investing.com/rss/news_285.rss"
+  ];
+  const items = [];
+  for (const url of feeds) {
+    try {
+      const xml = await (await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } })).text();
+      const data = parser.parse(xml);
+      const rows = toArr(data?.rss?.channel?.item).slice(0, 12);
+      rows.forEach(x => items.push({ title: x.title, link: x.link, published: x.pubDate, source: data?.rss?.channel?.title || "Market news" }));
+    } catch {}
+  }
+  const seen = new Set();
+  return { count: items.length, headlines: items.filter(x => x.title && !seen.has(x.title) && seen.add(x.title)).slice(0, input.limit || 12) };
+}
+
+async function marketSnapshot() {
+  const symbols = ["^GSPC","^IXIC","^DJI","^STOXX50E","^FTSE","^TNX","DX-Y.NYB","EURUSD=X","GC=F","CL=F","BTC-USD"];
+  const quotes = await executeTool("get_multiple_quotes", { symbols });
+  return { asOf: new Date().toISOString(), quotes };
 }
 
 // ─── Tool executor ────────────────────────────────────────────────
@@ -373,7 +450,8 @@ async function executeTool(name, input) {
         kurtosis:            +kurtosis(r).toFixed(4),
         beta:                betaVal !== null ? +betaVal.toFixed(4) : null,
         correlation:         corrVal !== null ? +corrVal.toFixed(4) : null,
-        currentReturnZscore: zs252raw[zs252raw.length - 1],
+        currentReturnZscore: zs252raw[zs252raw.length - 1] ?? zs30raw[zs30raw.length - 1] ?? null,
+        currentReturnZscore30: zs30raw[zs30raw.length - 1] ?? null,
       };
 
       const distribution = returnDistribution(r, input.bins || 20);
@@ -411,6 +489,12 @@ async function executeTool(name, input) {
       return { symbols: syms, matrix, range };
     }
 
+    case "get_market_news":
+      return fetchMarketNews(input || {});
+
+    case "get_macro_snapshot":
+      return marketSnapshot();
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -432,6 +516,8 @@ const TOOLS = [
   { name: "search_symbol",   description: "Search for a ticker by company name.", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
   { name: "compute_analytics", description: "Compute quant analytics: returns, return distribution, historical VaR 95/99, CVaR 95/99, skewness, kurtosis, rolling VaR, Z-score, rolling Sharpe, rolling vol, beta, correlation and drawdown. Returns series data + chart tags. Use for ANY quant, risk, distribution, VaR/CVaR, skew/kurtosis, or chart request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" }, bins: { type: "number", description: "Histogram bins for return distribution, default 20" } }, required: ["symbol"] } },
   { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
+  { name: "get_market_news", description: "Get current market news headlines from finance RSS feeds. Use for morning, midday, end-of-day briefs and any latest-news request.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, limit: { type: "number" } }, required: [] } },
+  { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
@@ -441,7 +527,7 @@ const SYSTEM = `You are a professional finance AI agent managing TWO Interactive
 Data is read-only via IBKR Flex Web Service. All combined figures are in EUR.
 
 Portfolio: CSNDX, CSPX, CSSX5E, IEEM, IUSE, NQSE, SPCX, VUAG, VWRL, VFEM.
-Yahoo Finance symbols: CSPX→CSPX.L, CSNDX→CNDX.SW, CSSX5E→CSSX5E.SW, IEEM→IEEM.L, IUSE→IUSE.L, NQSE→NQSE.DE, VUAG→VUAG.L, VWRL→VWRL.L, VFEM→VFEM.L.
+Yahoo Finance symbols: CSPX→CSPX.L, CSNDX→CNDX.L (Nasdaq 100 UCITS ETF proxy that works on Yahoo), CSSX5E→CSSX5E.SW, IEEM→IEEM.L, IUSE→IUSE.L, NQSE→NQSE.DE, SPCX→SPCX.L, VUAG→VUAG.L, VWRL→VWRL.L, VFEM→VFEM.L.
 
 CHART TAGS — embed in responses to render charts inline:
 Price chart:  @@CHART:SYMBOL:RANGE@@
@@ -450,6 +536,8 @@ Metrics: returns | distribution | priceZscore | priceZscore30 | rollingSharpe | 
 
 QUANT WORKFLOW: call compute_analytics first, then paste the chartTags from result into your reply.
 Example: "Sharpe: 1.24 | Vol: 12% | VaR95: 1.8% | CVaR95: 2.4% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@ @@QUANT:CSPX.L:rollingVaR95:1y:Rolling VaR 95% (30d)@@"
+
+MARKET NEWS WORKFLOW: for morning, midday, end-of-day, latest news, headlines, asset-class moves, or scheduled briefings, call get_market_news and get_macro_snapshot, then combine with portfolio data.
 
 Always use combined portfolio percentages, not per-account NAV%.
 1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
@@ -487,13 +575,13 @@ async function sendPush(title, body, icon = "📈") {
 // ─── Scheduled tasks ──────────────────────────────────────────────
 const TASKS = [
   { id: "morning", label: "Morning briefing",   icon: "🌅", cron: "30 7 * * 1-5", cronDisplay: "8:30 AM London",
-    prompt: "Morning briefing: get portfolio then allocation. Show combined NLV, top 5 positions by %, combined unrealized P&L. Concise." },
+    prompt: "Morning briefing: get market news, macro snapshot, portfolio and allocation. Cover main overnight headlines, movements in indices/rates/FX/commodities, combined NLV, top 5 positions by %, combined unrealized P&L, and key portfolio risks. Concise." },
   { id: "midday",  label: "Midday check",        icon: "☀️", cron: "0 11 * * 1-5",  cronDisplay: "12:00 PM London",
-    prompt: "Midday check: get portfolio. Combined NLV and unrealized P&L. Under 100 words." },
+    prompt: "Midday check: get market news, macro snapshot and portfolio. Mention any new market news since the morning, asset-class/index movements, combined NLV and unrealized P&L. Under 150 words." },
   { id: "eod",     label: "End-of-day summary",  icon: "🌆", cron: "0 16 * * 1-5",  cronDisplay: "5:00 PM London",
-    prompt: "End of day: get portfolio and trades. Combined NLV, unrealized P&L, trades today, biggest movers." },
+    prompt: "End of day: get market news, macro snapshot, portfolio and trades. Summarize today's key headlines, asset-class/index movements, portfolio movement, combined NLV, unrealized P&L, trades today, and biggest movers." },
   { id: "weekly",  label: "Weekly review",       icon: "⚖️", cron: "30 15 * * 5",   cronDisplay: "4:30 PM London (Fri)",
-    prompt: "Weekly review: get portfolio, allocation, P&L, trades. Combined NLV, full allocation breakdown, unrealized P&L, trades this week, commissions, concentration risk." },
+    prompt: "Weekly review: get market news, macro snapshot, portfolio, allocation, P&L and trades. Include weekly market headlines, asset-class/index movements, combined NLV, full allocation breakdown, unrealized P&L, trades this week, commissions, concentration risk, and 1Y portfolio metrics." },
 ];
 const taskState = {};
 TASKS.forEach(t => { taskState[t.id] = { enabled: true, lastRun: null, lastResult: null, running: false }; });
@@ -548,6 +636,15 @@ app.post("/api/tasks/:id/run", async (req, res) => {
 });
 
 app.get("/api/log", (req, res) => res.json(taskLog.slice(0, 50)));
+
+app.get("/api/news", async (req, res) => {
+  try { res.json(await fetchMarketNews({ symbols: (req.query.symbols || "").split(",").filter(Boolean), limit: +(req.query.limit || 12) })); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get("/api/market-snapshot", async (req, res) => {
+  try { res.json(await marketSnapshot()); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
 
 // Market data
 app.get("/api/chart/:symbol", async (req, res) => {

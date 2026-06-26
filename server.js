@@ -760,306 +760,365 @@ async function executeTool(name, input) {
 
 
 // ─── HMM Regime Detection Engine ─────────────────────────────────
-// 2-state Gaussian HMM fitted on VIX, OVX (WTI vol), HYG (credit proxy)
-// Walk-forward: for each day, train on previous 252 days, predict current
+// 2-state full-sample Gaussian HMM
+// Features: VIX, OVX (WTI vol), HYG credit stress, TNX vol (rates vol proxy)
+// Matches Python hmmlearn GaussianHMM(n_components=2, covariance_type='full', n_iter=1000)
 
-function hmmNormalPDF(x, mu, sigma) {
-  if (sigma <= 0) return 1e-10;
-  return (1 / (sigma * Math.sqrt(2 * Math.PI))) * Math.exp(-0.5 * ((x - mu) / sigma) ** 2);
+function gaussianPDF(x, mu, sigma) {
+  if (sigma <= 0) return 1e-300;
+  return Math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * Math.sqrt(2 * Math.PI));
 }
 
-function hmmFitGaussianMixture(data, assignments, k) {
-  // Estimate Gaussian params for each state from assignments
-  const params = [];
-  for (let s = 0; s < k; s++) {
-    const pts = data.filter((_, i) => assignments[i] === s);
-    if (!pts.length) { params.push({ mu: 0, sigma: 1 }); continue; }
-    const mu = pts.reduce((a, b) => a + b, 0) / pts.length;
-    const sigma = Math.sqrt(pts.reduce((a, b) => a + (b - mu) ** 2, 0) / pts.length) || 0.001;
-    params.push({ mu, sigma });
-  }
-  return params;
+// Multivariate diagonal Gaussian emission (full cov = off-diag terms)
+// We use full covariance: store as DxD matrix per state
+function mvnPDF(x, mu, covInv, covDet, D) {
+  const diff = x.map((v, d) => v - mu[d]);
+  let quad = 0;
+  for (let i = 0; i < D; i++)
+    for (let j = 0; j < D; j++)
+      quad += diff[i] * covInv[i][j] * diff[j];
+  const norm = Math.sqrt(Math.pow(2 * Math.PI, D) * Math.abs(covDet));
+  return Math.exp(-0.5 * quad) / (norm || 1e-300);
 }
 
-function hmmViterbi(obs, pi, A, B_params, K, D) {
-  // obs: T x D matrix, pi: initial probs, A: K x K transition, B_params: K x D {mu,sigma}
-  const T = obs.length;
-  const delta = Array.from({ length: T }, () => new Array(K).fill(0));
-  const psi   = Array.from({ length: T }, () => new Array(K).fill(0));
+function matInv2x2(m) {
+  const det = m[0][0]*m[1][1] - m[0][1]*m[1][0];
+  if (Math.abs(det) < 1e-12) return { inv: [[1,0],[0,1]], det: 1 };
+  return { inv: [[m[1][1]/det, -m[0][1]/det], [-m[1][0]/det, m[0][0]/det]], det };
+}
 
-  // Init
-  for (let s = 0; s < K; s++) {
-    let logB = 0;
-    for (let d = 0; d < D; d++) logB += Math.log(hmmNormalPDF(obs[0][d], B_params[s][d].mu, B_params[s][d].sigma) + 1e-300);
-    delta[0][s] = Math.log(pi[s] + 1e-300) + logB;
-  }
-
-  // Recursion
-  for (let t = 1; t < T; t++) {
-    for (let s = 0; s < K; s++) {
-      let logB = 0;
-      for (let d = 0; d < D; d++) logB += Math.log(hmmNormalPDF(obs[t][d], B_params[s][d].mu, B_params[s][d].sigma) + 1e-300);
-      let best = -Infinity, bestPrev = 0;
-      for (let prev = 0; prev < K; prev++) {
-        const val = delta[t-1][prev] + Math.log(A[prev][s] + 1e-300);
-        if (val > best) { best = val; bestPrev = prev; }
-      }
-      delta[t][s] = best + logB;
-      psi[t][s] = bestPrev;
+function matInv(m) {
+  const D = m.length;
+  if (D === 2) return matInv2x2(m);
+  // General inverse via Gaussian elimination
+  const a = m.map(r => [...r]);
+  const inv = Array.from({ length: D }, (_, i) => Array.from({ length: D }, (_, j) => i === j ? 1 : 0));
+  for (let col = 0; col < D; col++) {
+    let pivot = col;
+    for (let row = col+1; row < D; row++) if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
+    [a[col], a[pivot]] = [a[pivot], a[col]];
+    [inv[col], inv[pivot]] = [inv[pivot], inv[col]];
+    const scale = a[col][col] || 1e-12;
+    for (let j = 0; j < D; j++) { a[col][j] /= scale; inv[col][j] /= scale; }
+    for (let row = 0; row < D; row++) {
+      if (row === col) continue;
+      const f = a[row][col];
+      for (let j = 0; j < D; j++) { a[row][j] -= f * a[col][j]; inv[row][j] -= f * inv[col][j]; }
     }
   }
+  // Determinant (product of pivots before elimination — approximate via diagonal of original)
+  let det = 1;
+  for (let i = 0; i < D; i++) det *= m[i][i];
+  return { inv, det };
+}
 
-  // Backtrack
+function sampleMean(data, weights) {
+  const D = data[0].length;
+  const wSum = weights.reduce((a,b) => a+b, 0) || 1;
+  return Array.from({ length: D }, (_, d) =>
+    data.reduce((s, x, t) => s + weights[t] * x[d], 0) / wSum
+  );
+}
+
+function sampleFullCov(data, mu, weights) {
+  const D = data[0].length;
+  const wSum = weights.reduce((a,b) => a+b, 0) || 1;
+  return Array.from({ length: D }, (_, i) =>
+    Array.from({ length: D }, (_, j) =>
+      data.reduce((s, x, t) => s + weights[t] * (x[i]-mu[i]) * (x[j]-mu[j]), 0) / wSum + (i===j ? 1e-4 : 0)
+    )
+  );
+}
+
+// Forward-backward algorithm (Baum-Welch E-step)
+function forwardBackward(obs, pi, A, mu, covInv, covDet, K) {
+  const T = obs.length, D = obs[0].length;
+
+  // Emission probabilities
+  const B = obs.map(x => Array.from({ length: K }, (_, s) => mvnPDF(x, mu[s], covInv[s], covDet[s], D)));
+
+  // Forward pass (scaled)
+  const alpha = [], scales = [];
+  let a0 = Array.from({ length: K }, (_, s) => pi[s] * B[0][s]);
+  let sc0 = a0.reduce((a,b) => a+b, 0) || 1;
+  alpha.push(a0.map(v => v/sc0)); scales.push(sc0);
+  for (let t = 1; t < T; t++) {
+    const at = Array.from({ length: K }, (_, s) => B[t][s] * alpha[t-1].reduce((s2, a, prev) => s2 + a * A[prev][s], 0));
+    const sc = at.reduce((a,b) => a+b, 0) || 1;
+    alpha.push(at.map(v => v/sc)); scales.push(sc);
+  }
+
+  // Backward pass (scaled)
+  const beta = new Array(T);
+  beta[T-1] = new Array(K).fill(1);
+  for (let t = T-2; t >= 0; t--) {
+    beta[t] = Array.from({ length: K }, (_, s) =>
+      Array.from({ length: K }, (_, s2) => A[s][s2] * B[t+1][s2] * beta[t+1][s2]).reduce((a,b) => a+b, 0) / scales[t+1]
+    );
+  }
+
+  // Gamma (posterior state probabilities)
+  const gamma = alpha.map((at, t) => {
+    const g = at.map((a, s) => a * beta[t][s]);
+    const gsum = g.reduce((a,b) => a+b, 0) || 1;
+    return g.map(v => v/gsum);
+  });
+
+  // Xi (joint transition posteriors)
+  const xi = [];
+  for (let t = 0; t < T-1; t++) {
+    const x = Array.from({ length: K }, (_, s) =>
+      Array.from({ length: K }, (_, s2) =>
+        alpha[t][s] * A[s][s2] * B[t+1][s2] * beta[t+1][s2]
+      )
+    );
+    const xsum = x.reduce((rs, row) => rs + row.reduce((a,b) => a+b, 0), 0) || 1;
+    xi.push(x.map(row => row.map(v => v/xsum)));
+  }
+
+  const logLik = scales.reduce((s, sc) => s + Math.log(sc || 1e-300), 0);
+  return { gamma, xi, logLik };
+}
+
+function fitHMM(obs, K, maxIter = 100) {
+  const T = obs.length, D = obs[0].length;
+  if (T < K * 5) return null;
+
+  // Initialise: k-means on first feature
+  const sorted = [...obs.map(o => o[0])].sort((a,b) => a-b);
+  const quantiles = Array.from({ length: K }, (_, k) => sorted[Math.floor((k+0.5) * T/K)]);
+  let gamma = obs.map(x => {
+    const dists = quantiles.map(q => Math.abs(x[0] - q));
+    const minD  = Math.min(...dists);
+    const g = dists.map(d => d === minD ? 1 : 0);
+    const gs = g.reduce((a,b) => a+b, 0);
+    return g.map(v => v/gs);
+  });
+
+  // Init params
+  let pi = Array.from({ length: K }, (_, s) => gamma.reduce((sum, g) => sum + g[s], 0) / T);
+  let A  = Array.from({ length: K }, (_, s) => {
+    const row = Array.from({ length: K }, (_, s2) => s === s2 ? 9 : 1); // strong persistence prior
+    const rs  = row.reduce((a,b) => a+b, 0);
+    return row.map(v => v/rs);
+  });
+  let mu     = Array.from({ length: K }, (_, s) => sampleMean(obs, gamma.map(g => g[s])));
+  let covs   = Array.from({ length: K }, (_, s) => sampleFullCov(obs, mu[s], gamma.map(g => g[s])));
+  let covInv = covs.map(c => matInv(c));
+
+  let prevLogLik = -Infinity;
+  for (let iter = 0; iter < maxIter; iter++) {
+    // E-step
+    const { gamma: newGamma, xi, logLik } = forwardBackward(
+      obs, pi, A, mu, covInv.map(c => c.inv), covInv.map(c => c.det), K
+    );
+    gamma = newGamma;
+
+    // M-step
+    // Pi
+    pi = gamma[0].map(v => v + 1e-10);
+    const piSum = pi.reduce((a,b) => a+b, 0);
+    pi = pi.map(v => v/piSum);
+
+    // Transition (with strong persistence prior)
+    const PRIOR = 10; // transmat_prior=10 like Python
+    A = Array.from({ length: K }, (_, s) => {
+      const row = Array.from({ length: K }, (_, s2) => {
+        const xiSum = xi.reduce((sum, xit) => sum + xit[s][s2], 0);
+        return xiSum + PRIOR;
+      });
+      const rs = row.reduce((a,b) => a+b, 0);
+      return row.map(v => v/rs);
+    });
+
+    // Emissions
+    mu     = Array.from({ length: K }, (_, s) => sampleMean(obs, gamma.map(g => g[s])));
+    covs   = Array.from({ length: K }, (_, s) => sampleFullCov(obs, mu[s], gamma.map(g => g[s])));
+    covInv = covs.map(c => matInv(c));
+
+    if (Math.abs(logLik - prevLogLik) < 1e-4 && iter > 5) break;
+    prevLogLik = logLik;
+  }
+
+  return { pi, A, mu, covInv, gamma };
+}
+
+function viterbi(obs, pi, A, mu, covInvArr, covDetArr, K) {
+  const T = obs.length, D = obs[0].length;
+  const delta = [], psi = [];
+  const B0 = Array.from({ length: K }, (_, s) => mvnPDF(obs[0], mu[s], covInvArr[s], covDetArr[s], D));
+  delta.push(Array.from({ length: K }, (_, s) => Math.log(pi[s] + 1e-300) + Math.log(B0[s] + 1e-300)));
+  psi.push(new Array(K).fill(0));
+  for (let t = 1; t < T; t++) {
+    const Bt = Array.from({ length: K }, (_, s) => Math.log(mvnPDF(obs[t], mu[s], covInvArr[s], covDetArr[s], D) + 1e-300));
+    const dt = [], pt = [];
+    for (let s = 0; s < K; s++) {
+      let best = -Infinity, bestP = 0;
+      for (let p = 0; p < K; p++) {
+        const v = delta[t-1][p] + Math.log(A[p][s] + 1e-300);
+        if (v > best) { best = v; bestP = p; }
+      }
+      dt.push(best + Bt[s]); pt.push(bestP);
+    }
+    delta.push(dt); psi.push(pt);
+  }
   const states = new Array(T);
   states[T-1] = delta[T-1].indexOf(Math.max(...delta[T-1]));
   for (let t = T-2; t >= 0; t--) states[t] = psi[t+1][states[t+1]];
   return states;
 }
 
-function hmmForwardProb(obs, pi, A, B_params, K, D) {
-  // Forward algorithm — returns probability of each state at last timestep
-  const T = obs.length;
-  let alpha = new Array(K).fill(0);
-
-  // Init
-  for (let s = 0; s < K; s++) {
-    let b = 1;
-    for (let d = 0; d < D; d++) b *= hmmNormalPDF(obs[0][d], B_params[s][d].mu, B_params[s][d].sigma) + 1e-300;
-    alpha[s] = pi[s] * b;
-  }
-
-  // Forward
-  for (let t = 1; t < T; t++) {
-    const newAlpha = new Array(K).fill(0);
-    for (let s = 0; s < K; s++) {
-      let b = 1;
-      for (let d = 0; d < D; d++) b *= hmmNormalPDF(obs[t][d], B_params[s][d].mu, B_params[s][d].sigma) + 1e-300;
-      for (let prev = 0; prev < K; prev++) newAlpha[s] += alpha[prev] * A[prev][s];
-      newAlpha[s] *= b;
-    }
-    const scale = newAlpha.reduce((a, b) => a + b, 0) || 1;
-    alpha = newAlpha.map(v => v / scale);
-  }
-
-  const total = alpha.reduce((a, b) => a + b, 0) || 1;
-  return alpha.map(v => v / total);
-}
-
-function hmmBaumWelch(obs, K, D, maxIter = 30) {
-  const T = obs.length;
-  if (T < K * 3) return null;
-
-  // K-means init
-  const sorted0 = [...obs.map(o => o[0])].sort((a,b) => a-b);
-  let assignments = obs.map(o => o[0] > sorted0[Math.floor(T/2)] ? 1 : 0);
-
-  // Init params
-  let pi = new Array(K).fill(1/K);
-  let A  = Array.from({ length: K }, () => Array.from({ length: K }, (_, j) => j === 0 ? 0.9 : 0.1));
-  let B  = Array.from({ length: K }, (_, s) => Array.from({ length: D }, (_, d) => hmmFitGaussianMixture(obs.map(o => o[d]), assignments, K)[s]));
-
-  for (let iter = 0; iter < maxIter; iter++) {
-    // E-step: forward-backward (simplified — use Viterbi assignments)
-    const states = hmmViterbi(obs, pi, A, B, K, D);
-
-    // M-step: update params
-    // Transition matrix
-    const A_new = Array.from({ length: K }, () => new Array(K).fill(1e-6));
-    for (let t = 0; t < T-1; t++) A_new[states[t]][states[t+1]] += 1;
-    for (let s = 0; s < K; s++) {
-      const rowSum = A_new[s].reduce((a,b) => a+b, 0);
-      A_new[s] = A_new[s].map(v => v / rowSum);
-    }
-
-    // Emission params
-    const B_new = Array.from({ length: K }, (_, s) =>
-      Array.from({ length: D }, (_, d) => hmmFitGaussianMixture(obs.map(o => o[d]), states, K)[s])
-    );
-
-    // Initial state
-    const pi_new = new Array(K).fill(1e-6);
-    pi_new[states[0]] += 1;
-    const piSum = pi_new.reduce((a,b) => a+b, 0);
-    pi_new.forEach((v,i) => pi_new[i] = v / piSum);
-
-    A = A_new; B = B_new; pi = pi_new;
-    if (JSON.stringify(states) === JSON.stringify(assignments)) break;
-    assignments = states;
-  }
-
-  return { pi, A, B };
-}
-
-function normalizeFeatures(series) {
-  // Z-score normalize each feature column
+function standardize(series) {
   const D = series[0].length;
   const stats = Array.from({ length: D }, (_, d) => {
-    const vals = series.map(s => s[d]);
-    const mu = vals.reduce((a,b) => a+b, 0) / vals.length;
+    const vals = series.map(s => s[d]).filter(Number.isFinite);
+    const mu   = vals.reduce((a,b) => a+b, 0) / vals.length;
     const sigma = Math.sqrt(vals.reduce((a,b) => a + (b-mu)**2, 0) / vals.length) || 1;
     return { mu, sigma };
   });
-  return { normalized: series.map(s => s.map((v,d) => (v - stats[d].mu) / stats[d].sigma)), stats };
+  return {
+    scaled: series.map(s => s.map((v, d) => Number.isFinite(v) ? (v - stats[d].mu) / stats[d].sigma : 0)),
+    stats,
+  };
 }
 
-async function computeRegimeModel(portfolioItems, portfolioWeights, portfolioDates) {
-  // Fetch regime indicators
+async function computeRegimeModel(portfolioRetMap) {
   const RANGE = "2y";
-  const [vixData, ovxData, hygData] = await Promise.all([
+  // Fetch all 4 features
+  const [vixData, ovxData, hygData, tnxData] = await Promise.all([
     fetchYahooCloses("^VIX",  RANGE),
     fetchYahooCloses("^OVX",  RANGE),
     fetchYahooCloses("HYG",   RANGE),
+    fetchYahooCloses("^TNX",  RANGE),
   ]);
 
-  // Build date-aligned feature matrix
+  // Build maps
   const vixMap = new Map(vixData.bars.map(b => [b.date, b.close]));
   const ovxMap = new Map(ovxData.bars.map(b => [b.date, b.close]));
   const hygMap = new Map(hygData.bars.map(b => [b.date, b.close]));
+  const tnxMap = new Map(tnxData.bars.map(b => [b.date, b.close]));
 
-  // HYG: use negative return as credit stress (price down = spread up = stress)
+  // HYG: negative daily return = credit stress proxy
   const hygBars = hygData.bars;
-  const hygRetMap = new Map();
+  const hygStressMap = new Map();
   for (let i = 1; i < hygBars.length; i++) {
     const ret = (hygBars[i].close - hygBars[i-1].close) / hygBars[i-1].close;
-    hygRetMap.set(hygBars[i].date, -ret * 100); // positive = stress
+    hygStressMap.set(hygBars[i].date, -ret * 100);
   }
 
-  // Common dates across all features
-  const allDates = [...new Set([...vixMap.keys(), ...ovxMap.keys(), ...hygRetMap.keys()])]
-    .filter(d => vixMap.has(d) && ovxMap.has(d) && hygRetMap.has(d))
+  // TNX: rolling 10-day realised vol as rates vol proxy
+  const tnxBars = tnxData.bars;
+  const tnxVolMap = new Map();
+  const WIN_TNXVOL = 10;
+  for (let i = WIN_TNXVOL; i < tnxBars.length; i++) {
+    const slice = tnxBars.slice(i - WIN_TNXVOL, i).map(b => b.close);
+    const m = slice.reduce((a,b) => a+b, 0) / slice.length;
+    const v = Math.sqrt(slice.reduce((a,b) => a + (b-m)**2, 0) / slice.length);
+    tnxVolMap.set(tnxBars[i].date, v);
+  }
+
+  // Common dates
+  const allDates = [...vixMap.keys()]
+    .filter(d => ovxMap.has(d) && hygStressMap.has(d) && tnxVolMap.has(d))
     .sort();
 
-  if (allDates.length < 60) throw new Error("Insufficient feature data");
+  if (allDates.length < 100) throw new Error("Insufficient data — need at least 100 common trading days");
 
   const rawFeatures = allDates.map(d => [
-    vixMap.get(d),       // VIX level
-    ovxMap.get(d),       // OVX (WTI vol)
-    hygRetMap.get(d),    // HYG negative return (credit stress)
+    vixMap.get(d),         // VIX level
+    ovxMap.get(d),         // OVX (WTI vol)
+    hygStressMap.get(d),   // HYG negative return (credit stress)
+    tnxVolMap.get(d),      // TNX rolling vol (rates vol)
   ]);
 
-  // Normalize features
-  const { normalized: features } = normalizeFeatures(rawFeatures);
+  // Standardize (StandardScaler equivalent)
+  const { scaled } = standardize(rawFeatures);
 
-  // Walk-forward: train on rolling 252d window, label each day out-of-sample
-  const TRAIN_WIN = 252;
-  const K = 2, D = 3;
-  const regimeLabelsRaw = new Array(allDates.length).fill(null);
-  const stressProbsRaw  = new Array(allDates.length).fill(null);
+  // Fit full-sample HMM
+  const K = 2, D = 4;
+  const model = fitHMM(scaled, K, 100);
+  if (!model) throw new Error("HMM fitting failed");
 
-  // Fit on full history first to identify which state = stress
-  const fullModel = hmmBaumWelch(features, K, D);
-  if (!fullModel) throw new Error("HMM fitting failed");
+  const { pi, A, mu, covInv, gamma } = model;
+  const covDetArr = covInv.map(c => c.det);
+  const covInvArr = covInv.map(c => c.inv);
 
-  // Walk-forward labeling
-  for (let t = TRAIN_WIN; t < allDates.length; t++) {
-    const trainObs = features.slice(t - TRAIN_WIN, t);
-    const model = hmmBaumWelch(trainObs, K, D, 20);
-    if (!model) continue;
+  // Hard labels via Viterbi
+  const states = viterbi(scaled, pi, A, mu, covInvArr, covDetArr, K);
 
-    // Predict current day
-    const curObs = [features[t]];
-    const fwdProb = hmmForwardProb(curObs, model.pi, model.A, model.B, K, D);
+  // Identify stress state: higher mean VIX (feature 0) = stress
+  const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
 
-    // Identify stress state: higher mean VIX (feature[0]) = stress
-    const stressState = model.B[0][0].mu > model.B[1][0].mu ? 0 : 1;
-    regimeLabelsRaw[t] = fwdProb[stressState] > 0.5 ? 1 : 0; // 1=stress, 0=normal
-    stressProbsRaw[t]  = +fwdProb[stressState].toFixed(4);
-  }
+  // Align stress so regime 1 = stress
+  const regimes    = states.map(s => s === stressState ? 1 : 0);
+  const stressProbs = gamma.map(g => +g[stressState].toFixed(4));
 
-  // Build portfolio return series aligned to feature dates
-  // Use weighted returns from portfolioItems if available, else zeros
-  const portfolioRetMap = new Map();
-  if (portfolioItems && portfolioWeights && portfolioDates) {
-    portfolioDates.forEach((d, i) => {
-      const r = portfolioItems.reduce((s, item, j) => s + portfolioWeights[j] * (item.returns[i] || 0), 0);
-      portfolioRetMap.set(d, r);
-    });
-  }
+  // Portfolio returns aligned to feature dates
+  const portRets = allDates.map(d => portfolioRetMap?.get(d) ?? null);
 
-  // Align portfolio returns to regime dates
-  const aligned = allDates.map((d, i) => ({
-    date:        d,
-    regime:      regimeLabelsRaw[i],   // null during burn-in
-    stressProb:  stressProbsRaw[i],
-    portRet:     portfolioRetMap.get(d) ?? null,
-    vix:         rawFeatures[i][0],
-    ovx:         rawFeatures[i][1],
-    hygStress:   rawFeatures[i][2],
-  })).filter(r => r.regime !== null);
+  // Separate rets by regime
+  const normalRets = portRets.filter((r, i) => r !== null && regimes[i] === 0);
+  const stressRets = portRets.filter((r, i) => r !== null && regimes[i] === 1);
 
-  // Separate portfolio returns by regime
-  const normalRets  = aligned.filter(r => r.regime === 0 && r.portRet !== null).map(r => r.portRet);
-  const stressRets  = aligned.filter(r => r.regime === 1 && r.portRet !== null).map(r => r.portRet);
-
-  // Stats per regime
   function regimeStats(rets) {
     if (!rets.length) return null;
-    const m = mean(rets);
-    const s = std(rets);
-    const annVol = s * Math.sqrt(252) * 100;
-    const annRet = ((rets.reduce((a,b) => a*(1+b), 1)) ** (252/rets.length) - 1) * 100;
+    const s = std(rets), annVol = s * Math.sqrt(252) * 100;
+    const cumRet = rets.reduce((a,b) => a*(1+b), 1);
+    const annRet = rets.length > 0 ? (Math.pow(cumRet, 252/rets.length) - 1) * 100 : 0;
     const var95  = histVaR(rets, 0.95);
     const cvar95 = histCVaR(rets, 0.95);
-    // Average drawdown
-    let peak = 1, sumDD = 0, ddCount = 0;
-    let cumVal = 1;
-    rets.forEach(r => {
-      cumVal *= (1+r);
-      if (cumVal > peak) peak = cumVal;
-      const dd = (cumVal - peak) / peak;
-      if (dd < 0) { sumDD += dd; ddCount++; }
-    });
-    const avgDD = ddCount ? (sumDD / ddCount) * 100 : 0;
-    const maxDD = maxDDFromReturns(rets);
+    let peak = 1, cum = 1, sumDD = 0, ddN = 0;
+    rets.forEach(r => { cum *= (1+r); if (cum > peak) peak = cum; const dd = (cum-peak)/peak; if (dd < 0) { sumDD += dd; ddN++; } });
     return {
       count: rets.length,
       annualizedRetPct:  +annRet.toFixed(2),
       annualizedVolPct:  +annVol.toFixed(2),
       dailyVolPct:       +(s*100).toFixed(3),
-      sharpe:            annVol === 0 ? null : +(annRet / annVol).toFixed(3),
+      sharpe:            annVol === 0 ? null : +(annRet/annVol).toFixed(3),
       var95Pct:          var95 !== null ? +(var95*100).toFixed(2) : null,
       cvar95Pct:         cvar95 !== null ? +(cvar95*100).toFixed(2) : null,
-      avgDrawdownPct:    +avgDD.toFixed(2),
-      maxDrawdownPct:    +maxDD.toFixed(2),
+      avgDrawdownPct:    ddN ? +(sumDD/ddN*100).toFixed(2) : 0,
+      maxDrawdownPct:    +maxDDFromReturns(rets).toFixed(2),
     };
   }
 
-  // Portfolio index (cumulative) with regime coloring
+  // Portfolio cumulative index
   let cumVal = 100;
-  const portfolioIndex = aligned
-    .filter(r => r.portRet !== null)
-    .map(r => {
-      cumVal *= (1 + r.portRet);
-      return { date: r.date, value: +cumVal.toFixed(3), regime: r.regime };
+  const portfolioIndex = allDates.map((d, i) => {
+    if (portRets[i] !== null) cumVal *= (1 + portRets[i]);
+    return { date: d, value: +cumVal.toFixed(3), regime: regimes[i] };
+  });
+
+  // Feature means per state (for interpretation)
+  const featureNames = ["VIX","OVX","HYG_stress","TNX_vol"];
+  const stateMeans = Array.from({ length: K }, (_, s) => {
+    const obj = {};
+    featureNames.forEach((f, d) => {
+      const pts = allDates.map((_, i) => rawFeatures[i][d]).filter((_, i) => regimes[i] === (s === stressState ? 1 : 0));
+      obj[f] = pts.length ? +(pts.reduce((a,b) => a+b, 0)/pts.length).toFixed(2) : null;
     });
+    return obj;
+  });
 
-  // Return distribution bins per regime
-  const normalDist  = returnDistribution(normalRets, 20);
-  const stressDist  = returnDistribution(stressRets, 20);
-
-  // Current stress probability (last date)
-  const lastAligned = aligned[aligned.length - 1];
-
+  const lastI = allDates.length - 1;
   return {
-    dates:          aligned.map(r => r.date),
-    regimes:        aligned.map(r => r.regime),
-    stressProbs:    aligned.map(r => r.stressProb),
-    vix:            aligned.map(r => r.vix),
+    dates:             allDates,
+    regimes,
+    stressProbs,
     portfolioIndex,
-    normalStats:    regimeStats(normalRets),
-    stressStats:    regimeStats(stressRets),
-    normalDist,
-    stressDist,
-    normalRetsPct:  normalRets.map(r => +(r*100).toFixed(4)),
-    stressRetsPct:  stressRets.map(r => +(r*100).toFixed(4)),
-    currentStressProb:  lastAligned?.stressProb ?? null,
-    currentRegime:      lastAligned?.regime ?? null,
-    currentVix:         lastAligned?.vix ?? null,
-    featureDays:    aligned.length,
-    normalDays:     normalRets.length,
-    stressDays:     stressRets.length,
-    trainWindow:    TRAIN_WIN,
-    method: "2-state Gaussian HMM walk-forward (252d train window) on VIX + OVX + HYG credit stress proxy",
+    normalStats:       regimeStats(normalRets),
+    stressStats:       regimeStats(stressRets),
+    normalDist:        returnDistribution(normalRets, 20),
+    stressDist:        returnDistribution(stressRets, 20),
+    currentRegime:     regimes[lastI],
+    currentStressProb: stressProbs[lastI],
+    currentVix:        rawFeatures[lastI][0],
+    normalDays:        normalRets.length,
+    stressDays:        stressRets.length,
+    featureDays:       allDates.length,
+    stateMeans,
+    transitionMatrix:  A,
+    method: "Full-sample 2-state Gaussian HMM (full covariance, 100 EM iterations, persistence prior=10) on VIX + OVX + HYG credit stress + TNX realised vol",
   };
 }
 
@@ -1255,23 +1314,19 @@ app.get("/api/quotes", async (req, res) => {
 // Regime detection endpoint
 app.get("/api/regime", async (req, res) => {
   try {
-    // Get portfolio weights for return series
-    const p = await buildPortfolio().catch(() => null);
-    let portfolioItems = null, portfolioWeights = null, portfolioDates = null;
-
-    if (p?.combined?.metrics1Y) {
-      const m = p.combined.metrics1Y;
-      // Rebuild portfolio return series from metrics (already computed)
-      if (m.dates && m.portfolioReturnsPct) {
-        portfolioDates = m.dates;
-        // We need per-asset returns and weights to rebuild
-        // Use the portfolioReturnsPct directly as the weighted series
-        portfolioItems = [{ returns: m.portfolioReturnsPct.map(v => v/100) }];
-        portfolioWeights = [1];
+    // Get weighted portfolio daily return series (date → return)
+    const portfolioRetMap = new Map();
+    try {
+      const p = await buildPortfolio();
+      const m = p?.combined?.metrics1Y;
+      if (m?.dates && m?.portfolioReturnsPct) {
+        m.dates.forEach((d, i) => {
+          const r = m.portfolioReturnsPct[i];
+          if (Number.isFinite(r)) portfolioRetMap.set(d, r / 100);
+        });
       }
-    }
-
-    const result = await computeRegimeModel(portfolioItems, portfolioWeights, portfolioDates);
+    } catch {}
+    const result = await computeRegimeModel(portfolioRetMap.size > 0 ? portfolioRetMap : null);
     res.json(result);
   } catch (e) {
     console.error("Regime error:", e.message);

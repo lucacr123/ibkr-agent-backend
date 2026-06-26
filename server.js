@@ -567,7 +567,7 @@ function fitHMM(obs, K, maxIter=100) {
     const {gamma:ng,xi,logLik}=forwardBackward(obs,pi,A,mu,covInv.map(c=>c.inv),covInv.map(c=>c.det),K);
     gamma=ng;
     pi=gamma[0].map(v=>v+1e-10); const piS=pi.reduce((a,b)=>a+b,0); pi=pi.map(v=>v/piS);
-    const PRIOR=1;
+    const PRIOR=0.1;  // near-zero prior = less sticky, regime switches driven by data
     A=Array.from({length:K},(_,s)=>{const row=Array.from({length:K},(_,s2)=>{return xi.reduce((sum,xit)=>sum+xit[s][s2],0)+PRIOR;});const rs=row.reduce((a,b)=>a+b,0);return row.map(v=>v/rs);});
     mu=Array.from({length:K},(_,s)=>sampleMean(obs,gamma.map(g=>g[s])));
     covs=Array.from({length:K},(_,s)=>sampleFullCov(obs,mu[s],gamma.map(g=>g[s])));
@@ -609,7 +609,10 @@ async function computeRegimeModel(portfolioRetMap) {
   const ovxMap=new Map(ovxData.bars.map(b=>[b.date,b.close]));
   const hygBars=hygData.bars;
   const hygStressMap=new Map();
-  for (let i=1;i<hygBars.length;i++){const ret=(hygBars[i].close-hygBars[i-1].close)/hygBars[i-1].close;hygStressMap.set(hygBars[i].date,-ret*100);}
+  // Use absolute HYG price level — lower price = higher credit stress
+  // Invert so higher value = more stress (consistent with VIX/OVX)
+  const hygMax=Math.max(...hygBars.map(b=>b.close));
+  for (const b of hygBars) hygStressMap.set(b.date, hygMax - b.close);
   const allDates=[...vixMap.keys()].filter(d=>ovxMap.has(d)&&hygStressMap.has(d)).sort();
   if (allDates.length<252) throw new Error("Need at least 252 trading days");
   const rawFeatures=allDates.map(d=>[vixMap.get(d),ovxMap.get(d),hygStressMap.get(d)]);
@@ -638,11 +641,11 @@ async function computeRegimeModel(portfolioRetMap) {
   }
   let cumVal=100;
   const portfolioIndex=allDates.map((d,i)=>({d,i})).filter(({d})=>d>=cutoffStr).map(({d,i})=>{if(portRets[i]!==null)cumVal*=(1+portRets[i]);return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]};});
-  const stressProbFull=allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}));
+  const stressProbFull=allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]})).filter(x=>x.date>=cutoffStr);
   const featureNames=["VIX","OVX","HYG_stress"];
   const stateMeans=[0,1].map(r=>{const obj={};featureNames.forEach((f,d)=>{const pts=rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;});return obj;});
   const lastI=allDates.length-1;
-  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=1) on VIX+OVX+HYG — chart & stats: last 1Y"};
+  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=0.1) on VIX+OVX+HYG(level) — chart & stats: last 1Y"};
 }
 
 // ─── Tool executor ────────────────────────────────────────────────

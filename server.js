@@ -898,7 +898,7 @@ function fitHMM(obs, K, maxIter = 100) {
   // Init params
   let pi = Array.from({ length: K }, (_, s) => gamma.reduce((sum, g) => sum + g[s], 0) / T);
   let A  = Array.from({ length: K }, (_, s) => {
-    const row = Array.from({ length: K }, (_, s2) => s === s2 ? 9 : 1); // strong persistence prior
+    const row = Array.from({ length: K }, (_, s2) => s === s2 ? 3 : 1); // mild persistence init
     const rs  = row.reduce((a,b) => a+b, 0);
     return row.map(v => v/rs);
   });
@@ -921,7 +921,7 @@ function fitHMM(obs, K, maxIter = 100) {
     pi = pi.map(v => v/piSum);
 
     // Transition (with strong persistence prior)
-    const PRIOR = 10; // transmat_prior=10 like Python
+    const PRIOR = 1;  // uninformative prior — less sticky regimes
     A = Array.from({ length: K }, (_, s) => {
       const row = Array.from({ length: K }, (_, s2) => {
         const xiSum = xi.reduce((sum, xit) => sum + xit[s][s2], 0);
@@ -1056,15 +1056,16 @@ async function computeRegimeModel(portfolioRetMap) {
   // Portfolio returns aligned to feature dates
   const portRets = allDates.map(d => portfolioRetMap?.get(d) ?? null);
 
-  // Separate rets by regime
-  const normalRets = portRets.filter((r, i) => r !== null && regimes[i] === 0);
-  const stressRets = portRets.filter((r, i) => r !== null && regimes[i] === 1);
+  // For stats/distributions: only last 365 calendar days
+  const cutoff1Y = new Date(); cutoff1Y.setDate(cutoff1Y.getDate() - 365);
+  const cutoffStr = cutoff1Y.toISOString().slice(0, 10);
+  const normalRets = portRets.filter((r, i) => r !== null && regimes[i] === 0 && allDates[i] >= cutoffStr);
+  const stressRets = portRets.filter((r, i) => r !== null && regimes[i] === 1 && allDates[i] >= cutoffStr);
 
   function regimeStats(rets) {
     if (!rets.length) return null;
     const s = std(rets), annVol = s * Math.sqrt(252) * 100;
-    const cumRet = rets.reduce((a,b) => a*(1+b), 1);
-    const annRet = rets.length > 0 ? (Math.pow(cumRet, 252/rets.length) - 1) * 100 : 0;
+    const annRet = mean(rets) * 252 * 100;  // mean daily ret × 252 (correct for non-contiguous regime days)
     const var95  = histVaR(rets, 0.95);
     const cvar95 = histCVaR(rets, 0.95);
     let peak = 1, cum = 1, sumDD = 0, ddN = 0;

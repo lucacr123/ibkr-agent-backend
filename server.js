@@ -526,7 +526,7 @@ function sampleMean(data, weights) {
 }
 function sampleFullCov(data, mu, weights) {
   const D = data[0].length, wSum = weights.reduce((a,b)=>a+b,0)||1;
-  return Array.from({length:D},(_,i)=>Array.from({length:D},(_,j)=>data.reduce((s,x,t)=>s+weights[t]*(x[i]-mu[i])*(x[j]-mu[j]),0)/wSum+(i===j?1e-4:0)));
+  return Array.from({length:D},(_,i)=>Array.from({length:D},(_,j)=>data.reduce((s,x,t)=>s+weights[t]*(x[i]-mu[i])*(x[j]-mu[j]),0)/wSum+(i===j?0.05:0)));  // regularisation 0.05 keeps states from perfect separation
 }
 function forwardBackward(obs, pi, A, mu, covInv, covDet, K) {
   const T = obs.length, D = obs[0].length;
@@ -567,7 +567,7 @@ function fitHMM(obs, K, maxIter=100) {
     const {gamma:ng,xi,logLik}=forwardBackward(obs,pi,A,mu,covInv.map(c=>c.inv),covInv.map(c=>c.det),K);
     gamma=ng;
     pi=gamma[0].map(v=>v+1e-10); const piS=pi.reduce((a,b)=>a+b,0); pi=pi.map(v=>v/piS);
-    const PRIOR=0.1;  // near-zero prior = less sticky, regime switches driven by data
+    const PRIOR=2;  // moderate prior = smooth transitions, prevents binary flipping
     A=Array.from({length:K},(_,s)=>{const row=Array.from({length:K},(_,s2)=>{return xi.reduce((sum,xit)=>sum+xit[s][s2],0)+PRIOR;});const rs=row.reduce((a,b)=>a+b,0);return row.map(v=>v/rs);});
     mu=Array.from({length:K},(_,s)=>sampleMean(obs,gamma.map(g=>g[s])));
     covs=Array.from({length:K},(_,s)=>sampleFullCov(obs,mu[s],gamma.map(g=>g[s])));
@@ -610,8 +610,9 @@ async function computeRegimeModel(portfolioRetMap) {
   const xtc5Bars=xtc5Data.bars;
   const hygStressMap=new Map();
   // XTC5 is SHORT iTraxx Crossover — higher price = wider spreads = more credit stress
-  // Use absolute price level directly as stress signal (high = stressed)
-  for (const b of xtc5Bars) hygStressMap.set(b.date, b.close);
+  // Use absolute price level directly. Forward-fill any gaps.
+  let lastXtc5=xtc5Bars[0]?.close||100;
+  for (const b of xtc5Bars) { if(b.close!==null) lastXtc5=b.close; hygStressMap.set(b.date, lastXtc5); }
   const allDates=[...vixMap.keys()].filter(d=>ovxMap.has(d)&&hygStressMap.has(d)).sort();
   if (allDates.length<252) throw new Error("Need at least 252 trading days");
   const rawFeatures=allDates.map(d=>[vixMap.get(d),ovxMap.get(d),hygStressMap.get(d)]);
@@ -624,7 +625,8 @@ async function computeRegimeModel(portfolioRetMap) {
   const states=viterbi(scaled,pi,A,mu,covInvArr,covDetArr,K);
   const stressState=mu[0][0]>mu[1][0]?0:1;
   const regimes=states.map(s=>s===stressState?1:0);
-  const stressProbs=gamma.map(g=>+g[stressState].toFixed(4));
+  // Use smoothed posterior gamma for stress probability (forward-backward gives proper smoothed probs)
+  const stressProbs=gamma.map(g=>+Math.max(0,Math.min(1,g[stressState])).toFixed(4));
   const cutoff1Y=new Date(); cutoff1Y.setDate(cutoff1Y.getDate()-365);
   const cutoffStr=cutoff1Y.toISOString().slice(0,10);
   const portRets=allDates.map(d=>portfolioRetMap?.get(d)??null);
@@ -644,7 +646,7 @@ async function computeRegimeModel(portfolioRetMap) {
   const featureNames=["VIX","OVX","XTC5(iTraxx_short)"];
   const stateMeans=[0,1].map(r=>{const obj={};featureNames.forEach((f,d)=>{const pts=rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;});return obj;});
   const lastI=allDates.length-1;
-  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=0.1) on VIX+OVX+XTC5.DE(iTraxx Crossover Short level) — chart & stats: last 1Y"};
+  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=2, reg=0.05) on VIX + OVX + XTC5.DE (Xtrackers iTraxx Crossover Short) — chart & stats: last 1Y"};
 }
 
 // ─── Tool executor ────────────────────────────────────────────────

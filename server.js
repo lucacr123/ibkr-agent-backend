@@ -18,8 +18,8 @@ const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || "";
 const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "";
 const VAPID_EMAIL   = process.env.VAPID_EMAIL       || "mailto:you@example.com";
 
-const RESEND_KEY   = process.env.RESEND_API_KEY  || "";
-const REPORT_TO    = process.env.REPORT_EMAIL_TO || "rodriguez.albacar.joaquin@gmail.com";
+const RESEND_KEY  = process.env.RESEND_API_KEY  || "";
+const REPORT_TO   = process.env.REPORT_EMAIL_TO || "rodriguez.albacar.joaquin@gmail.com";
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
@@ -322,7 +322,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       annualizedReturnPct: +(annRet * 100).toFixed(2),
       averageDailyReturnPct: +(mean(pr) * 100).toFixed(4),
       annualizedVolPct: +(annVol * 100).toFixed(2),
-      sharpe: annVol === 0 ? null : +(annRet / annVol).toFixed(3),  // annualized: annRet / sqrt(w'Σw)*sqrt(252)
+      sharpe: annVol === 0 ? null : +(annRet / annVol).toFixed(3),  // annRet/sqrt(w'Σw)sqrt(252)
       sortino: downsideVol === 0 ? null : +(annRet / downsideVol).toFixed(3),
       maxDrawdownPct: +mdd.toFixed(2),
       var95Pct: var95 === null ? null : +(var95 * 100).toFixed(2),
@@ -337,7 +337,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       dates,
       portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
-      // rollingSharpe30 removed
+      rollingSharpe30: rollingFn(pr, 30, arr => { const ar = annualizedReturn(arr); const av = std(arr) * Math.sqrt(252); return av === 0 ? null : +(ar / av).toFixed(4); }),
       weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
@@ -381,19 +381,17 @@ async function fetchSymbolNews(symbol, limit = 5) {
       { headers: { "User-Agent": "Mozilla/5.0" } }
     );
     const d = await res.json();
-    const news = (d?.news || []).slice(0, limit).map(n => ({
+    return (d?.news || []).slice(0, limit).map(n => ({
       title: n.title, publisher: n.publisher,
       published: n.providerPublishTime ? new Date(n.providerPublishTime * 1000).toISOString() : null,
       link: n.link,
     }));
-    if (news.length) return news;
-  } catch {}
-  return [];
+  } catch { return []; }
 }
 
-// ─── Email report ─────────────────────────────────────────────────
+// ─── Email ────────────────────────────────────────────────────────
 async function sendEmail(to, subject, html) {
-  if (!RESEND_KEY) { console.log("📧 No RESEND_API_KEY — email skipped:", subject); return { ok: false }; }
+  if (!RESEND_KEY) { console.log("📧 No RESEND_API_KEY — skipped:", subject); return { ok: false }; }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
@@ -401,7 +399,7 @@ async function sendEmail(to, subject, html) {
   });
   const data = await res.json();
   if (!res.ok) throw new Error(`Resend: ${JSON.stringify(data)}`);
-  console.log("📧 Email sent:", subject, "→", to, "id:", data.id);
+  console.log("📧 Email sent to", to);
   return { ok: true, id: data.id };
 }
 
@@ -414,115 +412,238 @@ async function buildAndSendReport(to) {
   const combined = portfolio?.combined || {};
   const positions = combined.positions || [];
   const metrics = combined.metrics1Y;
-
   const nlv = `€${(combined.totalNetLiquidation||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
   const unrealPnl = combined.totalUnrealizedPnlEUR || 0;
   const unrealCol = unrealPnl >= 0 ? "#2ECC71" : "#E74C3C";
   const unrealStr = `${unrealPnl>=0?"+":""}€${Math.abs(unrealPnl).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
   const twr = combined.avgYtdReturnPct || 0;
   const twrCol = twr >= 0 ? "#2ECC71" : "#E74C3C";
-
   const headlinesHtml = (newsData?.headlines||[]).slice(0,5).map(h =>
     `<li style="margin-bottom:10px;line-height:1.5"><a href="${h.link||"#"}" style="color:#4A9EFF;text-decoration:none;font-size:14px">${h.title}</a><br><span style="color:#5A6280;font-size:11px">${h.publisher||""} ${h.published?`· ${new Date(h.published).toLocaleDateString()}`:""}}</span></li>`
   ).join("") || "<li style='color:#5A6280'>No headlines available</li>";
-
   const macroRows = (macro?.quotes||[]).slice(0,10).map(q => {
     const c = q.changePct>=0?"#2ECC71":"#E74C3C";
-    const arrow = q.changePct>=0?"▲":"▼";
-    return `<tr style="border-bottom:1px solid #1A1E2A"><td style="padding:7px 8px;color:#EDF0F7;font-size:13px">${q.symbol}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:#EDF0F7">${(q.price||0).toFixed(2)}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:${c}">${arrow} ${(q.changePct||0).toFixed(2)}%</td></tr>`;
+    return `<tr style="border-bottom:1px solid #1A1E2A"><td style="padding:7px 8px;color:#EDF0F7;font-size:13px">${q.symbol}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:#EDF0F7">${(q.price||0).toFixed(2)}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:${c}">${q.changePct>=0?"▲":"▼"} ${(q.changePct||0).toFixed(2)}%</td></tr>`;
   }).join("");
-
   const maxPct = Math.max(...positions.map(p=>p.allocationPct||0), 1);
   const allocBars = positions.slice(0,8).map(p => {
     const w = Math.round((p.allocationPct/maxPct)*180);
     const col = p.allocationPct > 20 ? "#C9A84C" : "#4A9EFF";
     return `<tr><td style="padding:4px 8px 4px 0;font-family:monospace;font-size:12px;color:#EDF0F7;white-space:nowrap">${p.symbol}</td><td><div style="background:${col};height:12px;width:${w}px;border-radius:3px;display:inline-block"></div></td><td style="padding-left:8px;font-family:monospace;font-size:12px;color:#C9A84C">${p.allocationPct.toFixed(1)}%</td></tr>`;
   }).join("");
-
   const concentration = positions.filter(p=>p.allocationPct>25);
   const risks = [
-    concentration.length ? `<div style="background:#2A1A1A;border-left:4px solid #E74C3C;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#E74C3C">⚠️ Concentration risk</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">${concentration.map(p=>`${p.symbol} is ${p.allocationPct.toFixed(1)}% of the portfolio — a lot of eggs in one basket.`).join(" ")}</p></div>` : "",
-    `<div style="background:#1A1E2A;border-left:4px solid #F59E0B;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#F59E0B">💱 Currency risk</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">The portfolio holds funds in EUR, GBP and USD. When these currencies move against each other, it affects the total value — even if nothing else changes.</p></div>`,
-    `<div style="background:#1A1E2A;border-left:4px solid #4A9EFF;border-radius:0 10px 10px 0;padding:12px"><strong style="color:#4A9EFF">📊 Normal market swings</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">Short-term ups and downs are completely normal. This portfolio is spread across thousands of companies worldwide, which helps smooth things out over time. No need to panic on red days!</p></div>`,
+    concentration.length ? `<div style="background:#2A1A1A;border-left:4px solid #E74C3C;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#E74C3C">⚠️ Concentration</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">${concentration.map(p=>`${p.symbol} is ${p.allocationPct.toFixed(1)}%`).join(", ")} — a lot of eggs in one basket.</p></div>` : "",
+    `<div style="background:#1A1E2A;border-left:4px solid #F59E0B;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#F59E0B">💱 Currency risk</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">Holdings in EUR, GBP and USD. FX moves affect total value even if stocks don't move.</p></div>`,
+    `<div style="background:#1A1E2A;border-left:4px solid #4A9EFF;border-radius:0 10px 10px 0;padding:12px"><strong style="color:#4A9EFF">📊 Normal swings</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">Short-term ups and downs are normal. Broadly diversified across thousands of global companies.</p></div>`,
   ].join("");
-
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7">
 <div style="max-width:600px;margin:0 auto;padding:24px 16px">
-
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:24px;margin-bottom:20px;text-align:center">
     <div style="font-size:32px;margin-bottom:8px">📊</div>
     <h1 style="margin:0;font-size:22px;color:#E8C87A;font-weight:700">Your Morning Portfolio Report</h1>
     <p style="margin:8px 0 0;color:#5A6280;font-size:14px">${new Date().toLocaleDateString("en-GB",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
   </div>
-
-  <div style="background:#1A1E2A;border-left:4px solid #C9A84C;border-radius:0 12px 12px 0;padding:14px 16px;margin-bottom:20px">
-    <p style="margin:0;font-size:14px;color:#EDF0F7;line-height:1.6">👋 <strong>Good morning!</strong> Here's your daily portfolio health check. We'll cover what's happening in the world, how your money is doing, and anything worth keeping an eye on.</p>
-  </div>
-
-  <!-- 1. Market News -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">🌍 1. Market News Overview</h2>
-    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">Top stories that could affect financial markets today:</p>
+    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">🌍 1. Market News</h2>
     <ul style="margin:0;padding-left:18px">${headlinesHtml}</ul>
   </div>
-
-  <!-- 2. Portfolio Overview -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">💼 2. Portfolio Overview</h2>
-    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">You own shares in investment funds spread across two accounts. Think of each fund as a basket of many company shares.</p>
+    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">💼 2. Portfolio Overview</h2>
     <div style="background:#1A1E2A;border-radius:12px;padding:16px;margin-bottom:16px;text-align:center">
-      <div style="font-size:11px;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">Total Value of Your Portfolio</div>
+      <div style="font-size:11px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Total Value</div>
       <div style="font-size:34px;font-weight:700;color:#E8C87A;font-family:monospace">${nlv}</div>
-      <div style="font-size:13px;color:${twrCol};margin-top:6px">12-month return: ${twr>=0?"+":""}${twr}% ${twr>=0?"📈":"📉"}</div>
+      <div style="font-size:13px;color:${twrCol};margin-top:6px">1Y return: ${twr>=0?"+":""}${twr}%</div>
     </div>
-    <div style="font-size:11px;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:10px">How your money is split:</div>
     <table style="width:100%">${allocBars}</table>
-    <p style="font-size:11px;color:#5A6280;margin:10px 0 0">Each bar = percentage of your total money. Bigger bar = more money there.</p>
   </div>
-
-  <!-- 3. Market Snapshot -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">📈 Markets at a glance</h2>
-    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">Like a weather forecast for different types of investments:</p>
+    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">📈 Markets</h2>
     <table style="width:100%;border-collapse:collapse">
-      <thead><tr style="border-bottom:1px solid #252A38"><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px;text-transform:uppercase">Market</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Price</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Today</th></tr></thead>
-      <tbody>${macroRows||"<tr><td colspan='3' style='padding:8px;color:#5A6280;font-size:13px'>No data available</td></tr>"}</tbody>
+      <thead><tr><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Market</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Price</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Today</th></tr></thead>
+      <tbody>${macroRows}</tbody>
     </table>
   </div>
-
-  <!-- 4. PnL -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">💰 3. P&amp;L and Performance Summary</h2>
-    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">The difference between what your investments are worth now vs what was paid for them:</p>
-    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px">
-      <div style="flex:1;min-width:130px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center">
-        <div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Unrealised Gain/Loss</div>
-        <div style="font-size:20px;font-weight:700;color:${unrealCol};font-family:monospace">${unrealStr}</div>
-        <div style="font-size:10px;color:#5A6280;margin-top:4px">On paper — not cashed in</div>
-      </div>
-      ${metrics?`<div style="flex:1;min-width:130px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center"><div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Sharpe Ratio</div><div style="font-size:20px;font-weight:700;color:${(metrics.sharpe||0)>0.5?"#2ECC71":"#F59E0B"};font-family:monospace">${(metrics.sharpe||0).toFixed(2)}</div><div style="font-size:10px;color:#5A6280;margin-top:4px">Return quality (>0.5 = good)</div></div>`:""}
-      ${metrics?`<div style="flex:1;min-width:130px;background:#1A1E2A;border-radius:12px;padding:14px;text-align:center"><div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Max Drawdown</div><div style="font-size:20px;font-weight:700;color:#E74C3C;font-family:monospace">${(metrics.maxDrawdownPct||0).toFixed(1)}%</div><div style="font-size:10px;color:#5A6280;margin-top:4px">Worst dip from peak</div></div>`:""}
+    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">💰 3. P&amp;L Summary</h2>
+    <div style="background:#1A1E2A;border-radius:12px;padding:14px;text-align:center;margin-bottom:12px">
+      <div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Unrealised Gain/Loss</div>
+      <div style="font-size:22px;font-weight:700;color:${unrealCol};font-family:monospace">${unrealStr}</div>
     </div>
-    ${metrics?`<div style="background:#1A1E2A;border-radius:10px;padding:12px"><p style="margin:0;font-size:13px;color:#EDF0F7;line-height:1.6">📖 <strong>In plain English:</strong> Over the past year, the portfolio returned <strong style="color:${(metrics.annualizedReturnPct||0)>=0?"#2ECC71":"#E74C3C"}">${(metrics.annualizedReturnPct||0).toFixed(1)}%</strong>. The typical daily up/down was about <strong style="color:#EDF0F7">${(metrics.annualizedVolPct||0).toFixed(1)}%</strong> when annualised. The worst stretch was a <strong style="color:#E74C3C">${(metrics.maxDrawdownPct||0).toFixed(1)}%</strong> drop from the highest point.</p></div>`:""}
+    ${metrics?`<div style="background:#1A1E2A;border-radius:10px;padding:12px"><p style="margin:0;font-size:13px;color:#EDF0F7;line-height:1.6">Over the past year: returned <strong style="color:${(metrics.annualizedReturnPct||0)>=0?"#2ECC71":"#E74C3C"}">${(metrics.annualizedReturnPct||0).toFixed(1)}%</strong>, vol <strong>${(metrics.annualizedVolPct||0).toFixed(1)}%</strong>, max drawdown <strong style="color:#E74C3C">${(metrics.maxDrawdownPct||0).toFixed(1)}%</strong>.</p></div>`:""}
   </div>
-
-  <!-- 5. Risks -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">⚠️ 4. Risks to be Watched</h2>
-    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">Not reasons to panic — just things worth being aware of:</p>
+    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">⚠️ 4. Risks to Watch</h2>
     ${risks}
   </div>
-
   <div style="text-align:center;padding:16px;color:#5A6280;font-size:11px">
-    <p style="margin:0">Generated by IBKR Agent · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC</p>
-    <p style="margin:6px 0 0">Data: IBKR Flex + Yahoo Finance. Not financial advice.</p>
+    <p style="margin:0">IBKR Agent · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC · Not financial advice</p>
   </div>
 </div></body></html>`;
-
   return sendEmail(to, `📊 Morning Portfolio Report — ${new Date().toLocaleDateString("en-GB")}`, html);
 }
 
+// ─── HMM Regime Detection Engine ─────────────────────────────────
+function gaussianPDF(x, mu, sigma) {
+  if (sigma <= 0) return 1e-300;
+  return Math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * Math.sqrt(2 * Math.PI));
+}
+function mvnPDF(x, mu, covInv, covDet, D) {
+  const diff = x.map((v, d) => v - mu[d]);
+  let quad = 0;
+  for (let i = 0; i < D; i++) for (let j = 0; j < D; j++) quad += diff[i] * covInv[i][j] * diff[j];
+  const norm = Math.sqrt(Math.pow(2 * Math.PI, D) * Math.abs(covDet));
+  return Math.exp(-0.5 * quad) / (norm || 1e-300);
+}
+function matInv(m) {
+  const D = m.length;
+  if (D === 2) {
+    const det = m[0][0]*m[1][1] - m[0][1]*m[1][0];
+    if (Math.abs(det) < 1e-12) return { inv: [[1,0],[0,1]], det: 1 };
+    return { inv: [[m[1][1]/det,-m[0][1]/det],[-m[1][0]/det,m[0][0]/det]], det };
+  }
+  const a = m.map(r => [...r]);
+  const inv = Array.from({ length: D }, (_, i) => Array.from({ length: D }, (_, j) => i===j?1:0));
+  for (let col = 0; col < D; col++) {
+    let pivot = col;
+    for (let row = col+1; row < D; row++) if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
+    [a[col],a[pivot]]=[a[pivot],a[col]]; [inv[col],inv[pivot]]=[inv[pivot],inv[col]];
+    const sc = a[col][col] || 1e-12;
+    for (let j = 0; j < D; j++) { a[col][j]/=sc; inv[col][j]/=sc; }
+    for (let row = 0; row < D; row++) {
+      if (row===col) continue;
+      const f = a[row][col];
+      for (let j = 0; j < D; j++) { a[row][j]-=f*a[col][j]; inv[row][j]-=f*inv[col][j]; }
+    }
+  }
+  let det = 1; for (let i = 0; i < D; i++) det *= m[i][i];
+  return { inv, det };
+}
+function sampleMean(data, weights) {
+  const D = data[0].length, wSum = weights.reduce((a,b)=>a+b,0)||1;
+  return Array.from({length:D},(_,d)=>data.reduce((s,x,t)=>s+weights[t]*x[d],0)/wSum);
+}
+function sampleFullCov(data, mu, weights) {
+  const D = data[0].length, wSum = weights.reduce((a,b)=>a+b,0)||1;
+  return Array.from({length:D},(_,i)=>Array.from({length:D},(_,j)=>data.reduce((s,x,t)=>s+weights[t]*(x[i]-mu[i])*(x[j]-mu[j]),0)/wSum+(i===j?1e-4:0)));
+}
+function forwardBackward(obs, pi, A, mu, covInv, covDet, K) {
+  const T = obs.length, D = obs[0].length;
+  const B = obs.map(x => Array.from({length:K},(_,s)=>mvnPDF(x,mu[s],covInv[s],covDet[s],D)));
+  const alpha=[],scales=[];
+  let a0=Array.from({length:K},(_,s)=>pi[s]*B[0][s]);
+  let sc0=a0.reduce((a,b)=>a+b,0)||1;
+  alpha.push(a0.map(v=>v/sc0)); scales.push(sc0);
+  for (let t=1;t<T;t++) {
+    const at=Array.from({length:K},(_,s)=>B[t][s]*alpha[t-1].reduce((s2,a,p)=>s2+a*A[p][s],0));
+    const sc=at.reduce((a,b)=>a+b,0)||1;
+    alpha.push(at.map(v=>v/sc)); scales.push(sc);
+  }
+  const beta=new Array(T); beta[T-1]=new Array(K).fill(1);
+  for (let t=T-2;t>=0;t--) beta[t]=Array.from({length:K},(_,s)=>Array.from({length:K},(_,s2)=>A[s][s2]*B[t+1][s2]*beta[t+1][s2]).reduce((a,b)=>a+b,0)/scales[t+1]);
+  const gamma=alpha.map((at,t)=>{const g=at.map((a,s)=>a*beta[t][s]);const gs=g.reduce((a,b)=>a+b,0)||1;return g.map(v=>v/gs);});
+  const xi=[];
+  for (let t=0;t<T-1;t++) {
+    const x=Array.from({length:K},(_,s)=>Array.from({length:K},(_,s2)=>alpha[t][s]*A[s][s2]*B[t+1][s2]*beta[t+1][s2]));
+    const xs=x.reduce((rs,row)=>rs+row.reduce((a,b)=>a+b,0),0)||1;
+    xi.push(x.map(row=>row.map(v=>v/xs)));
+  }
+  return { gamma, xi, logLik: scales.reduce((s,sc)=>s+Math.log(sc||1e-300),0) };
+}
+function fitHMM(obs, K, maxIter=100) {
+  const T=obs.length, D=obs[0].length;
+  if (T<K*5) return null;
+  const sorted=[...obs.map(o=>o[0])].sort((a,b)=>a-b);
+  const quantiles=Array.from({length:K},(_,k)=>sorted[Math.floor((k+0.5)*T/K)]);
+  let gamma=obs.map(x=>{const dists=quantiles.map(q=>Math.abs(x[0]-q));const minD=Math.min(...dists);const g=dists.map(d=>d===minD?1:0);const gs=g.reduce((a,b)=>a+b,0);return g.map(v=>v/gs);});
+  let pi=Array.from({length:K},(_,s)=>gamma.reduce((sum,g)=>sum+g[s],0)/T);
+  let A=Array.from({length:K},(_,s)=>{const row=Array.from({length:K},(_,s2)=>s===s2?3:1);const rs=row.reduce((a,b)=>a+b,0);return row.map(v=>v/rs);});
+  let mu=Array.from({length:K},(_,s)=>sampleMean(obs,gamma.map(g=>g[s])));
+  let covs=Array.from({length:K},(_,s)=>sampleFullCov(obs,mu[s],gamma.map(g=>g[s])));
+  let covInv=covs.map(c=>matInv(c));
+  let prevLL=-Infinity;
+  for (let iter=0;iter<maxIter;iter++) {
+    const {gamma:ng,xi,logLik}=forwardBackward(obs,pi,A,mu,covInv.map(c=>c.inv),covInv.map(c=>c.det),K);
+    gamma=ng;
+    pi=gamma[0].map(v=>v+1e-10); const piS=pi.reduce((a,b)=>a+b,0); pi=pi.map(v=>v/piS);
+    const PRIOR=1;
+    A=Array.from({length:K},(_,s)=>{const row=Array.from({length:K},(_,s2)=>{return xi.reduce((sum,xit)=>sum+xit[s][s2],0)+PRIOR;});const rs=row.reduce((a,b)=>a+b,0);return row.map(v=>v/rs);});
+    mu=Array.from({length:K},(_,s)=>sampleMean(obs,gamma.map(g=>g[s])));
+    covs=Array.from({length:K},(_,s)=>sampleFullCov(obs,mu[s],gamma.map(g=>g[s])));
+    covInv=covs.map(c=>matInv(c));
+    if (Math.abs(logLik-prevLL)<1e-4&&iter>5) break;
+    prevLL=logLik;
+  }
+  return {pi,A,mu,covInv,gamma};
+}
+function viterbi(obs,pi,A,mu,covInvArr,covDetArr,K) {
+  const T=obs.length,D=obs[0].length;
+  const delta=[],psi=[];
+  const B0=Array.from({length:K},(_,s)=>mvnPDF(obs[0],mu[s],covInvArr[s],covDetArr[s],D));
+  delta.push(Array.from({length:K},(_,s)=>Math.log(pi[s]+1e-300)+Math.log(B0[s]+1e-300)));
+  psi.push(new Array(K).fill(0));
+  for (let t=1;t<T;t++) {
+    const Bt=Array.from({length:K},(_,s)=>Math.log(mvnPDF(obs[t],mu[s],covInvArr[s],covDetArr[s],D)+1e-300));
+    const dt=[],pt=[];
+    for (let s=0;s<K;s++) {
+      let best=-Infinity,bestP=0;
+      for (let p=0;p<K;p++){const v=delta[t-1][p]+Math.log(A[p][s]+1e-300);if(v>best){best=v;bestP=p;}}
+      dt.push(best+Bt[s]); pt.push(bestP);
+    }
+    delta.push(dt); psi.push(pt);
+  }
+  const states=new Array(T);
+  states[T-1]=delta[T-1].indexOf(Math.max(...delta[T-1]));
+  for (let t=T-2;t>=0;t--) states[t]=psi[t+1][states[t+1]];
+  return states;
+}
+function standardize(series) {
+  const D=series[0].length;
+  const stats=Array.from({length:D},(_,d)=>{const vals=series.map(s=>s[d]).filter(Number.isFinite);const mu=vals.reduce((a,b)=>a+b,0)/vals.length;const sigma=Math.sqrt(vals.reduce((a,b)=>a+(b-mu)**2,0)/vals.length)||1;return{mu,sigma};});
+  return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
+}
+async function computeRegimeModel(portfolioRetMap) {
+  const [vixData,ovxData,hygData]=await Promise.all([fetchYahooCloses("^VIX","5y"),fetchYahooCloses("^OVX","5y"),fetchYahooCloses("HYG","5y")]);
+  const vixMap=new Map(vixData.bars.map(b=>[b.date,b.close]));
+  const ovxMap=new Map(ovxData.bars.map(b=>[b.date,b.close]));
+  const hygBars=hygData.bars;
+  const hygStressMap=new Map();
+  for (let i=1;i<hygBars.length;i++){const ret=(hygBars[i].close-hygBars[i-1].close)/hygBars[i-1].close;hygStressMap.set(hygBars[i].date,-ret*100);}
+  const allDates=[...vixMap.keys()].filter(d=>ovxMap.has(d)&&hygStressMap.has(d)).sort();
+  if (allDates.length<252) throw new Error("Need at least 252 trading days");
+  const rawFeatures=allDates.map(d=>[vixMap.get(d),ovxMap.get(d),hygStressMap.get(d)]);
+  const K=2,D=3;
+  const{scaled}=standardize(rawFeatures);
+  const model=fitHMM(scaled,K,100);
+  if (!model) throw new Error("HMM fitting failed");
+  const{pi,A,mu,covInv,gamma}=model;
+  const covInvArr=covInv.map(c=>c.inv),covDetArr=covInv.map(c=>c.det);
+  const states=viterbi(scaled,pi,A,mu,covInvArr,covDetArr,K);
+  const stressState=mu[0][0]>mu[1][0]?0:1;
+  const regimes=states.map(s=>s===stressState?1:0);
+  const stressProbs=gamma.map(g=>+g[stressState].toFixed(4));
+  const cutoff1Y=new Date(); cutoff1Y.setDate(cutoff1Y.getDate()-365);
+  const cutoffStr=cutoff1Y.toISOString().slice(0,10);
+  const portRets=allDates.map(d=>portfolioRetMap?.get(d)??null);
+  const normalRets=portRets.filter((r,i)=>r!==null&&regimes[i]===0&&allDates[i]>=cutoffStr);
+  const stressRets=portRets.filter((r,i)=>r!==null&&regimes[i]===1&&allDates[i]>=cutoffStr);
+  function regimeStats(rets){
+    if(!rets.length)return null;
+    const s=std(rets),annVol=s*Math.sqrt(252)*100,annRet=mean(rets)*252*100;
+    const var95=histVaR(rets,0.95),cvar95=histCVaR(rets,0.95);
+    let peak=1,cum=1,sumDD=0,ddN=0;
+    rets.forEach(r=>{cum*=(1+r);if(cum>peak)peak=cum;const dd=(cum-peak)/peak;if(dd<0){sumDD+=dd;ddN++;}});
+    return{count:rets.length,annualizedRetPct:+annRet.toFixed(2),annualizedVolPct:+annVol.toFixed(2),dailyVolPct:+(s*100).toFixed(3),sharpe:annVol===0?null:+(annRet/annVol).toFixed(3),var95Pct:var95!==null?+(var95*100).toFixed(2):null,cvar95Pct:cvar95!==null?+(cvar95*100).toFixed(2):null,avgDrawdownPct:ddN?+(sumDD/ddN*100).toFixed(2):0,maxDrawdownPct:+maxDDFromReturns(rets).toFixed(2)};
+  }
+  let cumVal=100;
+  const portfolioIndex=allDates.map((d,i)=>({d,i})).filter(({d})=>d>=cutoffStr).map(({d,i})=>{if(portRets[i]!==null)cumVal*=(1+portRets[i]);return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]};});
+  const stressProbFull=allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}));
+  const featureNames=["VIX","OVX","HYG_stress"];
+  const stateMeans=[0,1].map(r=>{const obj={};featureNames.forEach((f,d)=>{const pts=rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;});return obj;});
+  const lastI=allDates.length-1;
+  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=1) on VIX+OVX+HYG — chart & stats: last 1Y"};
+}
 
 // ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {
@@ -581,7 +702,7 @@ async function executeTool(name, input) {
         weights: m.weights,
         correlationMatrix: m.correlationMatrix,
         chartTag: "@@PORTFOLIO:1y@@",
-        // rollingSharpeTag removed
+        rollingSharpeTag: "@@QUANT:PORTFOLIO:rollingSharpe30:1y:Portfolio Rolling Sharpe (30d)@@"
       };
     }
 
@@ -697,7 +818,7 @@ async function executeTool(name, input) {
         totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
         meanDailyReturn:     +(mean(r) * 100).toFixed(4),
-        sharpe:              std(r)===0 ? 0 : +((mean(r)/std(r))*Math.sqrt(252)).toFixed(3),  // annualised single-asset
+        sharpe:              std(r)===0 ? 0 : +((mean(r)/std(r))*Math.sqrt(252)).toFixed(3),
         sortino:             +sortino(r).toFixed(4),
         maxDrawdown:         +maxDD(closes).toFixed(2),
         var95:               (() => { const v = histVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),
@@ -758,361 +879,6 @@ async function executeTool(name, input) {
   }
 }
 
-
-// ─── HMM Regime Detection Engine ─────────────────────────────────
-// 2-state full-sample Gaussian HMM
-// Features: VIX, OVX (WTI vol), HYG credit stress, TNX vol (rates vol proxy)
-// Matches Python hmmlearn GaussianHMM(n_components=2, covariance_type='full', n_iter=1000)
-
-function gaussianPDF(x, mu, sigma) {
-  if (sigma <= 0) return 1e-300;
-  return Math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * Math.sqrt(2 * Math.PI));
-}
-
-// Multivariate diagonal Gaussian emission (full cov = off-diag terms)
-// We use full covariance: store as DxD matrix per state
-function mvnPDF(x, mu, covInv, covDet, D) {
-  const diff = x.map((v, d) => v - mu[d]);
-  let quad = 0;
-  for (let i = 0; i < D; i++)
-    for (let j = 0; j < D; j++)
-      quad += diff[i] * covInv[i][j] * diff[j];
-  const norm = Math.sqrt(Math.pow(2 * Math.PI, D) * Math.abs(covDet));
-  return Math.exp(-0.5 * quad) / (norm || 1e-300);
-}
-
-function matInv2x2(m) {
-  const det = m[0][0]*m[1][1] - m[0][1]*m[1][0];
-  if (Math.abs(det) < 1e-12) return { inv: [[1,0],[0,1]], det: 1 };
-  return { inv: [[m[1][1]/det, -m[0][1]/det], [-m[1][0]/det, m[0][0]/det]], det };
-}
-
-function matInv(m) {
-  const D = m.length;
-  if (D === 2) return matInv2x2(m);
-  // General inverse via Gaussian elimination
-  const a = m.map(r => [...r]);
-  const inv = Array.from({ length: D }, (_, i) => Array.from({ length: D }, (_, j) => i === j ? 1 : 0));
-  for (let col = 0; col < D; col++) {
-    let pivot = col;
-    for (let row = col+1; row < D; row++) if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
-    [a[col], a[pivot]] = [a[pivot], a[col]];
-    [inv[col], inv[pivot]] = [inv[pivot], inv[col]];
-    const scale = a[col][col] || 1e-12;
-    for (let j = 0; j < D; j++) { a[col][j] /= scale; inv[col][j] /= scale; }
-    for (let row = 0; row < D; row++) {
-      if (row === col) continue;
-      const f = a[row][col];
-      for (let j = 0; j < D; j++) { a[row][j] -= f * a[col][j]; inv[row][j] -= f * inv[col][j]; }
-    }
-  }
-  // Determinant (product of pivots before elimination — approximate via diagonal of original)
-  let det = 1;
-  for (let i = 0; i < D; i++) det *= m[i][i];
-  return { inv, det };
-}
-
-function sampleMean(data, weights) {
-  const D = data[0].length;
-  const wSum = weights.reduce((a,b) => a+b, 0) || 1;
-  return Array.from({ length: D }, (_, d) =>
-    data.reduce((s, x, t) => s + weights[t] * x[d], 0) / wSum
-  );
-}
-
-function sampleFullCov(data, mu, weights) {
-  const D = data[0].length;
-  const wSum = weights.reduce((a,b) => a+b, 0) || 1;
-  return Array.from({ length: D }, (_, i) =>
-    Array.from({ length: D }, (_, j) =>
-      data.reduce((s, x, t) => s + weights[t] * (x[i]-mu[i]) * (x[j]-mu[j]), 0) / wSum + (i===j ? 1e-4 : 0)
-    )
-  );
-}
-
-// Forward-backward algorithm (Baum-Welch E-step)
-function forwardBackward(obs, pi, A, mu, covInv, covDet, K) {
-  const T = obs.length, D = obs[0].length;
-
-  // Emission probabilities
-  const B = obs.map(x => Array.from({ length: K }, (_, s) => mvnPDF(x, mu[s], covInv[s], covDet[s], D)));
-
-  // Forward pass (scaled)
-  const alpha = [], scales = [];
-  let a0 = Array.from({ length: K }, (_, s) => pi[s] * B[0][s]);
-  let sc0 = a0.reduce((a,b) => a+b, 0) || 1;
-  alpha.push(a0.map(v => v/sc0)); scales.push(sc0);
-  for (let t = 1; t < T; t++) {
-    const at = Array.from({ length: K }, (_, s) => B[t][s] * alpha[t-1].reduce((s2, a, prev) => s2 + a * A[prev][s], 0));
-    const sc = at.reduce((a,b) => a+b, 0) || 1;
-    alpha.push(at.map(v => v/sc)); scales.push(sc);
-  }
-
-  // Backward pass (scaled)
-  const beta = new Array(T);
-  beta[T-1] = new Array(K).fill(1);
-  for (let t = T-2; t >= 0; t--) {
-    beta[t] = Array.from({ length: K }, (_, s) =>
-      Array.from({ length: K }, (_, s2) => A[s][s2] * B[t+1][s2] * beta[t+1][s2]).reduce((a,b) => a+b, 0) / scales[t+1]
-    );
-  }
-
-  // Gamma (posterior state probabilities)
-  const gamma = alpha.map((at, t) => {
-    const g = at.map((a, s) => a * beta[t][s]);
-    const gsum = g.reduce((a,b) => a+b, 0) || 1;
-    return g.map(v => v/gsum);
-  });
-
-  // Xi (joint transition posteriors)
-  const xi = [];
-  for (let t = 0; t < T-1; t++) {
-    const x = Array.from({ length: K }, (_, s) =>
-      Array.from({ length: K }, (_, s2) =>
-        alpha[t][s] * A[s][s2] * B[t+1][s2] * beta[t+1][s2]
-      )
-    );
-    const xsum = x.reduce((rs, row) => rs + row.reduce((a,b) => a+b, 0), 0) || 1;
-    xi.push(x.map(row => row.map(v => v/xsum)));
-  }
-
-  const logLik = scales.reduce((s, sc) => s + Math.log(sc || 1e-300), 0);
-  return { gamma, xi, logLik };
-}
-
-function fitHMM(obs, K, maxIter = 100) {
-  const T = obs.length, D = obs[0].length;
-  if (T < K * 5) return null;
-
-  // Initialise: k-means on first feature
-  const sorted = [...obs.map(o => o[0])].sort((a,b) => a-b);
-  const quantiles = Array.from({ length: K }, (_, k) => sorted[Math.floor((k+0.5) * T/K)]);
-  let gamma = obs.map(x => {
-    const dists = quantiles.map(q => Math.abs(x[0] - q));
-    const minD  = Math.min(...dists);
-    const g = dists.map(d => d === minD ? 1 : 0);
-    const gs = g.reduce((a,b) => a+b, 0);
-    return g.map(v => v/gs);
-  });
-
-  // Init params
-  let pi = Array.from({ length: K }, (_, s) => gamma.reduce((sum, g) => sum + g[s], 0) / T);
-  let A  = Array.from({ length: K }, (_, s) => {
-    const row = Array.from({ length: K }, (_, s2) => s === s2 ? 3 : 1); // mild persistence init
-    const rs  = row.reduce((a,b) => a+b, 0);
-    return row.map(v => v/rs);
-  });
-  let mu     = Array.from({ length: K }, (_, s) => sampleMean(obs, gamma.map(g => g[s])));
-  let covs   = Array.from({ length: K }, (_, s) => sampleFullCov(obs, mu[s], gamma.map(g => g[s])));
-  let covInv = covs.map(c => matInv(c));
-
-  let prevLogLik = -Infinity;
-  for (let iter = 0; iter < maxIter; iter++) {
-    // E-step
-    const { gamma: newGamma, xi, logLik } = forwardBackward(
-      obs, pi, A, mu, covInv.map(c => c.inv), covInv.map(c => c.det), K
-    );
-    gamma = newGamma;
-
-    // M-step
-    // Pi
-    pi = gamma[0].map(v => v + 1e-10);
-    const piSum = pi.reduce((a,b) => a+b, 0);
-    pi = pi.map(v => v/piSum);
-
-    // Transition (with strong persistence prior)
-    const PRIOR = 1;  // uninformative prior — less sticky regimes
-    A = Array.from({ length: K }, (_, s) => {
-      const row = Array.from({ length: K }, (_, s2) => {
-        const xiSum = xi.reduce((sum, xit) => sum + xit[s][s2], 0);
-        return xiSum + PRIOR;
-      });
-      const rs = row.reduce((a,b) => a+b, 0);
-      return row.map(v => v/rs);
-    });
-
-    // Emissions
-    mu     = Array.from({ length: K }, (_, s) => sampleMean(obs, gamma.map(g => g[s])));
-    covs   = Array.from({ length: K }, (_, s) => sampleFullCov(obs, mu[s], gamma.map(g => g[s])));
-    covInv = covs.map(c => matInv(c));
-
-    if (Math.abs(logLik - prevLogLik) < 1e-4 && iter > 5) break;
-    prevLogLik = logLik;
-  }
-
-  return { pi, A, mu, covInv, gamma };
-}
-
-function viterbi(obs, pi, A, mu, covInvArr, covDetArr, K) {
-  const T = obs.length, D = obs[0].length;
-  const delta = [], psi = [];
-  const B0 = Array.from({ length: K }, (_, s) => mvnPDF(obs[0], mu[s], covInvArr[s], covDetArr[s], D));
-  delta.push(Array.from({ length: K }, (_, s) => Math.log(pi[s] + 1e-300) + Math.log(B0[s] + 1e-300)));
-  psi.push(new Array(K).fill(0));
-  for (let t = 1; t < T; t++) {
-    const Bt = Array.from({ length: K }, (_, s) => Math.log(mvnPDF(obs[t], mu[s], covInvArr[s], covDetArr[s], D) + 1e-300));
-    const dt = [], pt = [];
-    for (let s = 0; s < K; s++) {
-      let best = -Infinity, bestP = 0;
-      for (let p = 0; p < K; p++) {
-        const v = delta[t-1][p] + Math.log(A[p][s] + 1e-300);
-        if (v > best) { best = v; bestP = p; }
-      }
-      dt.push(best + Bt[s]); pt.push(bestP);
-    }
-    delta.push(dt); psi.push(pt);
-  }
-  const states = new Array(T);
-  states[T-1] = delta[T-1].indexOf(Math.max(...delta[T-1]));
-  for (let t = T-2; t >= 0; t--) states[t] = psi[t+1][states[t+1]];
-  return states;
-}
-
-function standardize(series) {
-  const D = series[0].length;
-  const stats = Array.from({ length: D }, (_, d) => {
-    const vals = series.map(s => s[d]).filter(Number.isFinite);
-    const mu   = vals.reduce((a,b) => a+b, 0) / vals.length;
-    const sigma = Math.sqrt(vals.reduce((a,b) => a + (b-mu)**2, 0) / vals.length) || 1;
-    return { mu, sigma };
-  });
-  return {
-    scaled: series.map(s => s.map((v, d) => Number.isFinite(v) ? (v - stats[d].mu) / stats[d].sigma : 0)),
-    stats,
-  };
-}
-
-async function computeRegimeModel(portfolioRetMap) {
-  // Fetch 5Y of 3 features: VIX, OVX, HYG
-  const [vixData, ovxData, hygData] = await Promise.all([
-    fetchYahooCloses("^VIX", "5y"),
-    fetchYahooCloses("^OVX", "5y"),
-    fetchYahooCloses("HYG",  "5y"),
-  ]);
-
-  const vixMap = new Map(vixData.bars.map(b => [b.date, b.close]));
-  const ovxMap = new Map(ovxData.bars.map(b => [b.date, b.close]));
-
-  // HYG: negative daily return = credit stress proxy
-  const hygBars = hygData.bars;
-  const hygStressMap = new Map();
-  for (let i = 1; i < hygBars.length; i++) {
-    const ret = (hygBars[i].close - hygBars[i-1].close) / hygBars[i-1].close;
-    hygStressMap.set(hygBars[i].date, -ret * 100);
-  }
-
-  // Common dates
-  const allDates = [...vixMap.keys()]
-    .filter(d => ovxMap.has(d) && hygStressMap.has(d))
-    .sort();
-
-  if (allDates.length < 252) throw new Error("Need at least 252 trading days");
-
-  const rawFeatures = allDates.map(d => [
-    vixMap.get(d),
-    ovxMap.get(d),
-    hygStressMap.get(d),
-  ]);
-
-  const K = 2, D = 3;
-
-  // Fit HMM on full 5Y (stable parameters, consistent labels)
-  const { scaled, stats: scaleStats } = standardize(rawFeatures);
-  const model = fitHMM(scaled, K, 100);
-  if (!model) throw new Error("HMM fitting failed");
-
-  const { pi, A, mu, covInv, gamma } = model;
-  const covInvArr = covInv.map(c => c.inv);
-  const covDetArr = covInv.map(c => c.det);
-
-  // Hard labels via Viterbi (smooth, consistent)
-  const states = viterbi(scaled, pi, A, mu, covInvArr, covDetArr, K);
-
-  // Stress state = higher mean VIX
-  const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
-
-  // Soft stress probabilities from gamma (smooth)
-  const regimes     = states.map(s => s === stressState ? 1 : 0);
-  const stressProbs = gamma.map(g => +g[stressState].toFixed(4));
-
-  // 1Y cutoff for portfolio chart and stats
-  const cutoff1Y = new Date(); cutoff1Y.setDate(cutoff1Y.getDate() - 365);
-  const cutoffStr = cutoff1Y.toISOString().slice(0, 10);
-
-  const portRets = allDates.map(d => portfolioRetMap?.get(d) ?? null);
-
-  // Stats: only last 1Y portfolio returns split by regime
-  const normalRets = portRets.filter((r, i) => r !== null && regimes[i] === 0 && allDates[i] >= cutoffStr);
-  const stressRets = portRets.filter((r, i) => r !== null && regimes[i] === 1 && allDates[i] >= cutoffStr);
-
-  function regimeStats(rets) {
-    if (!rets.length) return null;
-    const s = std(rets), annVol = s * Math.sqrt(252) * 100;
-    const annRet = mean(rets) * 252 * 100;
-    const var95  = histVaR(rets, 0.95);
-    const cvar95 = histCVaR(rets, 0.95);
-    let peak = 1, cum = 1, sumDD = 0, ddN = 0;
-    rets.forEach(r => { cum *= (1+r); if (cum > peak) peak = cum; const dd = (cum-peak)/peak; if (dd < 0) { sumDD += dd; ddN++; } });
-    return {
-      count: rets.length,
-      annualizedRetPct:  +annRet.toFixed(2),
-      annualizedVolPct:  +annVol.toFixed(2),
-      dailyVolPct:       +(s*100).toFixed(3),
-      sharpe:            annVol === 0 ? null : +(annRet/annVol).toFixed(3),
-      var95Pct:          var95 !== null ? +(var95*100).toFixed(2) : null,
-      cvar95Pct:         cvar95 !== null ? +(cvar95*100).toFixed(2) : null,
-      avgDrawdownPct:    ddN ? +(sumDD/ddN*100).toFixed(2) : 0,
-      maxDrawdownPct:    +maxDDFromReturns(rets).toFixed(2),
-    };
-  }
-
-  // Portfolio chart: only last 1Y, starting at 100
-  let cumVal = 100;
-  const portfolioIndex = allDates
-    .map((d, i) => ({ d, i }))
-    .filter(({ d }) => d >= cutoffStr)
-    .map(({ d, i }) => {
-      if (portRets[i] !== null) cumVal *= (1 + portRets[i]);
-      return { date: d, value: +cumVal.toFixed(3), regime: regimes[i] };
-    });
-
-  // Stress prob series: full 5Y for context
-  const stressProbFull = allDates.map((d, i) => ({ date: d, prob: stressProbs[i], regime: regimes[i] }));
-
-  // Feature means per regime
-  const featureNames = ["VIX", "OVX", "HYG_stress"];
-  const stateMeans = [0, 1].map(r => {
-    const obj = {};
-    featureNames.forEach((f, d) => {
-      const pts = rawFeatures.filter((_, i) => regimes[i] === r).map(x => x[d]);
-      obj[f] = pts.length ? +(pts.reduce((a,b) => a+b, 0)/pts.length).toFixed(2) : null;
-    });
-    return obj;
-  });
-
-  const lastI = allDates.length - 1;
-  return {
-    dates:             allDates,
-    regimes,
-    stressProbs,
-    stressProbFull,
-    portfolioIndex,
-    normalStats:       regimeStats(normalRets),
-    stressStats:       regimeStats(stressRets),
-    normalDist:        returnDistribution(normalRets, 20),
-    stressDist:        returnDistribution(stressRets, 20),
-    currentRegime:     regimes[lastI],
-    currentStressProb: stressProbs[lastI],
-    currentVix:        rawFeatures[lastI]?.[0] ?? null,
-    normalDays:        normalRets.length,
-    stressDays:        stressRets.length,
-    featureDays:       allDates.length,
-    stateMeans,
-    method: "Full-sample 2-state Gaussian HMM (5Y data, full covariance, 100 EM iters) on VIX + OVX + HYG — chart & stats: last 1Y",
-  };
-}
-
-
 // Analytics cache
 const analyticsCache = new Map();
 
@@ -1150,7 +916,7 @@ Metrics: returns | distribution | priceZscore | priceZscore30 | rollingVol | rol
 
 QUANT WORKFLOW: call compute_analytics first, then paste the chartTags from result into your reply.
 PORTFOLIO ANALYTICS WORKFLOW: call get_portfolio_analytics for portfolio overview, risk, VaR, matrices, weights, or reconstructed portfolio chart requests. Show weights/correlation matrices as markdown tables, not JSON. Include @@PORTFOLIO:1y@@ when the user asks for portfolio reconstruction or a single portfolio chart.
-Example: "Sharpe: 1.24 | Vol: 12% | VaR95: 1.8% | CVaR95: 2.4% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingVaR95:1y:Rolling VaR 95% (30d)@@"
+Example: "Sharpe: 1.24 | Vol: 12% | VaR95: 1.8% | CVaR95: 2.4% @@CHART:CSPX.L:1y@@ @@QUANT:CSPX.L:rollingSharpe:1y:Rolling Sharpe (30d)@@ @@QUANT:CSPX.L:rollingVaR95:1y:Rolling VaR 95% (30d)@@"
 
 MARKET NEWS WORKFLOW: for morning, midday, end-of-day, latest news, headlines, asset-class moves, or scheduled briefings, call get_market_news and get_macro_snapshot, then combine with portfolio data.
 
@@ -1177,7 +943,7 @@ async function runAgent(prompt, history = []) {
 // ─── Push ─────────────────────────────────────────────────────────
 const pushSubs = new Map();
 async function sendPush(title, body, icon = "📈") {
-  console.log(`🔔 sendPush: "${title}" | subs=${pushSubs.size} | vapid=${!!VAPID_PUBLIC&&!!VAPID_PRIVATE}`);
+  console.log(`🔔 sendPush "${title}" subs=${pushSubs.size} vapid=${!!(VAPID_PUBLIC&&VAPID_PRIVATE)}`);
   if (!VAPID_PUBLIC || !VAPID_PRIVATE || !pushSubs.size) return;
   const payload = JSON.stringify({ title, body, icon, timestamp: Date.now() });
   const expired = [];
@@ -1214,10 +980,7 @@ TASKS.forEach(task => {
       taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
       taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
       await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
-      // Send email for morning briefing
-      if (task.id === "morning") {
-        buildAndSendReport(REPORT_TO).catch(e => console.error("Morning email failed:", e.message));
-      }
+      if (task.id === "morning") buildAndSendReport(REPORT_TO).catch(e=>console.error("Email:",e.message));
     } catch (e) {
       taskState[task.id].running = false;
       taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message };
@@ -1252,31 +1015,31 @@ app.post("/api/tasks/:id/run", async (req, res) => {
     taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
     taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
     await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
-    if (task.id === "morning") {
-      buildAndSendReport(REPORT_TO).catch(e => console.error("Email failed:", e.message));
-    }
+    if (task.id === "morning") buildAndSendReport(REPORT_TO).catch(e=>console.error("Email:",e.message));
   } catch (e) { taskState[task.id].running = false; taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message }; }
 });
 
 app.get("/api/log", (req, res) => res.json(taskLog.slice(0, 50)));
 
-// Symbol news for chart tab headlines
 app.get("/api/news/symbol/:symbol", async (req, res) => {
-  try {
-    const news = await fetchSymbolNews(req.params.symbol, +(req.query.limit||5));
-    res.json({ news });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json({ news: await fetchSymbolNews(req.params.symbol, +(req.query.limit||5)) }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-// Send email report on demand
 app.post("/api/email/report", async (req, res) => {
-  try {
-    const to = req.body?.to || REPORT_TO;
-    const result = await buildAndSendReport(to);
-    res.json(result);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  try { res.json(await buildAndSendReport(req.body?.to || REPORT_TO)); }
+  catch (e) { res.status(500).json({ error: e.message }); }
 });
-
+app.get("/api/regime", async (req, res) => {
+  try {
+    const portfolioRetMap = new Map();
+    try {
+      const p = await buildPortfolio();
+      const m = p?.combined?.metrics1Y;
+      if (m?.dates && m?.portfolioReturnsPct) m.dates.forEach((d,i)=>{ if(Number.isFinite(m.portfolioReturnsPct[i])) portfolioRetMap.set(d, m.portfolioReturnsPct[i]/100); });
+    } catch {}
+    res.json(await computeRegimeModel(portfolioRetMap.size>0?portfolioRetMap:null));
+  } catch (e) { console.error("Regime error:",e.message); res.status(500).json({ error: e.message }); }
+});
 app.get("/api/news", async (req, res) => {
   try { res.json(await fetchMarketNews({ symbols: (req.query.symbols || "").split(",").filter(Boolean), limit: +(req.query.limit || 12) })); }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -1300,29 +1063,6 @@ app.get("/api/quotes", async (req, res) => {
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-
-// Regime detection endpoint
-app.get("/api/regime", async (req, res) => {
-  try {
-    // Get weighted portfolio daily return series (date → return)
-    const portfolioRetMap = new Map();
-    try {
-      const p = await buildPortfolio();
-      const m = p?.combined?.metrics1Y;
-      if (m?.dates && m?.portfolioReturnsPct) {
-        m.dates.forEach((d, i) => {
-          const r = m.portfolioReturnsPct[i];
-          if (Number.isFinite(r)) portfolioRetMap.set(d, r / 100);
-        });
-      }
-    } catch {}
-    const result = await computeRegimeModel(portfolioRetMap.size > 0 ? portfolioRetMap : null);
-    res.json(result);
-  } catch (e) {
-    console.error("Regime error:", e.message);
-    res.status(500).json({ error: e.message });
-  }
-});
 
 app.get("/api/portfolio/analytics", async (req, res) => {
   try {
@@ -1353,7 +1093,7 @@ app.get("/api/analytics/:symbol", (req, res) => {
 
 // Push
 app.get("/api/push/vapid-key",    (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
-app.post("/api/push/subscribe",   (req, res) => { const sub = req.body; if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" }); const id=Buffer.from(sub.endpoint).toString("base64").slice(0,32); pushSubs.set(id,sub); console.log(`📱 Push registered id=${id.slice(0,8)} total=${pushSubs.size}`); res.json({ ok: true }); });
+app.post("/api/push/subscribe",   (req, res) => { const sub = req.body; if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" }); const id=Buffer.from(sub.endpoint).toString("base64").slice(0,32); pushSubs.set(id,sub); console.log(`📱 Push registered total=${pushSubs.size}`); res.json({ ok: true }); });
 app.post("/api/push/unsubscribe", (req, res) => { pushSubs.delete(Buffer.from(req.body.endpoint || "").toString("base64").slice(0, 32)); res.json({ ok: true }); });
 app.post("/api/push/test",        async (req, res) => { await sendPush("✅ Test", "Push notifications working!", "✅"); res.json({ ok: true }); });
 

@@ -223,44 +223,118 @@ function cumulativeFromReturns(r) { let v = 1; return r.map(x => (v *= (1 + x)))
 function maxDDFromReturns(r) { const c = cumulativeFromReturns(r); return maxDD(c.map(v => v * 100)); }
 function annualizedReturn(r) { if (!r.length) return 0; const total = r.reduce((s,v)=>s*(1+v),1); return Math.pow(total, 252 / r.length) - 1; }
 function informationRatio(a, b) { const len = Math.min(a.length, b.length); if (!len) return null; const active = a.slice(-len).map((v,i)=>v - b.slice(-len)[i]); const te = std(active); return te === 0 ? null : (mean(active) / te) * Math.sqrt(252); }
+async function fetchYahooReturnSeries(symbol, range = "1y") {
+  const { bars } = await fetchYahooCloses(yfSymbol(symbol), range);
+  const out = [];
+  for (let i = 1; i < bars.length; i++) {
+    const prev = bars[i - 1]?.close;
+    const cur = bars[i]?.close;
+    if (prev && cur && Number.isFinite(prev) && Number.isFinite(cur)) out.push({ date: bars[i].date, ret: (cur - prev) / prev });
+  }
+  return out;
+}
+
+function sampleCov(a, b) {
+  const len = Math.min(a.length, b.length);
+  if (len < 2) return 0;
+  const aa = a.slice(-len), bb = b.slice(-len);
+  const ma = mean(aa), mb = mean(bb);
+  return aa.reduce((s, v, i) => s + (v - ma) * (bb[i] - mb), 0) / (len - 1);
+}
+
+function covarianceMatrix(returnMatrix) {
+  const n = returnMatrix.length;
+  return Array.from({ length: n }, (_, i) => Array.from({ length: n }, (_, j) => sampleCov(returnMatrix[i], returnMatrix[j])));
+}
+
+function correlationMatrixFromReturns(items) {
+  const out = {};
+  for (let i = 0; i < items.length; i++) {
+    out[items[i].symbol] = {};
+    for (let j = 0; j < items.length; j++) out[items[i].symbol][items[j].symbol] = +(corrFn(items[i].returns, items[j].returns) || 0).toFixed(3);
+  }
+  return out;
+}
+
 async function computePortfolioMetrics(positions, totalNLV) {
   try {
-    const weighted = [];
+    const rawItems = [];
     for (const p of positions) {
       const weight = totalNLV > 0 ? p.totalValueEUR / totalNLV : 0;
       if (!weight) continue;
       try {
-        const { bars } = await fetchYahooCloses(yfSymbol(p.symbol), "1y");
-        const r = rets(bars.map(x => x.close));
-        weighted.push({ symbol: p.symbol, weight, returns: r });
+        const series = await fetchYahooReturnSeries(p.symbol, "1y");
+        if (series.length) rawItems.push({ symbol: p.symbol, yahooSymbol: yfSymbol(p.symbol), weight, series });
       } catch {}
     }
-    if (!weighted.length) return null;
-    const len = Math.min(...weighted.map(x => x.returns.length));
-    if (!len) return null;
-    const pr = Array.from({ length: len }, (_, i) => weighted.reduce((s, x) => s + x.weight * x.returns[x.returns.length - len + i], 0));
-    let br = [];
-    try { const { bars } = await fetchYahooCloses("^GSPC", "1y"); br = rets(bars.map(x => x.close)).slice(-len); } catch {}
-    const mdd = maxDDFromReturns(pr);
+    if (!rawItems.length) return null;
+
+    // Align all ETF daily returns by actual Yahoo dates, then renormalise to invested assets.
+    // This is the user's requested model: current weights + 1Y correlation/covariance from daily returns.
+    const commonDates = rawItems.map(x => new Set(x.series.map(r => r.date))).reduce((acc, set) => new Set([...acc].filter(d => set.has(d))));
+    const dates = [...commonDates].sort();
+    if (dates.length < 30) return null;
+    const items = rawItems.map(x => {
+      const byDate = new Map(x.series.map(r => [r.date, r.ret]));
+      return { ...x, returns: dates.map(d => byDate.get(d)).filter(Number.isFinite) };
+    }).filter(x => x.returns.length === dates.length);
+    if (!items.length) return null;
+
+    const investedWeight = items.reduce((s, x) => s + x.weight, 0);
+    const weights = items.map(x => x.weight / investedWeight);
+    const returnMatrix = items.map(x => x.returns);
+    const cov = covarianceMatrix(returnMatrix);
+    const corr = correlationMatrixFromReturns(items);
+
+    const pr = dates.map((_, t) => items.reduce((s, x, i) => s + weights[i] * x.returns[t], 0));
+    const totalReturn = pr.reduce((s, v) => s * (1 + v), 1) - 1;
     const annRet = annualizedReturn(pr);
-    const var95 = histVaR(pr, 0.95), var99 = histVaR(pr, 0.99), cvar95 = histCVaR(pr, 0.95);
+    const dailyVol = Math.sqrt(weights.reduce((rowSum, wi, i) => rowSum + weights.reduce((colSum, wj, j) => colSum + wi * wj * cov[i][j], 0), 0));
+    const annVol = dailyVol * Math.sqrt(252);
+
+    let br = [];
+    try {
+      const bench = await fetchYahooReturnSeries("^GSPC", "1y");
+      const bmap = new Map(bench.map(r => [r.date, r.ret]));
+      br = dates.map(d => bmap.get(d)).filter(Number.isFinite);
+    } catch {}
+
+    const len = Math.min(pr.length, br.length || pr.length);
+    const prAligned = pr.slice(-len);
+    const brAligned = br.length ? br.slice(-len) : [];
+    const active = brAligned.length ? prAligned.map((v, i) => v - brAligned[i]) : [];
+    const trackingError = active.length ? std(active) * Math.sqrt(252) : null;
+    const activeAnnRet = brAligned.length ? annualizedReturn(prAligned) - annualizedReturn(brAligned) : null;
+    const infoRatio = trackingError && trackingError !== 0 ? activeAnnRet / trackingError : null;
+
+    const mdd = maxDDFromReturns(pr);
+    const downside = pr.filter(v => v < 0);
+    const downsideVol = downside.length ? Math.sqrt(downside.reduce((s, v) => s + v * v, 0) / downside.length) * Math.sqrt(252) : 0;
+    const var95 = histVaR(pr, 0.95), var99 = histVaR(pr, 0.99), cvar95 = histCVaR(pr, 0.95), cvar99 = histCVaR(pr, 0.99);
+
     return {
       period: "1y",
       days: pr.length,
+      investedWeightPct: +(investedWeight * 100).toFixed(2),
+      totalReturnPct: +(totalReturn * 100).toFixed(2),
       annualizedReturnPct: +(annRet * 100).toFixed(2),
       averageDailyReturnPct: +(mean(pr) * 100).toFixed(4),
-      annualizedVolPct: +(std(pr) * Math.sqrt(252) * 100).toFixed(2),
-      sharpe: +sharpe(pr).toFixed(3),
-      sortino: +sortino(pr).toFixed(3),
+      annualizedVolPct: +(annVol * 100).toFixed(2),
+      sharpe: annVol === 0 ? null : +(annRet / annVol).toFixed(3),
+      sortino: downsideVol === 0 ? null : +(annRet / downsideVol).toFixed(3),
       maxDrawdownPct: +mdd.toFixed(2),
       var95Pct: var95 === null ? null : +(var95 * 100).toFixed(2),
       var99Pct: var99 === null ? null : +(var99 * 100).toFixed(2),
       cvar95Pct: cvar95 === null ? null : +(cvar95 * 100).toFixed(2),
+      cvar99Pct: cvar99 === null ? null : +(cvar99 * 100).toFixed(2),
       calmar: mdd === 0 ? null : +(annRet / Math.abs(mdd / 100)).toFixed(3),
-      informationRatioVsSPX: br.length ? +(informationRatio(pr, br) ?? 0).toFixed(3) : null,
+      informationRatioVsSPX: infoRatio === null ? null : +infoRatio.toFixed(3),
+      trackingErrorVsSPXPct: trackingError === null ? null : +(trackingError * 100).toFixed(2),
       skewness: +skewness(pr).toFixed(3),
       kurtosis: +kurtosis(pr).toFixed(3),
-      method: "allocation-weighted current holdings, 1Y daily Yahoo returns"
+      correlationMatrix: corr,
+      covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
+      method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix; Sharpe = annualized return / covariance-based annualized volatility"
     };
   } catch { return null; }
 }

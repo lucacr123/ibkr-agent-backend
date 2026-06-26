@@ -697,7 +697,7 @@ async function executeTool(name, input) {
         totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
         meanDailyReturn:     +(mean(r) * 100).toFixed(4),
-        sharpe:              std(r)===0 ? 0 : +(mean(r)/std(r)).toFixed(4),
+        sharpe:              std(r)===0 ? 0 : +((mean(r)/std(r))*Math.sqrt(252)).toFixed(3),  // annualised single-asset
         sortino:             +sortino(r).toFixed(4),
         maxDrawdown:         +maxDD(closes).toFixed(2),
         var95:               (() => { const v = histVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),

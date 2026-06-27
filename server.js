@@ -111,7 +111,13 @@ async function buildPortfolio(force = false) {
       cashEUR:           n(equity.cash) * acctFxToEUR,
       stockValue:        n(equity.stock),
       stockValueEUR:     n(equity.stock) * acctFxToEUR,
-      dividendAccruals:  n(equity.dividendAccruals),
+      dividendAccruals:   n(equity.dividendAccruals),
+      // NLV breakdown for debugging
+      nlvCash:            n(equity.cash),
+      nlvStock:           n(equity.stock),
+      nlvDividendAccruals: n(equity.dividendAccruals),
+      // equity.total = cash + stock + dividendAccruals + other accruals
+      // IBKR portal shows same figure so gap is likely FX timing
       acctFxToEUR,
       ytdReturn:     n(changeInNAV.twr),
       startingValue: n(changeInNAV.startingValue) * acctFxToEUR,
@@ -120,6 +126,7 @@ async function buildPortfolio(force = false) {
       commissions:   n(baseCash.commissions),
       deposits:      n(baseCash.deposits),
       withdrawals:   n(baseCash.withdrawals),
+      netDeposits:   n(baseCash.deposits) + n(baseCash.withdrawals), // withdrawals are negative in Flex
       dividends:     n(baseCash.dividends),
       brokerInterest: n(baseCash.brokerInterest),
       positions: positions.map(p => {
@@ -184,6 +191,7 @@ async function buildPortfolio(force = false) {
       totalCommissions:      +accounts.reduce((s, a) => s + a.commissions, 0).toFixed(2),
       totalDividends:        +accounts.reduce((s, a) => s + a.dividends, 0).toFixed(2),
       totalBrokerInterest:   +accounts.reduce((s, a) => s + a.brokerInterest, 0).toFixed(2),
+      totalNetDeposits:      +accounts.reduce((s, a) => s + (a.netDeposits || 0), 0).toFixed(2),
       positionCount:         combinedPositions.length,
       positions:             combinedPositions,
       metrics1Y:             portfolioMetrics,
@@ -484,118 +492,193 @@ async function buildAndSendReport(to) {
   return sendEmail(to, `📊 Morning Portfolio Report — ${new Date().toLocaleDateString("en-GB")}`, html);
 }
 
-// ─── HMM Regime Detection Engine ─────────────────────────────────
-function gaussianPDF(x, mu, sigma) {
-  if (sigma <= 0) return 1e-300;
-  return Math.exp(-0.5 * ((x - mu) / sigma) ** 2) / (sigma * Math.sqrt(2 * Math.PI));
-}
-function mvnPDF(x, mu, covInv, covDet, D) {
-  const diff = x.map((v, d) => v - mu[d]);
-  let quad = 0;
-  for (let i = 0; i < D; i++) for (let j = 0; j < D; j++) quad += diff[i] * covInv[i][j] * diff[j];
-  const norm = Math.sqrt(Math.pow(2 * Math.PI, D) * Math.abs(covDet));
-  return Math.exp(-0.5 * quad) / (norm || 1e-300);
-}
-function matInv(m) {
-  const D = m.length;
-  if (D === 2) {
-    const det = m[0][0]*m[1][1] - m[0][1]*m[1][0];
-    if (Math.abs(det) < 1e-12) return { inv: [[1,0],[0,1]], det: 1 };
-    return { inv: [[m[1][1]/det,-m[0][1]/det],[-m[1][0]/det,m[0][0]/det]], det };
+// ─── HMM Regime Detection Engine — Diagonal Covariance ───────────
+// Diagonal covariance = numerically stable, no matrix inversion needed
+// Equivalent to GaussianHMM(covariance_type='diag') in sklearn
+
+// Log-likelihood of obs under diagonal Gaussian (state s)
+function diagLogB(x, mu, sigSq) {
+  // sigSq: per-feature variance array
+  let ll = 0;
+  for (let d = 0; d < x.length; d++) {
+    const v = sigSq[d] > 0 ? sigSq[d] : 1e-6;
+    ll += -0.5 * (Math.log(2 * Math.PI * v) + (x[d] - mu[d]) ** 2 / v);
   }
-  const a = m.map(r => [...r]);
-  const inv = Array.from({ length: D }, (_, i) => Array.from({ length: D }, (_, j) => i===j?1:0));
-  for (let col = 0; col < D; col++) {
-    let pivot = col;
-    for (let row = col+1; row < D; row++) if (Math.abs(a[row][col]) > Math.abs(a[pivot][col])) pivot = row;
-    [a[col],a[pivot]]=[a[pivot],a[col]]; [inv[col],inv[pivot]]=[inv[pivot],inv[col]];
-    const sc = a[col][col] || 1e-12;
-    for (let j = 0; j < D; j++) { a[col][j]/=sc; inv[col][j]/=sc; }
-    for (let row = 0; row < D; row++) {
-      if (row===col) continue;
-      const f = a[row][col];
-      for (let j = 0; j < D; j++) { a[row][j]-=f*a[col][j]; inv[row][j]-=f*inv[col][j]; }
-    }
+  return ll;
+}
+
+// Forward algorithm (log-space, scaled) — returns alpha, scales, logP
+function forward(obs, logPi, logA, mu, sigSq, K) {
+  const T = obs.length;
+  const logAlpha = [];
+  // t=0
+  let row0 = Array.from({length:K}, (_,s) => logPi[s] + diagLogB(obs[0], mu[s], sigSq[s]));
+  const max0 = Math.max(...row0);
+  const scaled0 = row0.map(v => Math.exp(v - max0));
+  const sc0 = scaled0.reduce((a,b)=>a+b, 0);
+  logAlpha.push(scaled0.map(v => Math.log(v/sc0 + 1e-300) + max0));
+
+  for (let t = 1; t < T; t++) {
+    const logB = Array.from({length:K}, (_,s) => diagLogB(obs[t], mu[s], sigSq[s]));
+    const row = Array.from({length:K}, (_,s) => {
+      const vals = Array.from({length:K}, (_,p) => logAlpha[t-1][p] + logA[p][s]);
+      const mx = Math.max(...vals);
+      return mx + Math.log(vals.reduce((a,v) => a + Math.exp(v-mx), 0) + 1e-300) + logB[s];
+    });
+    logAlpha.push(row);
   }
-  let det = 1; for (let i = 0; i < D; i++) det *= m[i][i];
-  return { inv, det };
+  return logAlpha;
 }
-function sampleMean(data, weights) {
-  const D = data[0].length, wSum = weights.reduce((a,b)=>a+b,0)||1;
-  return Array.from({length:D},(_,d)=>data.reduce((s,x,t)=>s+weights[t]*x[d],0)/wSum);
-}
-function sampleFullCov(data, mu, weights) {
-  const D = data[0].length, wSum = weights.reduce((a,b)=>a+b,0)||1;
-  return Array.from({length:D},(_,i)=>Array.from({length:D},(_,j)=>data.reduce((s,x,t)=>s+weights[t]*(x[i]-mu[i])*(x[j]-mu[j]),0)/wSum+(i===j?0.05:0)));  // regularisation 0.05 keeps states from perfect separation
-}
-function forwardBackward(obs, pi, A, mu, covInv, covDet, K) {
-  const T = obs.length, D = obs[0].length;
-  const B = obs.map(x => Array.from({length:K},(_,s)=>mvnPDF(x,mu[s],covInv[s],covDet[s],D)));
-  const alpha=[],scales=[];
-  let a0=Array.from({length:K},(_,s)=>pi[s]*B[0][s]);
-  let sc0=a0.reduce((a,b)=>a+b,0)||1;
-  alpha.push(a0.map(v=>v/sc0)); scales.push(sc0);
-  for (let t=1;t<T;t++) {
-    const at=Array.from({length:K},(_,s)=>B[t][s]*alpha[t-1].reduce((s2,a,p)=>s2+a*A[p][s],0));
-    const sc=at.reduce((a,b)=>a+b,0)||1;
-    alpha.push(at.map(v=>v/sc)); scales.push(sc);
+
+// Backward algorithm (log-space)
+function backward(obs, logA, mu, sigSq, K) {
+  const T = obs.length;
+  const logBeta = new Array(T);
+  logBeta[T-1] = new Array(K).fill(0);
+  for (let t = T-2; t >= 0; t--) {
+    const logB_next = Array.from({length:K}, (_,s) => diagLogB(obs[t+1], mu[s], sigSq[s]));
+    logBeta[t] = Array.from({length:K}, (_,s) => {
+      const vals = Array.from({length:K}, (_,s2) => logA[s][s2] + logB_next[s2] + logBeta[t+1][s2]);
+      const mx = Math.max(...vals);
+      return mx + Math.log(vals.reduce((a,v) => a + Math.exp(v-mx), 0) + 1e-300);
+    });
   }
-  const beta=new Array(T); beta[T-1]=new Array(K).fill(1);
-  for (let t=T-2;t>=0;t--) beta[t]=Array.from({length:K},(_,s)=>Array.from({length:K},(_,s2)=>A[s][s2]*B[t+1][s2]*beta[t+1][s2]).reduce((a,b)=>a+b,0)/scales[t+1]);
-  const gamma=alpha.map((at,t)=>{const g=at.map((a,s)=>a*beta[t][s]);const gs=g.reduce((a,b)=>a+b,0)||1;return g.map(v=>v/gs);});
-  const xi=[];
-  for (let t=0;t<T-1;t++) {
-    const x=Array.from({length:K},(_,s)=>Array.from({length:K},(_,s2)=>alpha[t][s]*A[s][s2]*B[t+1][s2]*beta[t+1][s2]));
-    const xs=x.reduce((rs,row)=>rs+row.reduce((a,b)=>a+b,0),0)||1;
-    xi.push(x.map(row=>row.map(v=>v/xs)));
-  }
-  return { gamma, xi, logLik: scales.reduce((s,sc)=>s+Math.log(sc||1e-300),0) };
+  return logBeta;
 }
+
+// Gamma and Xi from forward-backward
+function gammaXi(logAlpha, logBeta, obs, logA, mu, sigSq, K) {
+  const T = obs.length;
+  // Gamma
+  const gamma = logAlpha.map((la, t) => {
+    const raw = la.map((v, s) => v + logBeta[t][s]);
+    const mx = Math.max(...raw);
+    const ex = raw.map(v => Math.exp(v - mx));
+    const sm = ex.reduce((a,b) => a+b, 0) || 1;
+    return ex.map(v => v/sm);
+  });
+  // Xi (T-1 x K x K)
+  const xi = [];
+  for (let t = 0; t < T-1; t++) {
+    const logB_next = Array.from({length:K}, (_,s) => diagLogB(obs[t+1], mu[s], sigSq[s]));
+    const raw = Array.from({length:K}, (_,s) =>
+      Array.from({length:K}, (_,s2) =>
+        logAlpha[t][s] + logA[s][s2] + logB_next[s2] + logBeta[t+1][s2]
+      )
+    );
+    const flat = raw.flat();
+    const mx = Math.max(...flat);
+    const ex = raw.map(row => row.map(v => Math.exp(v-mx)));
+    const sm = ex.reduce((rs,row) => rs + row.reduce((a,b)=>a+b,0), 0) || 1;
+    xi.push(ex.map(row => row.map(v => v/sm)));
+  }
+  const logLik = (() => {
+    const last = logAlpha[T-1];
+    const mx = Math.max(...last);
+    return mx + Math.log(last.reduce((a,v) => a + Math.exp(v-mx), 0) + 1e-300);
+  })();
+  return { gamma, xi, logLik };
+}
+
 function fitHMM(obs, K, maxIter=100) {
-  const T=obs.length, D=obs[0].length;
-  if (T<K*5) return null;
-  const sorted=[...obs.map(o=>o[0])].sort((a,b)=>a-b);
-  const quantiles=Array.from({length:K},(_,k)=>sorted[Math.floor((k+0.5)*T/K)]);
-  let gamma=obs.map(x=>{const dists=quantiles.map(q=>Math.abs(x[0]-q));const minD=Math.min(...dists);const g=dists.map(d=>d===minD?1:0);const gs=g.reduce((a,b)=>a+b,0);return g.map(v=>v/gs);});
-  let pi=Array.from({length:K},(_,s)=>gamma.reduce((sum,g)=>sum+g[s],0)/T);
-  let A=Array.from({length:K},(_,s)=>{const row=Array.from({length:K},(_,s2)=>s===s2?3:1);const rs=row.reduce((a,b)=>a+b,0);return row.map(v=>v/rs);});
-  let mu=Array.from({length:K},(_,s)=>sampleMean(obs,gamma.map(g=>g[s])));
-  let covs=Array.from({length:K},(_,s)=>sampleFullCov(obs,mu[s],gamma.map(g=>g[s])));
-  let covInv=covs.map(c=>matInv(c));
-  let prevLL=-Infinity;
-  for (let iter=0;iter<maxIter;iter++) {
-    const {gamma:ng,xi,logLik}=forwardBackward(obs,pi,A,mu,covInv.map(c=>c.inv),covInv.map(c=>c.det),K);
-    gamma=ng;
-    pi=gamma[0].map(v=>v+1e-10); const piS=pi.reduce((a,b)=>a+b,0); pi=pi.map(v=>v/piS);
-    const PRIOR=2;  // moderate prior = smooth transitions, prevents binary flipping
-    A=Array.from({length:K},(_,s)=>{const row=Array.from({length:K},(_,s2)=>{return xi.reduce((sum,xit)=>sum+xit[s][s2],0)+PRIOR;});const rs=row.reduce((a,b)=>a+b,0);return row.map(v=>v/rs);});
-    mu=Array.from({length:K},(_,s)=>sampleMean(obs,gamma.map(g=>g[s])));
-    covs=Array.from({length:K},(_,s)=>sampleFullCov(obs,mu[s],gamma.map(g=>g[s])));
-    covInv=covs.map(c=>matInv(c));
-    if (Math.abs(logLik-prevLL)<1e-4&&iter>5) break;
-    prevLL=logLik;
+  const T = obs.length, D = obs[0].length;
+  if (T < K * 5) return null;
+
+  // Init: split on first feature (VIX) — low half = state 0, high half = state 1
+  const sorted = [...obs.map(o=>o[0])].sort((a,b)=>a-b);
+  const median = sorted[Math.floor(T/2)];
+  let gamma = obs.map(x => {
+    const p = x[0] > median ? 0.85 : 0.15;  // soft assignment
+    return [1-p, p];  // state 0 = low VIX (normal), state 1 = high VIX (stress)
+  });
+
+  // Init params
+  let pi = [0.8, 0.2];  // most time in normal
+  let logA = [
+    [Math.log(0.95), Math.log(0.05)],   // normal → normal 95%
+    [Math.log(0.10), Math.log(0.90)],   // stress → stress 90%
+  ];
+  let mu = Array.from({length:K}, (_,s) => {
+    const wts = gamma.map(g => g[s]);
+    const wSum = wts.reduce((a,b)=>a+b, 0) || 1;
+    return Array.from({length:D}, (_,d) => obs.reduce((s2,x,t) => s2+wts[t]*x[d], 0)/wSum);
+  });
+  let sigSq = Array.from({length:K}, (_,s) => {
+    const wts = gamma.map(g => g[s]);
+    const wSum = wts.reduce((a,b)=>a+b, 0) || 1;
+    return Array.from({length:D}, (_,d) => {
+      const v = obs.reduce((s2,x,t) => s2+wts[t]*(x[d]-mu[s][d])**2, 0)/wSum;
+      return Math.max(v, 0.01);  // minimum variance floor
+    });
+  });
+
+  let prevLL = -Infinity;
+  for (let iter = 0; iter < maxIter; iter++) {
+    const logPi = pi.map(v => Math.log(v + 1e-300));
+    const logAlpha = forward(obs, logPi, logA, mu, sigSq, K);
+    const logBeta  = backward(obs, logA, mu, sigSq, K);
+    const { gamma: ng, xi, logLik } = gammaXi(logAlpha, logBeta, obs, logA, mu, sigSq, K);
+    gamma = ng;
+
+    // M-step pi
+    pi = gamma[0].slice();
+    const piS = pi.reduce((a,b)=>a+b,0) || 1;
+    pi = pi.map(v => v/piS);
+
+    // M-step A — with Dirichlet prior to prevent extreme transitions
+    const PRIOR = 1.0;  // symmetric Dirichlet prior — allows switching
+    logA = Array.from({length:K}, (_,s) => {
+      const row = Array.from({length:K}, (_,s2) =>
+        xi.reduce((sm,xit) => sm+xit[s][s2], 0) + PRIOR
+      );
+      const rs = row.reduce((a,b)=>a+b,0) || 1;
+      return row.map(v => Math.log(v/rs + 1e-300));
+    });
+
+    // M-step mu and sigSq
+    mu = Array.from({length:K}, (_,s) => {
+      const wts = gamma.map(g => g[s]);
+      const wSum = wts.reduce((a,b)=>a+b,0) || 1;
+      return Array.from({length:D}, (_,d) => obs.reduce((sm,x,t) => sm+wts[t]*x[d],0)/wSum);
+    });
+    sigSq = Array.from({length:K}, (_,s) => {
+      const wts = gamma.map(g => g[s]);
+      const wSum = wts.reduce((a,b)=>a+b,0) || 1;
+      return Array.from({length:D}, (_,d) => {
+        const v = obs.reduce((sm,x,t) => sm+wts[t]*(x[d]-mu[s][d])**2,0)/wSum;
+        return Math.max(v, 0.01);
+      });
+    });
+
+    if (Math.abs(logLik - prevLL) < 1e-3 && iter > 5) break;
+    prevLL = logLik;
   }
-  return {pi,A,mu,covInv,gamma};
+
+  return { pi, logA, mu, sigSq, gamma };
 }
-function viterbi(obs,pi,A,mu,covInvArr,covDetArr,K) {
-  const T=obs.length,D=obs[0].length;
-  const delta=[],psi=[];
-  const B0=Array.from({length:K},(_,s)=>mvnPDF(obs[0],mu[s],covInvArr[s],covDetArr[s],D));
-  delta.push(Array.from({length:K},(_,s)=>Math.log(pi[s]+1e-300)+Math.log(B0[s]+1e-300)));
+
+function viterbi(obs, pi, logA, mu, sigSq, K) {
+  const T = obs.length;
+  const logPi = pi.map(v => Math.log(v + 1e-300));
+  const delta = [], psi = [];
+  delta.push(Array.from({length:K}, (_,s) => logPi[s] + diagLogB(obs[0], mu[s], sigSq[s])));
   psi.push(new Array(K).fill(0));
-  for (let t=1;t<T;t++) {
-    const Bt=Array.from({length:K},(_,s)=>Math.log(mvnPDF(obs[t],mu[s],covInvArr[s],covDetArr[s],D)+1e-300));
-    const dt=[],pt=[];
-    for (let s=0;s<K;s++) {
-      let best=-Infinity,bestP=0;
-      for (let p=0;p<K;p++){const v=delta[t-1][p]+Math.log(A[p][s]+1e-300);if(v>best){best=v;bestP=p;}}
-      dt.push(best+Bt[s]); pt.push(bestP);
+  for (let t = 1; t < T; t++) {
+    const dt = [], pt = [];
+    for (let s = 0; s < K; s++) {
+      let best = -Infinity, bestP = 0;
+      for (let p = 0; p < K; p++) {
+        const v = delta[t-1][p] + logA[p][s];
+        if (v > best) { best = v; bestP = p; }
+      }
+      dt.push(best + diagLogB(obs[t], mu[s], sigSq[s]));
+      pt.push(bestP);
     }
     delta.push(dt); psi.push(pt);
   }
-  const states=new Array(T);
-  states[T-1]=delta[T-1].indexOf(Math.max(...delta[T-1]));
-  for (let t=T-2;t>=0;t--) states[t]=psi[t+1][states[t+1]];
+  const states = new Array(T);
+  states[T-1] = delta[T-1].indexOf(Math.max(...delta[T-1]));
+  for (let t = T-2; t >= 0; t--) states[t] = psi[t+1][states[t+1]];
   return states;
 }
 function standardize(series) {
@@ -604,50 +687,119 @@ function standardize(series) {
   return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
 }
 async function computeRegimeModel(portfolioRetMap) {
-  const [vixData,ovxData,xtc5Data]=await Promise.all([fetchYahooCloses("^VIX","5y"),fetchYahooCloses("^OVX","5y"),fetchYahooCloses("XTC5.DE","5y")]);
-  const vixMap=new Map(vixData.bars.map(b=>[b.date,b.close]));
-  const ovxMap=new Map(ovxData.bars.map(b=>[b.date,b.close]));
-  const xtc5Bars=xtc5Data.bars;
-  const hygStressMap=new Map();
-  // XTC5 is SHORT iTraxx Crossover — higher price = wider spreads = more credit stress
-  // Use absolute price level directly. Forward-fill any gaps.
-  let lastXtc5=xtc5Bars[0]?.close||100;
-  for (const b of xtc5Bars) { if(b.close!==null) lastXtc5=b.close; hygStressMap.set(b.date, lastXtc5); }
-  const allDates=[...vixMap.keys()].filter(d=>ovxMap.has(d)&&hygStressMap.has(d)).sort();
-  if (allDates.length<252) throw new Error("Need at least 252 trading days");
-  const rawFeatures=allDates.map(d=>[vixMap.get(d),ovxMap.get(d),hygStressMap.get(d)]);
-  const K=2,D=3;
-  const{scaled}=standardize(rawFeatures);
-  const model=fitHMM(scaled,K,100);
-  if (!model) throw new Error("HMM fitting failed");
-  const{pi,A,mu,covInv,gamma}=model;
-  const covInvArr=covInv.map(c=>c.inv),covDetArr=covInv.map(c=>c.det);
-  const states=viterbi(scaled,pi,A,mu,covInvArr,covDetArr,K);
-  const stressState=mu[0][0]>mu[1][0]?0:1;
-  const regimes=states.map(s=>s===stressState?1:0);
-  // Use smoothed posterior gamma for stress probability (forward-backward gives proper smoothed probs)
-  const stressProbs=gamma.map(g=>+Math.max(0,Math.min(1,g[stressState])).toFixed(4));
-  const cutoff1Y=new Date(); cutoff1Y.setDate(cutoff1Y.getDate()-365);
-  const cutoffStr=cutoff1Y.toISOString().slice(0,10);
-  const portRets=allDates.map(d=>portfolioRetMap?.get(d)??null);
-  const normalRets=portRets.filter((r,i)=>r!==null&&regimes[i]===0&&allDates[i]>=cutoffStr);
-  const stressRets=portRets.filter((r,i)=>r!==null&&regimes[i]===1&&allDates[i]>=cutoffStr);
-  function regimeStats(rets){
-    if(!rets.length)return null;
-    const s=std(rets),annVol=s*Math.sqrt(252)*100,annRet=mean(rets)*252*100;
-    const var95=histVaR(rets,0.95),cvar95=histCVaR(rets,0.95);
+  // Features: VIX + OVX only (2 features — stable, no XTC5)
+  // 5Y of data for walk-forward (train 1Y → test 1Y → repeat)
+  const [vixData, ovxData] = await Promise.all([
+    fetchYahooCloses("^VIX", "5y"),
+    fetchYahooCloses("^OVX", "5y"),
+  ]);
+
+  const vixMap = new Map(vixData.bars.map(b => [b.date, b.close]));
+  const ovxMap = new Map(ovxData.bars.map(b => [b.date, b.close]));
+
+  const allDates = [...vixMap.keys()].filter(d => ovxMap.has(d)).sort();
+  if (allDates.length < 504) throw new Error("Need at least 2Y of VIX+OVX data");
+
+  const rawFeatures = allDates.map(d => [vixMap.get(d), ovxMap.get(d)]);
+  const K = 2, YEAR = 252;
+
+  // Walk-forward: train on year N, label year N+1, repeat across all years
+  const wfRegimes   = new Array(allDates.length).fill(null);
+  const wfProbs     = new Array(allDates.length).fill(null);
+  const nPairs = Math.floor((allDates.length - YEAR) / YEAR);
+
+  for (let pair = 0; pair < nPairs; pair++) {
+    const trainStart = pair * YEAR;
+    const trainEnd   = trainStart + YEAR;
+    const testStart  = trainEnd;
+    const testEnd    = Math.min(testStart + YEAR, allDates.length);
+
+    const trainRaw = rawFeatures.slice(trainStart, trainEnd);
+    const { scaled: trainScaled, stats: sc } = standardize(trainRaw);
+
+    const model = fitHMM(trainScaled, K, 100);
+    if (!model) continue;
+
+    const { pi, logA, mu, sigSq } = model;
+    // Stress = state with higher mean VIX (feature 0)
+    const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
+
+    // Scale test data with training stats
+    const testRaw    = rawFeatures.slice(testStart, testEnd);
+    const testScaled = testRaw.map(x => x.map((v, d) => (v - sc[d].mu) / sc[d].sigma));
+
+    // Viterbi hard labels on test year
+    const testStates = viterbi(testScaled, pi, logA, mu, sigSq, K);
+
+    // Smooth probabilities via forward-backward on test year
+    const logPi    = pi.map(v => Math.log(v + 1e-300));
+    const logAlpha = forward(testScaled, logPi, logA, mu, sigSq, K);
+    const logBeta  = backward(testScaled, logA, mu, sigSq, K);
+    const { gamma: testGamma } = gammaXi(logAlpha, logBeta, testScaled, logA, mu, sigSq, K);
+
+    for (let i = 0; i < testEnd - testStart; i++) {
+      wfRegimes[testStart + i] = testStates[i] === stressState ? 1 : 0;
+      wfProbs  [testStart + i] = +Math.max(0, Math.min(1, testGamma[i][stressState])).toFixed(4);
+    }
+  }
+
+  // Keep only labeled days
+  const labeledIdx   = allDates.map((_,i)=>i).filter(i => wfRegimes[i] !== null);
+  const labeledDates = labeledIdx.map(i => allDates[i]);
+  const regimes      = labeledIdx.map(i => wfRegimes[i]);
+  const stressProbs  = labeledIdx.map(i => wfProbs[i]);
+  const labeledFeat  = labeledIdx.map(i => rawFeatures[i]);
+
+  const cutoff1Y = new Date(); cutoff1Y.setDate(cutoff1Y.getDate() - 365);
+  const cutoffStr = cutoff1Y.toISOString().slice(0, 10);
+
+  const portRets   = labeledDates.map(d => portfolioRetMap?.get(d) ?? null);
+  const normalRets = portRets.filter((r,i) => r!==null && regimes[i]===0 && labeledDates[i]>=cutoffStr);
+  const stressRets = portRets.filter((r,i) => r!==null && regimes[i]===1 && labeledDates[i]>=cutoffStr);
+
+  function regimeStats(rets) {
+    if (!rets.length) return null;
+    const s = std(rets), annVol = s*Math.sqrt(252)*100, annRet = mean(rets)*252*100;
+    const var95 = histVaR(rets,0.95), cvar95 = histCVaR(rets,0.95);
     let peak=1,cum=1,sumDD=0,ddN=0;
     rets.forEach(r=>{cum*=(1+r);if(cum>peak)peak=cum;const dd=(cum-peak)/peak;if(dd<0){sumDD+=dd;ddN++;}});
-    return{count:rets.length,annualizedRetPct:+annRet.toFixed(2),annualizedVolPct:+annVol.toFixed(2),dailyVolPct:+(s*100).toFixed(3),sharpe:annVol===0?null:+(annRet/annVol).toFixed(3),var95Pct:var95!==null?+(var95*100).toFixed(2):null,cvar95Pct:cvar95!==null?+(cvar95*100).toFixed(2):null,avgDrawdownPct:ddN?+(sumDD/ddN*100).toFixed(2):0,maxDrawdownPct:+maxDDFromReturns(rets).toFixed(2)};
+    return{count:rets.length,annualizedRetPct:+annRet.toFixed(2),annualizedVolPct:+annVol.toFixed(2),
+      dailyVolPct:+(s*100).toFixed(3),sharpe:annVol===0?null:+(annRet/annVol).toFixed(3),
+      var95Pct:var95!==null?+(var95*100).toFixed(2):null,cvar95Pct:cvar95!==null?+(cvar95*100).toFixed(2):null,
+      avgDrawdownPct:ddN?+(sumDD/ddN*100).toFixed(2):0,maxDrawdownPct:+maxDDFromReturns(rets).toFixed(2)};
   }
-  let cumVal=100;
-  const portfolioIndex=allDates.map((d,i)=>({d,i})).filter(({d})=>d>=cutoffStr).map(({d,i})=>{if(portRets[i]!==null)cumVal*=(1+portRets[i]);return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]};});
-  const stressProbFull=allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]})).filter(x=>x.date>=cutoffStr);
-  const featureNames=["VIX","OVX","XTC5(iTraxx_short)"];
-  const stateMeans=[0,1].map(r=>{const obj={};featureNames.forEach((f,d)=>{const pts=rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;});return obj;});
-  const lastI=allDates.length-1;
-  return{dates:allDates,regimes,stressProbs,stressProbFull,portfolioIndex,normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],currentVix:rawFeatures[lastI]?.[0]??null,normalDays:normalRets.length,stressDays:stressRets.length,featureDays:allDates.length,stateMeans,method:"Full-sample 2-state Gaussian HMM (5Y, full covariance, 100 EM iters, prior=2, reg=0.05) on VIX + OVX + XTC5.DE (Xtrackers iTraxx Crossover Short) — chart & stats: last 1Y"};
+
+  let cumVal = 100;
+  const portfolioIndex = labeledDates.map((d,i)=>({d,i}))
+    .filter(({d})=>d>=cutoffStr)
+    .map(({d,i})=>{if(portRets[i]!==null)cumVal*=(1+portRets[i]);return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]};});
+
+  const stressProbFull = labeledDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}))
+    .filter(x=>x.date>=cutoffStr);
+
+  const featureNames = ["VIX","OVX"];
+  const stateMeans = [0,1].map(r=>{
+    const obj={};
+    featureNames.forEach((f,d)=>{
+      const pts=labeledFeat.filter((_,i)=>regimes[i]===r).map(x=>x[d]);
+      obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;
+    });
+    return obj;
+  });
+
+  const lastI = labeledDates.length-1;
+  return{
+    dates:labeledDates,regimes,stressProbs,stressProbFull,portfolioIndex,
+    normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),
+    normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),
+    currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],
+    currentVix:labeledFeat[lastI]?.[0]??null,
+    normalDays:normalRets.length,stressDays:stressRets.length,featureDays:labeledDates.length,
+    stateMeans,
+    method:`Walk-forward HMM (VIX+OVX, diag cov, train 1Y → test 1Y, ${nPairs} pairs) — chart & stats: last 1Y`,
+  };
 }
+
 
 // ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {

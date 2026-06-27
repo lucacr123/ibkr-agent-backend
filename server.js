@@ -345,7 +345,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       dates,
       portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
-      rollingSharpe30: rollingFn(pr, 30, arr => { const ar = annualizedReturn(arr); const av = std(arr) * Math.sqrt(252); return av === 0 ? null : +(ar / av).toFixed(4); }),
+      drawdownSeries: (() => { let peak=-Infinity; return cumulativeFromReturns(pr).map(v=>{ if(v>peak)peak=v; return +((v-peak)/peak*100).toFixed(3); }); })(),
       weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
@@ -687,8 +687,7 @@ function standardize(series) {
   return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
 }
 async function computeRegimeModel(portfolioRetMap) {
-  // Features: VIX + OVX only (2 features — stable, no XTC5)
-  // 5Y of data for walk-forward (train 1Y → test 1Y → repeat)
+  // Features: VIX + OVX only — 5Y full-sample fit for stable regime labels
   const [vixData, ovxData] = await Promise.all([
     fetchYahooCloses("^VIX", "5y"),
     fetchYahooCloses("^OVX", "5y"),
@@ -696,107 +695,75 @@ async function computeRegimeModel(portfolioRetMap) {
 
   const vixMap = new Map(vixData.bars.map(b => [b.date, b.close]));
   const ovxMap = new Map(ovxData.bars.map(b => [b.date, b.close]));
-
   const allDates = [...vixMap.keys()].filter(d => ovxMap.has(d)).sort();
-  if (allDates.length < 504) throw new Error("Need at least 2Y of VIX+OVX data");
+  if (allDates.length < 252) throw new Error("Need at least 1Y of VIX+OVX data");
 
   const rawFeatures = allDates.map(d => [vixMap.get(d), ovxMap.get(d)]);
-  const K = 2, YEAR = 252;
+  const { scaled } = standardize(rawFeatures);
 
-  // Walk-forward: train on year N, label year N+1, repeat across all years
-  const wfRegimes   = new Array(allDates.length).fill(null);
-  const wfProbs     = new Array(allDates.length).fill(null);
-  const nPairs = Math.floor((allDates.length - YEAR) / YEAR);
+  // Full-sample fit — 5Y of data gives stable EM convergence
+  const model = fitHMM(scaled, 2, 100);
+  if (!model) throw new Error("HMM fitting failed");
 
-  for (let pair = 0; pair < nPairs; pair++) {
-    const trainStart = pair * YEAR;
-    const trainEnd   = trainStart + YEAR;
-    const testStart  = trainEnd;
-    const testEnd    = Math.min(testStart + YEAR, allDates.length);
+  const { pi, logA, mu, sigSq, gamma } = model;
 
-    const trainRaw = rawFeatures.slice(trainStart, trainEnd);
-    const { scaled: trainScaled, stats: sc } = standardize(trainRaw);
+  // Hard labels via Viterbi
+  const states = viterbi(scaled, pi, logA, mu, sigSq, 2);
 
-    const model = fitHMM(trainScaled, K, 100);
-    if (!model) continue;
+  // Stress state = higher mean VIX (feature 0 in standardised space)
+  const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
+  const regimes    = states.map(s => s === stressState ? 1 : 0);
+  const stressProbs = gamma.map(g => +Math.max(0, Math.min(1, g[stressState])).toFixed(4));
 
-    const { pi, logA, mu, sigSq } = model;
-    // Stress = state with higher mean VIX (feature 0)
-    const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
-
-    // Scale test data with training stats
-    const testRaw    = rawFeatures.slice(testStart, testEnd);
-    const testScaled = testRaw.map(x => x.map((v, d) => (v - sc[d].mu) / sc[d].sigma));
-
-    // Viterbi hard labels on test year
-    const testStates = viterbi(testScaled, pi, logA, mu, sigSq, K);
-
-    // Smooth probabilities via forward-backward on test year
-    const logPi    = pi.map(v => Math.log(v + 1e-300));
-    const logAlpha = forward(testScaled, logPi, logA, mu, sigSq, K);
-    const logBeta  = backward(testScaled, logA, mu, sigSq, K);
-    const { gamma: testGamma } = gammaXi(logAlpha, logBeta, testScaled, logA, mu, sigSq, K);
-
-    for (let i = 0; i < testEnd - testStart; i++) {
-      wfRegimes[testStart + i] = testStates[i] === stressState ? 1 : 0;
-      wfProbs  [testStart + i] = +Math.max(0, Math.min(1, testGamma[i][stressState])).toFixed(4);
-    }
-  }
-
-  // Keep only labeled days
-  const labeledIdx   = allDates.map((_,i)=>i).filter(i => wfRegimes[i] !== null);
-  const labeledDates = labeledIdx.map(i => allDates[i]);
-  const regimes      = labeledIdx.map(i => wfRegimes[i]);
-  const stressProbs  = labeledIdx.map(i => wfProbs[i]);
-  const labeledFeat  = labeledIdx.map(i => rawFeatures[i]);
-
+  // 1Y window for chart and stats
   const cutoff1Y = new Date(); cutoff1Y.setDate(cutoff1Y.getDate() - 365);
   const cutoffStr = cutoff1Y.toISOString().slice(0, 10);
 
-  const portRets   = labeledDates.map(d => portfolioRetMap?.get(d) ?? null);
-  const normalRets = portRets.filter((r,i) => r!==null && regimes[i]===0 && labeledDates[i]>=cutoffStr);
-  const stressRets = portRets.filter((r,i) => r!==null && regimes[i]===1 && labeledDates[i]>=cutoffStr);
+  const portRets   = allDates.map(d => portfolioRetMap?.get(d) ?? null);
+  const normalRets = portRets.filter((r,i) => r!==null && regimes[i]===0 && allDates[i]>=cutoffStr);
+  const stressRets = portRets.filter((r,i) => r!==null && regimes[i]===1 && allDates[i]>=cutoffStr);
 
   function regimeStats(rets) {
     if (!rets.length) return null;
     const s = std(rets), annVol = s*Math.sqrt(252)*100, annRet = mean(rets)*252*100;
     const var95 = histVaR(rets,0.95), cvar95 = histCVaR(rets,0.95);
-    let peak=1,cum=1,sumDD=0,ddN=0;
-    rets.forEach(r=>{cum*=(1+r);if(cum>peak)peak=cum;const dd=(cum-peak)/peak;if(dd<0){sumDD+=dd;ddN++;}});
-    return{count:rets.length,annualizedRetPct:+annRet.toFixed(2),annualizedVolPct:+annVol.toFixed(2),
-      dailyVolPct:+(s*100).toFixed(3),sharpe:annVol===0?null:+(annRet/annVol).toFixed(3),
-      var95Pct:var95!==null?+(var95*100).toFixed(2):null,cvar95Pct:cvar95!==null?+(cvar95*100).toFixed(2):null,
-      avgDrawdownPct:ddN?+(sumDD/ddN*100).toFixed(2):0,maxDrawdownPct:+maxDDFromReturns(rets).toFixed(2)};
+    let peak=1, cum=1, sumDD=0, ddN=0;
+    rets.forEach(r => { cum*=(1+r); if(cum>peak)peak=cum; const dd=(cum-peak)/peak; if(dd<0){sumDD+=dd;ddN++;} });
+    return { count:rets.length, annualizedRetPct:+annRet.toFixed(2), annualizedVolPct:+annVol.toFixed(2),
+      dailyVolPct:+(s*100).toFixed(3), sharpe:annVol===0?null:+(annRet/annVol).toFixed(3),
+      var95Pct:var95!==null?+(var95*100).toFixed(2):null, cvar95Pct:cvar95!==null?+(cvar95*100).toFixed(2):null,
+      avgDrawdownPct:ddN?+(sumDD/ddN*100).toFixed(2):0, maxDrawdownPct:+maxDDFromReturns(rets).toFixed(2) };
   }
 
   let cumVal = 100;
-  const portfolioIndex = labeledDates.map((d,i)=>({d,i}))
+  const portfolioIndex = allDates.map((d,i)=>({d,i}))
     .filter(({d})=>d>=cutoffStr)
-    .map(({d,i})=>{if(portRets[i]!==null)cumVal*=(1+portRets[i]);return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]};});
+    .map(({d,i})=>{ if(portRets[i]!==null) cumVal*=(1+portRets[i]); return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]}; });
 
-  const stressProbFull = labeledDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}))
-    .filter(x=>x.date>=cutoffStr);
+  // Full 5Y stress prob series — then filter to 1Y for display
+  const stressProbFull = allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}))
+    .filter(x => x.date >= cutoffStr);
 
   const featureNames = ["VIX","OVX"];
-  const stateMeans = [0,1].map(r=>{
-    const obj={};
-    featureNames.forEach((f,d)=>{
-      const pts=labeledFeat.filter((_,i)=>regimes[i]===r).map(x=>x[d]);
-      obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;
+  const stateMeans = [0,1].map(r => {
+    const obj = {};
+    featureNames.forEach((f,d) => {
+      const pts = rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);
+      obj[f] = pts.length ? +(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2) : null;
     });
     return obj;
   });
 
-  const lastI = labeledDates.length-1;
-  return{
-    dates:labeledDates,regimes,stressProbs,stressProbFull,portfolioIndex,
-    normalStats:regimeStats(normalRets),stressStats:regimeStats(stressRets),
-    normalDist:returnDistribution(normalRets,20),stressDist:returnDistribution(stressRets,20),
-    currentRegime:regimes[lastI],currentStressProb:stressProbs[lastI],
-    currentVix:labeledFeat[lastI]?.[0]??null,
-    normalDays:normalRets.length,stressDays:stressRets.length,featureDays:labeledDates.length,
+  const lastI = allDates.length - 1;
+  return {
+    dates:allDates, regimes, stressProbs, stressProbFull, portfolioIndex,
+    normalStats:regimeStats(normalRets), stressStats:regimeStats(stressRets),
+    normalDist:returnDistribution(normalRets,20), stressDist:returnDistribution(stressRets,20),
+    currentRegime:regimes[lastI], currentStressProb:stressProbs[lastI],
+    currentVix:rawFeatures[lastI]?.[0]??null,
+    normalDays:normalRets.length, stressDays:stressRets.length, featureDays:allDates.length,
     stateMeans,
-    method:`Walk-forward HMM (VIX+OVX, diag cov, train 1Y → test 1Y, ${nPairs} pairs) — chart & stats: last 1Y`,
+    method:"Full-sample 2-state HMM (VIX+OVX, diagonal cov, 100 EM iters) on 5Y — chart & stats: last 1Y",
   };
 }
 

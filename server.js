@@ -357,23 +357,50 @@ async function computePortfolioMetrics(positions, totalNLV) {
 }
 
 async function fetchMarketNews(input = {}) {
-  const symbols = (input.symbols && input.symbols.length ? input.symbols : ["^GSPC","^IXIC","^DJI","^STOXX50E","^FTSE","^TNX","EURUSD=X","GC=F","CL=F"]).map(yfSymbol);
-  const feeds = [
-    `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(symbols.join(","))}&region=US&lang=en-US`,
-    "https://www.investing.com/rss/news_25.rss",
-    "https://www.investing.com/rss/news_285.rss"
-  ];
+  const limit = input.limit || 12;
   const items = [];
+
+  // Yahoo Finance RSS — general market news (no symbol filter = broader coverage)
+  const feeds = [
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^GSPC,^IXIC,^DJI,^STOXX50E&region=US&lang=en-US",
+    "https://feeds.finance.yahoo.com/rss/2.0/headline?s=EURUSD=X,GC=F,CL=F,^TNX&region=US&lang=en-US",
+    "https://www.investing.com/rss/news_25.rss",
+    "https://www.investing.com/rss/news_285.rss",
+    "https://feeds.reuters.com/reuters/businessNews",
+  ];
   for (const url of feeds) {
     try {
-      const xml = await (await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } })).text();
+      const xml  = await (await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/rss+xml,application/xml" } })).text();
       const data = parser.parse(xml);
-      const rows = toArr(data?.rss?.channel?.item).slice(0, 12);
-      rows.forEach(x => items.push({ title: x.title, link: x.link, published: x.pubDate, source: data?.rss?.channel?.title || "Market news" }));
+      const rows = toArr(data?.rss?.channel?.item || data?.feed?.entry).slice(0, 20);
+      rows.forEach(x => {
+        const title = x.title?.["#text"] || x.title;
+        const link  = x.link?.href || x.link;
+        const pub   = x.pubDate || x.published || x["dc:date"];
+        if (title) items.push({ title, link, published: pub, publisher: data?.rss?.channel?.title || data?.feed?.title?.["#text"] || "Market news" });
+      });
     } catch {}
   }
+
+  // Also fetch via Yahoo Finance search for broader week coverage
+  try {
+    const res  = await fetch("https://query1.finance.yahoo.com/v1/finance/search?q=market+stocks+economy&newsCount=20&quotesCount=0", { headers: { "User-Agent": "Mozilla/5.0" } });
+    const data = await res.json();
+    (data?.news || []).forEach(n => {
+      if (n.title) items.push({ title: n.title, link: n.link, published: n.providerPublishTime ? new Date(n.providerPublishTime*1000).toISOString() : null, publisher: n.publisher });
+    });
+  } catch {}
+
   const seen = new Set();
-  return { count: items.length, headlines: items.filter(x => x.title && !seen.has(x.title) && seen.add(x.title)).slice(0, input.limit || 12) };
+  const deduped = items.filter(x => x.title && !seen.has(x.title) && seen.add(x.title));
+  // Sort by date descending, keep last 7 days
+  const weekAgo = Date.now() - 7*24*60*60*1000;
+  const recent = deduped.filter(x => {
+    if (!x.published) return true; // keep if no date
+    const d = new Date(x.published).getTime();
+    return isNaN(d) || d >= weekAgo;
+  });
+  return { count: recent.length, headlines: recent.slice(0, limit) };
 }
 
 async function marketSnapshot() {
@@ -415,11 +442,22 @@ async function sendEmail(to, subject, html) {
 }
 
 async function buildAndSendReport(to) {
-  const [portfolio, newsData, macro] = await Promise.all([
+  const [portfolio, newsData, macro, weeklyData] = await Promise.all([
     buildPortfolio().catch(() => null),
     fetchMarketNews({ limit: 10 }).catch(() => ({ headlines: [] })),
     marketSnapshot().catch(() => ({ quotes: [] })),
+    // Fetch 5-day history for 3 key indices to get weekly % change
+    Promise.all(["^GSPC","^IXIC","^STOXX50E"].map(sym =>
+      fetchYahooCloses(sym, "5d").then(d => {
+        const bars = d.bars.filter(b => b.close);
+        if (bars.length < 2) return { sym, weekChg: 0, bars: [] };
+        const first = bars[0].close, last = bars[bars.length-1].close;
+        return { sym, weekChg: +((last-first)/first*100).toFixed(2), bars };
+      }).catch(() => ({ sym, weekChg: 0, bars: [] }))
+    )).catch(() => []),
   ]);
+  const weeklyMap = {};
+  (weeklyData || []).forEach(w => { weeklyMap[w.sym] = w; });
   const combined  = portfolio?.combined || {};
   const positions = combined.positions || [];
   const metrics   = combined.metrics1Y;
@@ -509,16 +547,16 @@ async function buildAndSendReport(to) {
   const indexMap = {};
   (macro?.quotes||[]).forEach(q => { indexMap[q.symbol] = q; });
 
-  function sparklineSVG(changePct, label, desc, region) {
+  function sparklineSVG(changePct, label, desc, region, realBars=[]) {
     const col   = changePct >= 0 ? "#2ECC71" : "#E74C3C";
     const arrow = changePct >= 0 ? "▲" : "▼";
-    const bars  = 10;
-    // Simulate a weekly price path from changePct (smooth curve ending at changePct)
-    const path  = Array.from({length:bars}, (_,i) => {
-      const progress = i / (bars-1);
-      const noise    = Math.sin(i*1.3)*0.3;
-      return 50 + (changePct * progress * 2.5) + noise;
-    });
+    // Use real price bars if available, otherwise simulate
+    const path = realBars.length >= 2
+      ? realBars.map(b => b.close)
+      : Array.from({length:10}, (_,i) => {
+          const progress = i/9, noise = Math.sin(i*1.3)*0.3;
+          return 50 + (changePct * progress * 2.5) + noise;
+        });
     const minV = Math.min(...path), maxV = Math.max(...path), range = maxV-minV||1;
     const W=180, H=50;
     const pts = path.map((v,i) => `${Math.round(i/(bars-1)*W)},${Math.round(H - ((v-minV)/range)*(H-6) - 3)}`).join(" ");
@@ -539,19 +577,20 @@ async function buildAndSendReport(to) {
     </td>`;
   }
 
-  const spxQ   = indexMap["^GSPC"] || indexMap["SPX"] || {};
-  const ndxQ   = indexMap["^IXIC"] || indexMap["NDX"] || {};
-  const sx5eQ  = indexMap["^STOXX50E"] || indexMap["SX5E"] || {};
-  const spxChg  = spxQ.changePct  || 0;
-  const ndxChg  = ndxQ.changePct  || 0;
-  const sx5eChg = sx5eQ.changePct || 0;
+  const spxChg  = weeklyMap["^GSPC"]?.weekChg  || 0;
+  const ndxChg  = weeklyMap["^IXIC"]?.weekChg  || 0;
+  const sx5eChg = weeklyMap["^STOXX50E"]?.weekChg || 0;
+  // Use real price bars for sparkline if available
+  const spxBars  = weeklyMap["^GSPC"]?.bars  || [];
+  const ndxBars  = weeklyMap["^IXIC"]?.bars  || [];
+  const sx5eBars = weeklyMap["^STOXX50E"]?.bars || [];
 
   const marketsHtml = `
   <table style="width:100%;border-collapse:separate;border-spacing:8px">
     <tr>
-      ${sparklineSVG(spxChg,  "S&P 500",   "500 largest US companies — the main US stock market benchmark", "🇺🇸 United States")}
-      ${sparklineSVG(ndxChg,  "Nasdaq 100","100 largest tech & growth companies — Apple, Microsoft, Nvidia…", "🇺🇸 Technology")}
-      ${sparklineSVG(sx5eChg, "Euro Stoxx 50","50 biggest European companies — the European equivalent of the S&P 500", "🇪🇺 Europe")}
+      ${sparklineSVG(spxChg,  "S&P 500",   "500 largest US companies — the main US stock market benchmark", "🇺🇸 United States", spxBars)}
+      ${sparklineSVG(ndxChg,  "Nasdaq 100","100 largest tech & growth companies — Apple, Microsoft, Nvidia…", "🇺🇸 Technology", ndxBars)}
+      ${sparklineSVG(sx5eChg, "Euro Stoxx 50","50 biggest European companies — the European equivalent of the S&P 500", "🇪🇺 Europe", sx5eBars)}
     </tr>
   </table>
   <p style="font-size:11px;color:#5A6280;margin:10px 0 0;line-height:1.5">

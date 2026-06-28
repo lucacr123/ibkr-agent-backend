@@ -797,8 +797,8 @@ function fitHMM(obs, K, maxIter=100) {
   // Init params
   let pi = [0.8, 0.2];  // most time in normal
   let logA = [
-    [Math.log(0.95), Math.log(0.05)],   // normal → normal 95%
-    [Math.log(0.10), Math.log(0.90)],   // stress → stress 90%
+    [Math.log(0.97), Math.log(0.03)],   // normal → normal 97%
+    [Math.log(0.05), Math.log(0.95)],   // stress → stress 95%
   ];
   let mu = Array.from({length:K}, (_,s) => {
     const wts = gamma.map(g => g[s]);
@@ -828,7 +828,7 @@ function fitHMM(obs, K, maxIter=100) {
     pi = pi.map(v => v/piS);
 
     // M-step A — with Dirichlet prior to prevent extreme transitions
-    const PRIOR = 1.0;  // symmetric Dirichlet prior — allows switching
+    const PRIOR = 5.0;  // asymmetric-ish prior — more persistence, fewer spurious switches
     logA = Array.from({length:K}, (_,s) => {
       const row = Array.from({length:K}, (_,s2) =>
         xi.reduce((sm,xit) => sm+xit[s][s2], 0) + PRIOR
@@ -889,7 +889,7 @@ function standardize(series) {
   return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
 }
 async function computeRegimeModel(portfolioRetMap) {
-  // Features: VIX + MOVE + DXST.DE 30d ann. vol
+  // Features: VIX + MOVE + DXST.DE 30d ann. vol — full-sample fit
   const [vixData, moveData, dxstData] = await Promise.all([
     fetchYahooCloses("^VIX",   "5y"),
     fetchYahooCloses("^MOVE",  "5y"),
@@ -899,7 +899,6 @@ async function computeRegimeModel(portfolioRetMap) {
   const vixMap  = new Map(vixData.bars.map(b => [b.date, b.close]));
   const moveMap = new Map(moveData.bars.map(b => [b.date, b.close]));
 
-  // DXST: 30-day rolling annualised vol of daily returns
   const dxstBars = dxstData.bars;
   const dxstVolMap = new Map();
   const WIN_VOL = 30;
@@ -912,79 +911,27 @@ async function computeRegimeModel(portfolioRetMap) {
     dxstVolMap.set(dxstBars[i].date, v);
   }
 
-  const allDates = [...vixMap.keys()]
-    .filter(d => moveMap.has(d) && dxstVolMap.has(d))
-    .sort();
-
+  const allDates = [...vixMap.keys()].filter(d => moveMap.has(d) && dxstVolMap.has(d)).sort();
   if (allDates.length < 252) throw new Error("Need at least 1Y of data");
 
   const rawFeatures = allDates.map(d => [vixMap.get(d), moveMap.get(d), dxstVolMap.get(d)]);
+  const { scaled } = standardize(rawFeatures);
 
-  // ── Expanding walk-forward ────────────────────────────────────────
-  // Initial in-sample: 6 months (~126 days)
-  // Each test window: 6 months (~126 days)
-  // After each test, expand training by 126 days and predict next 126
-  const INIT   = 126;  // initial train window
-  const STEP   = 126;  // test window + expansion step
-  const K      = 2;
+  const model = fitHMM(scaled, 2, 100);
+  if (!model) throw new Error("HMM fitting failed");
 
-  const wfRegimes = new Array(allDates.length).fill(null);
-  const wfProbs   = new Array(allDates.length).fill(null);
+  const { pi, logA, mu, sigSq, gamma } = model;
+  const states      = viterbi(scaled, pi, logA, mu, sigSq, 2);
+  const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
+  const regimes     = states.map(s => s === stressState ? 1 : 0);
+  const stressProbs = gamma.map(g => +Math.max(0, Math.min(1, g[stressState])).toFixed(4));
 
-  let trainEnd = INIT;
-  let windowN  = 0;
-
-  while (trainEnd < allDates.length) {
-    const testStart = trainEnd;
-    const testEnd   = Math.min(testStart + STEP, allDates.length);
-
-    // Train on expanding window [0..trainEnd]
-    const trainRaw = rawFeatures.slice(0, trainEnd);
-    const { scaled: trainScaled, stats: sc } = standardize(trainRaw);
-    const model = fitHMM(trainScaled, K, 100);
-
-    if (model) {
-      const { pi, logA, mu, sigSq } = model;
-      // Stress state = higher mean VIX (feature 0)
-      const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
-
-      // Scale test window using training statistics
-      const testRaw    = rawFeatures.slice(testStart, testEnd);
-      const testScaled = testRaw.map(x => x.map((v, d) => (v - sc[d].mu) / sc[d].sigma));
-
-      // Hard labels via Viterbi on test window
-      const testStates = viterbi(testScaled, pi, logA, mu, sigSq, K);
-
-      // Smooth probabilities via forward-backward on test window
-      const logPi    = pi.map(v => Math.log(v + 1e-300));
-      const logAlpha = forward(testScaled, logPi, logA, mu, sigSq, K);
-      const logBeta  = backward(testScaled, logA, mu, sigSq, K);
-      const { gamma: testGamma } = gammaXi(logAlpha, logBeta, testScaled, logA, mu, sigSq, K);
-
-      for (let i = 0; i < testEnd - testStart; i++) {
-        wfRegimes[testStart + i] = testStates[i] === stressState ? 1 : 0;
-        wfProbs  [testStart + i] = +Math.max(0, Math.min(1, testGamma[i][stressState])).toFixed(4);
-      }
-    }
-
-    trainEnd += STEP;  // expand training window by 6 months
-    windowN++;
-  }
-
-  // Filter to labeled dates only (first 6 months are burn-in)
-  const labeledIdx   = allDates.map((_,i) => i).filter(i => wfRegimes[i] !== null);
-  const labeledDates = labeledIdx.map(i => allDates[i]);
-  const regimes      = labeledIdx.map(i => wfRegimes[i]);
-  const stressProbs  = labeledIdx.map(i => wfProbs[i]);
-  const labeledFeat  = labeledIdx.map(i => rawFeatures[i]);
-
-  // 1Y cutoff for chart and stats
   const cutoff1Y = new Date(); cutoff1Y.setDate(cutoff1Y.getDate() - 365);
   const cutoffStr = cutoff1Y.toISOString().slice(0, 10);
 
-  const portRets   = labeledDates.map(d => portfolioRetMap?.get(d) ?? null);
-  const normalRets = portRets.filter((r,i) => r!==null && regimes[i]===0 && labeledDates[i]>=cutoffStr);
-  const stressRets = portRets.filter((r,i) => r!==null && regimes[i]===1 && labeledDates[i]>=cutoffStr);
+  const portRets   = allDates.map(d => portfolioRetMap?.get(d) ?? null);
+  const normalRets = portRets.filter((r,i) => r!==null && regimes[i]===0 && allDates[i]>=cutoffStr);
+  const stressRets = portRets.filter((r,i) => r!==null && regimes[i]===1 && allDates[i]>=cutoffStr);
 
   function regimeStats(rets) {
     if (!rets.length) return null;
@@ -999,35 +946,35 @@ async function computeRegimeModel(portfolioRetMap) {
   }
 
   let cumVal = 100;
-  const portfolioIndex = labeledDates.map((d,i) => ({d,i}))
-    .filter(({d}) => d >= cutoffStr)
-    .map(({d,i}) => { if(portRets[i]!==null) cumVal*=(1+portRets[i]); return {date:d, value:+cumVal.toFixed(3), regime:regimes[i]}; });
+  const portfolioIndex = allDates.map((d,i)=>({d,i}))
+    .filter(({d})=>d>=cutoffStr)
+    .map(({d,i})=>{ if(portRets[i]!==null) cumVal*=(1+portRets[i]); return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]}; });
 
-  const stressProbFull = labeledDates.map((d,i) => ({date:d, prob:stressProbs[i], regime:regimes[i]}))
-    .filter(x => x.date >= cutoffStr);
+  const stressProbFull = allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}))
+    .filter(x=>x.date>=cutoffStr);
 
   const featureNames = ["VIX","MOVE","DXST_ann_vol(iTraxx)"];
-  const stateMeans = [0,1].map(r => {
-    const obj = {};
-    featureNames.forEach((f,d) => {
-      const pts = labeledFeat.filter((_,i) => regimes[i]===r).map(x => x[d]);
-      obj[f] = pts.length ? +(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2) : null;
+  const stateMeans = [0,1].map(r=>{
+    const obj={};
+    featureNames.forEach((f,d)=>{
+      const pts=rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);
+      obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;
     });
     return obj;
   });
 
-  const lastI = labeledDates.length - 1;
+  const lastI = allDates.length-1;
   return {
-    dates: labeledDates, regimes, stressProbs, stressProbFull, portfolioIndex,
-    normalStats: regimeStats(normalRets), stressStats: regimeStats(stressRets),
-    normalDist: returnDistribution(normalRets, 20), stressDist: returnDistribution(stressRets, 20),
-    currentRegime: regimes[lastI], currentStressProb: stressProbs[lastI],
-    currentVix: labeledFeat[lastI]?.[0] ?? null,
-    currentMove: labeledFeat[lastI]?.[1] ?? null,
-    currentDxstVol: labeledFeat[lastI]?.[2] ?? null,
-    normalDays: normalRets.length, stressDays: stressRets.length, featureDays: labeledDates.length,
-    stateMeans, windowN,
-    method: `Expanding walk-forward HMM (init 6M, test+expand 6M, ${windowN} windows) — VIX + MOVE + DXST vol — chart & stats: last 1Y`,
+    dates:allDates, regimes, stressProbs, stressProbFull, portfolioIndex,
+    normalStats:regimeStats(normalRets), stressStats:regimeStats(stressRets),
+    normalDist:returnDistribution(normalRets,20), stressDist:returnDistribution(stressRets,20),
+    currentRegime:regimes[lastI], currentStressProb:stressProbs[lastI],
+    currentVix:rawFeatures[lastI]?.[0]??null,
+    currentMove:rawFeatures[lastI]?.[1]??null,
+    currentDxstVol:rawFeatures[lastI]?.[2]??null,
+    normalDays:normalRets.length, stressDays:stressRets.length, featureDays:allDates.length,
+    stateMeans,
+    method:"Full-sample 2-state HMM (VIX + MOVE + DXST vol, diag cov, prior=5, 100 EM iters) on 5Y — chart & stats: last 1Y",
   };
 }
 

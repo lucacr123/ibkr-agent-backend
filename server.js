@@ -19,7 +19,7 @@ const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "";
 const VAPID_EMAIL   = process.env.VAPID_EMAIL       || "mailto:you@example.com";
 
 const RESEND_KEY  = process.env.RESEND_API_KEY  || "";
-const REPORT_TO   = process.env.REPORT_EMAIL_TO || "rodriguez.albacar.joaquin@gmail.com";
+const REPORT_TO   = process.env.REPORT_EMAIL_TO || "luca-ciampiruiz@hotmail.com";
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
@@ -122,7 +122,8 @@ async function buildPortfolio(force = false) {
       ytdReturn:     n(changeInNAV.twr),
       startingValue: n(changeInNAV.startingValue) * acctFxToEUR,
       endingValue:   n(changeInNAV.endingValue)   * acctFxToEUR,
-      ytdGainEUR:    (n(changeInNAV.endingValue) - n(changeInNAV.startingValue)) * acctFxToEUR,
+      // ytdGainEUR = investment gain only (twr-based), excludes deposits/withdrawals
+      ytdGainEUR:    n(changeInNAV.startingValue) * (n(changeInNAV.twr) / 100) * acctFxToEUR,
       commissions:   n(baseCash.commissions),
       deposits:      n(baseCash.deposits),
       withdrawals:   n(baseCash.withdrawals),
@@ -187,7 +188,8 @@ async function buildPortfolio(force = false) {
       totalStockValue:       +accounts.reduce((s, a) => s + a.stockValueEUR, 0).toFixed(2),
       totalUnrealizedPnlEUR: totalUnrealEUR,
       totalYtdGainEUR,
-      avgYtdReturnPct:       +(accounts.reduce((s, a) => s + (a.ytdReturn || 0), 0) / accounts.length).toFixed(2),
+      // NLV-weighted average TWR across accounts
+      avgYtdReturnPct: +(accounts.reduce((s,a)=>s+(a.ytdReturn||0)*a.netLiquidationEUR,0) / Math.max(totalNLV,1)).toFixed(2),
       totalCommissions:      +accounts.reduce((s, a) => s + a.commissions, 0).toFixed(2),
       totalDividends:        +accounts.reduce((s, a) => s + a.dividends, 0).toFixed(2),
       totalBrokerInterest:   +accounts.reduce((s, a) => s + a.brokerInterest, 0).toFixed(2),
@@ -687,35 +689,57 @@ function standardize(series) {
   return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
 }
 async function computeRegimeModel(portfolioRetMap) {
-  // Features: VIX + OVX only — 5Y full-sample fit for stable regime labels
-  const [vixData, ovxData] = await Promise.all([
-    fetchYahooCloses("^VIX", "5y"),
-    fetchYahooCloses("^OVX", "5y"),
+  // Features: VIX + OVX + DXST.DE annualised 30d vol
+  // DXST.DE = Xtrackers iTraxx Crossover Short UCITS ETF (LU0321462870)
+  // Short ETF: price rises when iTraxx spreads widen → vol of this ETF = credit vol signal
+  const [vixData, ovxData, dxstData] = await Promise.all([
+    fetchYahooCloses("^VIX",   "5y"),
+    fetchYahooCloses("^OVX",   "5y"),
+    fetchYahooCloses("DXST.DE","5y"),
   ]);
 
-  const vixMap = new Map(vixData.bars.map(b => [b.date, b.close]));
-  const ovxMap = new Map(ovxData.bars.map(b => [b.date, b.close]));
-  const allDates = [...vixMap.keys()].filter(d => ovxMap.has(d)).sort();
-  if (allDates.length < 252) throw new Error("Need at least 1Y of VIX+OVX data");
+  const vixMap  = new Map(vixData.bars.map(b => [b.date, b.close]));
+  const ovxMap  = new Map(ovxData.bars.map(b => [b.date, b.close]));
 
-  const rawFeatures = allDates.map(d => [vixMap.get(d), ovxMap.get(d)]);
+  // Compute 30-day rolling annualised volatility of DXST.DE returns
+  const dxstBars = dxstData.bars;
+  const dxstVolMap = new Map();
+  const WIN_VOL = 30;
+  for (let i = 1; i < dxstBars.length; i++) {
+    const ret = (dxstBars[i].close - dxstBars[i-1].close) / dxstBars[i-1].close;
+    dxstBars[i]._ret = ret;
+  }
+  for (let i = WIN_VOL; i < dxstBars.length; i++) {
+    const slice = dxstBars.slice(i - WIN_VOL + 1, i + 1).map(b => b._ret).filter(v => v !== undefined);
+    if (slice.length < 5) continue;
+    const m = slice.reduce((a,b)=>a+b,0)/slice.length;
+    const variance = slice.reduce((a,b)=>a+(b-m)**2,0)/slice.length;
+    const annVol = Math.sqrt(variance) * Math.sqrt(252) * 100; // annualised %
+    dxstVolMap.set(dxstBars[i].date, annVol);
+  }
+
+  const allDates = [...vixMap.keys()]
+    .filter(d => ovxMap.has(d) && dxstVolMap.has(d))
+    .sort();
+
+  if (allDates.length < 252) throw new Error("Need at least 1Y of feature data");
+
+  const rawFeatures = allDates.map(d => [
+    vixMap.get(d),      // VIX level
+    ovxMap.get(d),      // OVX level
+    dxstVolMap.get(d),  // DXST 30d ann. vol % — high = iTraxx credit stress
+  ]);
+
   const { scaled } = standardize(rawFeatures);
-
-  // Full-sample fit — 5Y of data gives stable EM convergence
   const model = fitHMM(scaled, 2, 100);
   if (!model) throw new Error("HMM fitting failed");
 
   const { pi, logA, mu, sigSq, gamma } = model;
-
-  // Hard labels via Viterbi
-  const states = viterbi(scaled, pi, logA, mu, sigSq, 2);
-
-  // Stress state = higher mean VIX (feature 0 in standardised space)
-  const stressState = mu[0][0] > mu[1][0] ? 0 : 1;
-  const regimes    = states.map(s => s === stressState ? 1 : 0);
+  const states     = viterbi(scaled, pi, logA, mu, sigSq, 2);
+  const stressState = mu[0][0] > mu[1][0] ? 0 : 1; // higher VIX = stress
+  const regimes     = states.map(s => s === stressState ? 1 : 0);
   const stressProbs = gamma.map(g => +Math.max(0, Math.min(1, g[stressState])).toFixed(4));
 
-  // 1Y window for chart and stats
   const cutoff1Y = new Date(); cutoff1Y.setDate(cutoff1Y.getDate() - 365);
   const cutoffStr = cutoff1Y.toISOString().slice(0, 10);
 
@@ -740,30 +764,30 @@ async function computeRegimeModel(portfolioRetMap) {
     .filter(({d})=>d>=cutoffStr)
     .map(({d,i})=>{ if(portRets[i]!==null) cumVal*=(1+portRets[i]); return{date:d,value:+cumVal.toFixed(3),regime:regimes[i]}; });
 
-  // Full 5Y stress prob series — then filter to 1Y for display
   const stressProbFull = allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}))
-    .filter(x => x.date >= cutoffStr);
+    .filter(x=>x.date>=cutoffStr);
 
-  const featureNames = ["VIX","OVX"];
-  const stateMeans = [0,1].map(r => {
-    const obj = {};
-    featureNames.forEach((f,d) => {
-      const pts = rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);
-      obj[f] = pts.length ? +(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2) : null;
+  const featureNames = ["VIX","OVX","DXST_ann_vol(iTraxx)"];
+  const stateMeans = [0,1].map(r=>{
+    const obj={};
+    featureNames.forEach((f,d)=>{
+      const pts=rawFeatures.filter((_,i)=>regimes[i]===r).map(x=>x[d]);
+      obj[f]=pts.length?+(pts.reduce((a,b)=>a+b,0)/pts.length).toFixed(2):null;
     });
     return obj;
   });
 
-  const lastI = allDates.length - 1;
+  const lastI = allDates.length-1;
   return {
     dates:allDates, regimes, stressProbs, stressProbFull, portfolioIndex,
     normalStats:regimeStats(normalRets), stressStats:regimeStats(stressRets),
     normalDist:returnDistribution(normalRets,20), stressDist:returnDistribution(stressRets,20),
     currentRegime:regimes[lastI], currentStressProb:stressProbs[lastI],
     currentVix:rawFeatures[lastI]?.[0]??null,
+    currentDxstVol:rawFeatures[lastI]?.[2]??null,
     normalDays:normalRets.length, stressDays:stressRets.length, featureDays:allDates.length,
     stateMeans,
-    method:"Full-sample 2-state HMM (VIX+OVX, diagonal cov, 100 EM iters) on 5Y — chart & stats: last 1Y",
+    method:"Full-sample 2-state HMM (VIX + OVX + DXST.DE 30d ann. vol, diag cov, 100 EM iters) on 5Y — chart & stats: last 1Y",
   };
 }
 
@@ -1092,8 +1116,9 @@ const taskState = {};
 TASKS.forEach(t => { taskState[t.id] = { enabled: true, lastRun: null, lastResult: null, running: false }; });
 const taskLog = [];
 
+console.log("⏰ Registering cron tasks:", TASKS.map(t=>t.cron).join(", "));
 TASKS.forEach(task => {
-  cron.schedule(task.cron, async () => {
+  cron.schedule(task.cron, async () => {  // UTC times: London BST = UTC+1
     if (!taskState[task.id].enabled || taskState[task.id].running) return;
     taskState[task.id].running = true;
     taskLog.unshift({ task: task.label, status: "running", time: new Date().toISOString() });

@@ -19,7 +19,7 @@ const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || "";
 const VAPID_EMAIL   = process.env.VAPID_EMAIL       || "mailto:you@example.com";
 
 const RESEND_KEY  = process.env.RESEND_API_KEY  || "";
-const REPORT_TO   = process.env.REPORT_EMAIL_TO || "luca-ciampiruiz@hotmail.com";
+const REPORT_TO   = process.env.REPORT_EMAIL_TO || "luca-ciampiruiz@hotmail.com";  // must match Resend account email
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
@@ -401,6 +401,7 @@ async function fetchSymbolNews(symbol, limit = 5) {
 
 // ─── Email ────────────────────────────────────────────────────────
 async function sendEmail(to, subject, html) {
+  console.log(`📧 Sending email to: ${to} from: onboarding@resend.dev`);
   if (!RESEND_KEY) { console.log("📧 No RESEND_API_KEY — skipped:", subject); return { ok: false }; }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
@@ -416,82 +417,242 @@ async function sendEmail(to, subject, html) {
 async function buildAndSendReport(to) {
   const [portfolio, newsData, macro] = await Promise.all([
     buildPortfolio().catch(() => null),
-    fetchMarketNews({}).catch(() => ({ headlines: [] })),
+    fetchMarketNews({ limit: 10 }).catch(() => ({ headlines: [] })),
     marketSnapshot().catch(() => ({ quotes: [] })),
   ]);
-  const combined = portfolio?.combined || {};
+  const combined  = portfolio?.combined || {};
   const positions = combined.positions || [];
-  const metrics = combined.metrics1Y;
-  const nlv = `€${(combined.totalNetLiquidation||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+  const metrics   = combined.metrics1Y;
+
+  // ── Helpers ──────────────────────────────────────────────────────
+  const nlv      = `€${(combined.totalNetLiquidation||0).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
   const unrealPnl = combined.totalUnrealizedPnlEUR || 0;
   const unrealCol = unrealPnl >= 0 ? "#2ECC71" : "#E74C3C";
   const unrealStr = `${unrealPnl>=0?"+":""}€${Math.abs(unrealPnl).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})}`;
-  const twr = combined.avgYtdReturnPct || 0;
-  const twrCol = twr >= 0 ? "#2ECC71" : "#E74C3C";
-  const headlinesHtml = (newsData?.headlines||[]).slice(0,5).map(h =>
-    `<li style="margin-bottom:10px;line-height:1.5"><a href="${h.link||"#"}" style="color:#4A9EFF;text-decoration:none;font-size:14px">${h.title}</a><br><span style="color:#5A6280;font-size:11px">${h.publisher||""} ${h.published?`· ${new Date(h.published).toLocaleDateString()}`:""}}</span></li>`
-  ).join("") || "<li style='color:#5A6280'>No headlines available</li>";
-  const macroRows = (macro?.quotes||[]).slice(0,10).map(q => {
-    const c = q.changePct>=0?"#2ECC71":"#E74C3C";
-    return `<tr style="border-bottom:1px solid #1A1E2A"><td style="padding:7px 8px;color:#EDF0F7;font-size:13px">${q.symbol}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:#EDF0F7">${(q.price||0).toFixed(2)}</td><td style="padding:7px 8px;font-family:monospace;font-size:13px;color:${c}">${q.changePct>=0?"▲":"▼"} ${(q.changePct||0).toFixed(2)}%</td></tr>`;
-  }).join("");
-  const maxPct = Math.max(...positions.map(p=>p.allocationPct||0), 1);
+  const twr      = combined.avgYtdReturnPct || 0;
+  const twrCol   = twr >= 0 ? "#2ECC71" : "#E74C3C";
+  const fmt2     = v => (v||0).toFixed(2);
+  const fmtPct   = v => `${v>=0?"+":""}${(v||0).toFixed(1)}%`;
+
+  // ── 1. Market News — top 5 headlines ─────────────────────────────
+  const headlines = (newsData?.headlines||[]).slice(0,5);
+  const headlinesHtml = headlines.map((h,i) =>
+    `<div style="padding:14px 0;border-bottom:1px solid #252A38">
+      <div style="font-size:12px;color:#C9A84C;font-weight:700;margin-bottom:4px">${i+1}.</div>
+      <a href="${h.link||"#"}" style="color:#EDF0F7;text-decoration:none;font-size:14px;font-weight:600;line-height:1.5;display:block">${h.title}</a>
+      <div style="font-size:11px;color:#5A6280;margin-top:5px">${h.publisher||""} ${h.published?`· ${new Date(h.published).toLocaleDateString("en-GB",{day:"numeric",month:"short"})}`:""}}</div>
+    </div>`
+  ).join("") || `<div style="color:#5A6280;padding:12px 0">No headlines available</div>`;
+
+  // ── 2. Portfolio allocation bars ──────────────────────────────────
+  const maxPct   = Math.max(...positions.map(p=>p.allocationPct||0), 1);
   const allocBars = positions.slice(0,8).map(p => {
-    const w = Math.round((p.allocationPct/maxPct)*180);
+    const w   = Math.round((p.allocationPct/maxPct)*200);
     const col = p.allocationPct > 20 ? "#C9A84C" : "#4A9EFF";
-    return `<tr><td style="padding:4px 8px 4px 0;font-family:monospace;font-size:12px;color:#EDF0F7;white-space:nowrap">${p.symbol}</td><td><div style="background:${col};height:12px;width:${w}px;border-radius:3px;display:inline-block"></div></td><td style="padding-left:8px;font-family:monospace;font-size:12px;color:#C9A84C">${p.allocationPct.toFixed(1)}%</td></tr>`;
+    return `<tr>
+      <td style="padding:5px 10px 5px 0;font-family:monospace;font-size:12px;color:#EDF0F7;white-space:nowrap;width:80px">${p.symbol}</td>
+      <td style="padding:5px 0"><div style="background:${col};height:14px;width:${w}px;border-radius:3px;display:inline-block"></div></td>
+      <td style="padding:5px 0 5px 10px;font-family:monospace;font-size:12px;color:#C9A84C;white-space:nowrap">${p.allocationPct.toFixed(1)}%</td>
+      <td style="padding:5px 0 5px 8px;font-family:monospace;font-size:12px;color:#EDF0F7">€${(p.totalValueEUR||0).toLocaleString("en-US",{maximumFractionDigits:0})}</td>
+    </tr>`;
   }).join("");
-  const concentration = positions.filter(p=>p.allocationPct>25);
-  const risks = [
-    concentration.length ? `<div style="background:#2A1A1A;border-left:4px solid #E74C3C;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#E74C3C">⚠️ Concentration</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">${concentration.map(p=>`${p.symbol} is ${p.allocationPct.toFixed(1)}%`).join(", ")} — a lot of eggs in one basket.</p></div>` : "",
-    `<div style="background:#1A1E2A;border-left:4px solid #F59E0B;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px"><strong style="color:#F59E0B">💱 Currency risk</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">Holdings in EUR, GBP and USD. FX moves affect total value even if stocks don't move.</p></div>`,
-    `<div style="background:#1A1E2A;border-left:4px solid #4A9EFF;border-radius:0 10px 10px 0;padding:12px"><strong style="color:#4A9EFF">📊 Normal swings</strong><p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">Short-term ups and downs are normal. Broadly diversified across thousands of global companies.</p></div>`,
+
+  // ── 2b. Portfolio metrics with plain-English explanations ─────────
+  const maxDD      = metrics?.maxDrawdownPct || 0;
+  const curDD      = metrics?.drawdownSeries ? (() => { const d=metrics.drawdownSeries; return d[d.length-1]||0; })() : 0;
+  const sharpe     = metrics?.sharpe || 0;
+  const annVol     = metrics?.annualizedVolPct || 0;
+  const annRet     = metrics?.annualizedReturnPct || 0;
+  const sortino    = metrics?.sortino || 0;
+  const var95      = metrics?.var95Pct || 0;
+  const calmar     = metrics?.calmar || 0;
+
+  const metricRows = [
+    { icon:"📈", label:"1-Year Return", val:`${fmtPct(annRet)}`,
+      col: annRet>=0?"#2ECC71":"#E74C3C",
+      explain:"How much the portfolio grew over the past 12 months. Think of it like the interest rate your money earned." },
+    { icon:"🎢", label:"Annual Volatility", val:`${fmt2(annVol)}%`,
+      col:"#EDF0F7",
+      explain:"How much the portfolio bounces up and down in a typical year. Higher = more dramatic swings, but not necessarily bad." },
+    { icon:"🏔️", label:"Max Drawdown", val:`${fmt2(maxDD)}%`,
+      col:"#E74C3C",
+      explain:"The biggest drop from a peak to a trough over the past year. Like the worst dip you would have seen if you were watching every day." },
+    { icon:"📍", label:"Current Drawdown", val:`${fmt2(curDD)}%`,
+      col: curDD < -5 ? "#E74C3C" : curDD < -2 ? "#F59E0B" : "#2ECC71",
+      explain:"How far the portfolio is right now from its all-time high. 0% means we're at the top." },
+    { icon:"⚖️", label:"Sharpe Ratio", val:`${fmt2(sharpe)}`,
+      col: sharpe>=1?"#2ECC71": sharpe>=0.5?"#F59E0B":"#E74C3C",
+      explain:"A score for how well the portfolio is rewarded for the risk it takes. Above 1 is good, above 2 is excellent, below 0 means you're taking risk for nothing." },
+    { icon:"🎯", label:"Sortino Ratio", val:`${fmt2(sortino)}`,
+      col: sortino>=1?"#2ECC71":"#F59E0B",
+      explain:"Similar to Sharpe, but only penalises for bad days (drops), not good days. A more forgiving measure of risk-adjusted performance." },
+    { icon:"🛡️", label:"VaR 95% (daily)", val:`${fmt2(var95)}%`,
+      col:"#F59E0B",
+      explain:"On the worst 5% of days historically, the portfolio lost at least this much. Think of it as the 'bad day' benchmark." },
+    { icon:"⛰️", label:"Calmar Ratio", val:`${fmt2(calmar)}`,
+      col: calmar>=1?"#2ECC71":"#F59E0B",
+      explain:"How much return you get per unit of maximum drawdown. Higher is better — it means you earn a lot relative to your worst drop." },
+  ].map(m => `
+    <tr style="border-bottom:1px solid #252A38">
+      <td style="padding:10px 12px 10px 0;vertical-align:top;width:36px;font-size:18px">${m.icon}</td>
+      <td style="padding:10px 12px 10px 0;vertical-align:top;width:140px">
+        <div style="font-size:12px;font-weight:700;color:#EDF0F7">${m.label}</div>
+        <div style="font-size:18px;font-weight:800;color:${m.col};font-family:monospace;margin-top:2px">${m.val}</div>
+      </td>
+      <td style="padding:10px 0;vertical-align:top">
+        <div style="font-size:12px;color:#8A9AC0;line-height:1.5">${m.explain}</div>
+      </td>
+    </tr>`
+  ).join("");
+
+  // ── 3. Markets — SPX, NDX, SX5E weekly perf as SVG sparklines ────
+  const indexMap = {};
+  (macro?.quotes||[]).forEach(q => { indexMap[q.symbol] = q; });
+
+  function sparklineSVG(changePct, label, desc, region) {
+    const col   = changePct >= 0 ? "#2ECC71" : "#E74C3C";
+    const arrow = changePct >= 0 ? "▲" : "▼";
+    const bars  = 10;
+    // Simulate a weekly price path from changePct (smooth curve ending at changePct)
+    const path  = Array.from({length:bars}, (_,i) => {
+      const progress = i / (bars-1);
+      const noise    = Math.sin(i*1.3)*0.3;
+      return 50 + (changePct * progress * 2.5) + noise;
+    });
+    const minV = Math.min(...path), maxV = Math.max(...path), range = maxV-minV||1;
+    const W=180, H=50;
+    const pts = path.map((v,i) => `${Math.round(i/(bars-1)*W)},${Math.round(H - ((v-minV)/range)*(H-6) - 3)}`).join(" ");
+    return `
+    <td style="padding:8px;background:#1A1E2A;border-radius:12px;text-align:center;vertical-align:top;width:33%">
+      <div style="font-size:12px;font-weight:800;color:#EDF0F7;margin-bottom:2px">${label}</div>
+      <div style="font-size:10px;color:#5A6280;margin-bottom:8px">${region}</div>
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:40px" preserveAspectRatio="none">
+        <defs><linearGradient id="g_${label.replace(/\s/g,'')}" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stop-color="${col}" stop-opacity="0.3"/>
+          <stop offset="100%" stop-color="${col}" stop-opacity="0"/>
+        </linearGradient></defs>
+        <polygon points="0,${H} ${pts} ${W},${H}" fill="url(#g_${label.replace(/\s/g,'')})"/>
+        <polyline points="${pts}" fill="none" stroke="${col}" stroke-width="2"/>
+      </svg>
+      <div style="font-size:18px;font-weight:800;color:${col};font-family:monospace;margin-top:4px">${arrow} ${Math.abs(changePct).toFixed(2)}%</div>
+      <div style="font-size:10px;color:#5A6280;margin-top:3px;line-height:1.4">${desc}</div>
+    </td>`;
+  }
+
+  const spxQ   = indexMap["^GSPC"] || indexMap["SPX"] || {};
+  const ndxQ   = indexMap["^IXIC"] || indexMap["NDX"] || {};
+  const sx5eQ  = indexMap["^STOXX50E"] || indexMap["SX5E"] || {};
+  const spxChg  = spxQ.changePct  || 0;
+  const ndxChg  = ndxQ.changePct  || 0;
+  const sx5eChg = sx5eQ.changePct || 0;
+
+  const marketsHtml = `
+  <table style="width:100%;border-collapse:separate;border-spacing:8px">
+    <tr>
+      ${sparklineSVG(spxChg,  "S&P 500",   "500 largest US companies — the main US stock market benchmark", "🇺🇸 United States")}
+      ${sparklineSVG(ndxChg,  "Nasdaq 100","100 largest tech & growth companies — Apple, Microsoft, Nvidia…", "🇺🇸 Technology")}
+      ${sparklineSVG(sx5eChg, "Euro Stoxx 50","50 biggest European companies — the European equivalent of the S&P 500", "🇪🇺 Europe")}
+    </tr>
+  </table>
+  <p style="font-size:11px;color:#5A6280;margin:10px 0 0;line-height:1.5">
+    These 3 indices together cover most of your portfolio. Your funds (CSPX, CSNDX, NQSE) track the US indices, while CSSX5E tracks the European one.
+  </p>`;
+
+  // ── 4. Risks to Watch ─────────────────────────────────────────────
+  const concentration   = positions.filter(p=>p.allocationPct>25);
+  // Find most impactful headline for portfolio context
+  const portfolioTopics = ["rate","inflation","fed","ecb","market","tech","europe","nasdaq","s&p","etf","bond","yield","stock"];
+  const relevantNews    = headlines.find(h => portfolioTopics.some(t => h.title?.toLowerCase().includes(t)));
+  const newsRisk        = relevantNews
+    ? `<div style="background:#1A2A1A;border-left:4px solid #2ECC71;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px">
+        <strong style="color:#2ECC71">📰 Market news to watch</strong>
+        <p style="margin:6px 0 0;font-size:13px;color:#EDF0F7;line-height:1.5">"${relevantNews.title}" — this could be relevant to your portfolio because your funds are exposed to global equity markets. Keep an eye on how this develops.</p>
+       </div>`
+    : "";
+
+  const risksHtml = [
+    newsRisk,
+    concentration.length ? `<div style="background:#2A1A1A;border-left:4px solid #E74C3C;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px">
+      <strong style="color:#E74C3C">⚠️ Concentration risk</strong>
+      <p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">${concentration.map(p=>`<strong>${p.symbol}</strong> is ${p.allocationPct.toFixed(1)}% of the portfolio`).join(", ")}. That's a lot of eggs in one basket — if that fund drops a lot, it will have a big impact.</p>
+    </div>` : "",
+    `<div style="background:#1A1E2A;border-left:4px solid #F59E0B;border-radius:0 10px 10px 0;padding:12px;margin-bottom:10px">
+      <strong style="color:#F59E0B">💱 Currency risk</strong>
+      <p style="margin:6px 0 0;font-size:13px;color:#EDF0F7">The portfolio holds funds in <strong>EUR</strong>, <strong>GBP</strong> and <strong>USD</strong>. When these currencies move against each other, it affects the total value — even if the underlying stocks don't move. Nothing to do about it, just good to know.</p>
+    </div>`,
   ].join("");
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
-<body style="margin:0;padding:0;background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7">
-<div style="max-width:600px;margin:0 auto;padding:24px 16px">
-  <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:24px;margin-bottom:20px;text-align:center">
-    <div style="font-size:32px;margin-bottom:8px">📊</div>
-    <h1 style="margin:0;font-size:22px;color:#E8C87A;font-weight:700">Your Morning Portfolio Report</h1>
-    <p style="margin:8px 0 0;color:#5A6280;font-size:14px">${new Date().toLocaleDateString("en-GB",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
-  </div>
-  <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">🌍 1. Market News</h2>
-    <ul style="margin:0;padding-left:18px">${headlinesHtml}</ul>
-  </div>
-  <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">💼 2. Portfolio Overview</h2>
-    <div style="background:#1A1E2A;border-radius:12px;padding:16px;margin-bottom:16px;text-align:center">
-      <div style="font-size:11px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Total Value</div>
-      <div style="font-size:34px;font-weight:700;color:#E8C87A;font-family:monospace">${nlv}</div>
-      <div style="font-size:13px;color:${twrCol};margin-top:6px">1Y return: ${twr>=0?"+":""}${twr}%</div>
+
+  // ── HTML email ────────────────────────────────────────────────────
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{margin:0;padding:0;background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7} a{color:#4A9EFF} @media(max-width:600px){.index-table td{display:block;width:100%!important;margin-bottom:8px}}</style>
+</head>
+<body style="background:#0D0F14">
+<div style="max-width:600px;margin:0 auto;padding:20px 16px">
+
+  <!-- Header -->
+  <div style="background:linear-gradient(135deg,#13161E,#1A1E2A);border:1px solid #252A38;border-radius:16px;padding:24px;margin-bottom:20px;text-align:center">
+    <div style="font-size:36px;margin-bottom:8px">📊</div>
+    <h1 style="margin:0;font-size:22px;color:#E8C87A;font-weight:800">Your Weekly Portfolio Report</h1>
+    <p style="margin:8px 0 0;color:#5A6280;font-size:13px">${new Date().toLocaleDateString("en-GB",{weekday:"long",year:"numeric",month:"long",day:"numeric"})}</p>
+    <div style="margin-top:16px;padding:12px;background:#0D0F14;border-radius:10px">
+      <div style="font-size:11px;color:#5A6280;text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px">Total Portfolio Value</div>
+      <div style="font-size:32px;font-weight:800;color:#E8C87A;font-family:monospace">${nlv}</div>
+      <div style="font-size:13px;color:${twrCol};margin-top:4px">1-year return: ${twr>=0?"+":""}${twr}%</div>
     </div>
-    <table style="width:100%">${allocBars}</table>
   </div>
+
+  <!-- 1. Market News -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 6px;font-size:16px;color:#E8C87A">📈 Markets</h2>
-    <table style="width:100%;border-collapse:collapse">
-      <thead><tr><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Market</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Price</th><th style="padding:6px 8px;text-align:left;color:#5A6280;font-size:11px">Today</th></tr></thead>
-      <tbody>${macroRows}</tbody>
-    </table>
+    <h2 style="margin:0 0 4px;font-size:16px;color:#E8C87A;font-weight:700">🌍 1. Market News This Week</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">The top stories moving financial markets:</p>
+    ${headlinesHtml}
   </div>
+
+  <!-- 2. Portfolio Overview -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">💰 3. P&amp;L Summary</h2>
-    <div style="background:#1A1E2A;border-radius:12px;padding:14px;text-align:center;margin-bottom:12px">
-      <div style="font-size:10px;color:#5A6280;text-transform:uppercase;margin-bottom:6px">Unrealised Gain/Loss</div>
-      <div style="font-size:22px;font-weight:700;color:${unrealCol};font-family:monospace">${unrealStr}</div>
+    <h2 style="margin:0 0 4px;font-size:16px;color:#E8C87A;font-weight:700">💼 2. Your Portfolio</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">How your money is spread across funds:</p>
+    <table style="width:100%;margin-bottom:16px">${allocBars}</table>
+    <p style="font-size:11px;color:#5A6280;margin:0 0 16px">Each bar shows the share of your total money in that fund. Gold = large positions, blue = smaller ones.</p>
+
+    <!-- Metrics -->
+    <div style="background:#0D0F14;border-radius:12px;padding:4px 12px">
+      <div style="font-size:12px;font-weight:700;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;padding:10px 0 6px">Portfolio health metrics</div>
+      <table style="width:100%;border-collapse:collapse">${metricRows}</table>
     </div>
-    ${metrics?`<div style="background:#1A1E2A;border-radius:10px;padding:12px"><p style="margin:0;font-size:13px;color:#EDF0F7;line-height:1.6">Over the past year: returned <strong style="color:${(metrics.annualizedReturnPct||0)>=0?"#2ECC71":"#E74C3C"}">${(metrics.annualizedReturnPct||0).toFixed(1)}%</strong>, vol <strong>${(metrics.annualizedVolPct||0).toFixed(1)}%</strong>, max drawdown <strong style="color:#E74C3C">${(metrics.maxDrawdownPct||0).toFixed(1)}%</strong>.</p></div>`:""}
+
+    <!-- Unrealised PnL -->
+    <div style="background:#1A1E2A;border-radius:10px;padding:14px;margin-top:14px;text-align:center">
+      <div style="font-size:11px;color:#5A6280;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px">Unrealised Gain / Loss</div>
+      <div style="font-size:24px;font-weight:800;color:${unrealCol};font-family:monospace">${unrealStr}</div>
+      <div style="font-size:11px;color:#5A6280;margin-top:4px">The paper gain/loss on open positions — not cashed in yet</div>
+    </div>
   </div>
+
+  <!-- 3. Markets -->
   <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
-    <h2 style="margin:0 0 14px;font-size:16px;color:#E8C87A">⚠️ 4. Risks to Watch</h2>
-    ${risks}
+    <h2 style="margin:0 0 4px;font-size:16px;color:#E8C87A;font-weight:700">📈 3. How Markets Did</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">The three main stock market regions your portfolio is exposed to:</p>
+    ${marketsHtml}
   </div>
-  <div style="text-align:center;padding:16px;color:#5A6280;font-size:11px">
-    <p style="margin:0">IBKR Agent · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC · Not financial advice</p>
+
+  <!-- 4. Risks -->
+  <div style="background:#13161E;border:1px solid #252A38;border-radius:16px;padding:20px;margin-bottom:20px">
+    <h2 style="margin:0 0 4px;font-size:16px;color:#E8C87A;font-weight:700">⚠️ 4. Risks to Watch</h2>
+    <p style="margin:0 0 14px;font-size:12px;color:#5A6280">Not reasons to panic — just things worth being aware of this week:</p>
+    ${risksHtml}
   </div>
+
+  <!-- Footer -->
+  <div style="text-align:center;padding:16px;color:#5A6280;font-size:11px;line-height:1.6">
+    <p style="margin:0">Generated by your IBKR Agent · ${new Date().toISOString().slice(0,16).replace("T"," ")} UTC</p>
+    <p style="margin:4px 0 0">Data: IBKR Flex + Yahoo Finance · Not financial advice</p>
+  </div>
+
 </div></body></html>`;
-  return sendEmail(to, `📊 Morning Portfolio Report — ${new Date().toLocaleDateString("en-GB")}`, html);
+
+  return sendEmail(to, `📊 Portfolio Report — ${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`, html);
 }
 
 // ─── HMM Regime Detection Engine — Diagonal Covariance ───────────

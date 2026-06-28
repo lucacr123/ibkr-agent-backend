@@ -559,7 +559,7 @@ async function buildAndSendReport(to) {
         });
     const minV = Math.min(...path), maxV = Math.max(...path), range = maxV-minV||1;
     const W=180, H=50;
-    const pts = path.map((v,i) => `${Math.round(i/(bars-1)*W)},${Math.round(H - ((v-minV)/range)*(H-6) - 3)}`).join(" ");
+    const pts = path.map((v,i) => `${Math.round(i/Math.max(path.length-1,1)*W)},${Math.round(H - ((v-minV)/range)*(H-6) - 3)}`).join(" ");
     return `
     <td style="padding:8px;background:#1A1E2A;border-radius:12px;text-align:center;vertical-align:top;width:33%">
       <div style="font-size:12px;font-weight:800;color:#EDF0F7;margin-bottom:2px">${label}</div>

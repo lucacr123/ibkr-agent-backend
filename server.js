@@ -889,17 +889,18 @@ function standardize(series) {
   return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
 }
 async function computeRegimeModel(portfolioRetMap) {
-  // Features: VIX + OVX + DXST.DE annualised 30d vol
-  // DXST.DE = Xtrackers iTraxx Crossover Short UCITS ETF (LU0321462870)
-  // Short ETF: price rises when iTraxx spreads widen → vol of this ETF = credit vol signal
-  const [vixData, ovxData, dxstData] = await Promise.all([
+  // Features: VIX + MOVE + DXST.DE annualised 30d vol
+  // VIX  = equity vol (fear gauge)
+  // MOVE = bond market vol (ICE BofA MOVE index) — rates stress
+  // DXST = iTraxx Crossover Short ETF 30d ann. vol — credit stress
+  const [vixData, moveData, dxstData] = await Promise.all([
     fetchYahooCloses("^VIX",   "5y"),
-    fetchYahooCloses("^OVX",   "5y"),
+    fetchYahooCloses("^MOVE",  "5y"),
     fetchYahooCloses("DXST.DE","5y"),
   ]);
 
   const vixMap  = new Map(vixData.bars.map(b => [b.date, b.close]));
-  const ovxMap  = new Map(ovxData.bars.map(b => [b.date, b.close]));
+  const moveMap = new Map(moveData.bars.map(b => [b.date, b.close]));
 
   // Compute 30-day rolling annualised volatility of DXST.DE returns
   const dxstBars = dxstData.bars;
@@ -914,20 +915,20 @@ async function computeRegimeModel(portfolioRetMap) {
     if (slice.length < 5) continue;
     const m = slice.reduce((a,b)=>a+b,0)/slice.length;
     const variance = slice.reduce((a,b)=>a+(b-m)**2,0)/slice.length;
-    const annVol = Math.sqrt(variance) * Math.sqrt(252) * 100; // annualised %
+    const annVol = Math.sqrt(variance) * Math.sqrt(252) * 100;
     dxstVolMap.set(dxstBars[i].date, annVol);
   }
 
   const allDates = [...vixMap.keys()]
-    .filter(d => ovxMap.has(d) && dxstVolMap.has(d))
+    .filter(d => moveMap.has(d) && dxstVolMap.has(d))
     .sort();
 
   if (allDates.length < 252) throw new Error("Need at least 1Y of feature data");
 
   const rawFeatures = allDates.map(d => [
-    vixMap.get(d),      // VIX level
-    ovxMap.get(d),      // OVX level
-    dxstVolMap.get(d),  // DXST 30d ann. vol % — high = iTraxx credit stress
+    vixMap.get(d),      // VIX — equity vol
+    moveMap.get(d),     // MOVE — bond market vol
+    dxstVolMap.get(d),  // DXST 30d ann. vol — iTraxx credit vol
   ]);
 
   const { scaled } = standardize(rawFeatures);
@@ -967,7 +968,7 @@ async function computeRegimeModel(portfolioRetMap) {
   const stressProbFull = allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}))
     .filter(x=>x.date>=cutoffStr);
 
-  const featureNames = ["VIX","OVX","DXST_ann_vol(iTraxx)"];
+  const featureNames = ["VIX","MOVE","DXST_ann_vol(iTraxx)"];
   const stateMeans = [0,1].map(r=>{
     const obj={};
     featureNames.forEach((f,d)=>{
@@ -984,10 +985,11 @@ async function computeRegimeModel(portfolioRetMap) {
     normalDist:returnDistribution(normalRets,20), stressDist:returnDistribution(stressRets,20),
     currentRegime:regimes[lastI], currentStressProb:stressProbs[lastI],
     currentVix:rawFeatures[lastI]?.[0]??null,
+    currentMove:rawFeatures[lastI]?.[1]??null,
     currentDxstVol:rawFeatures[lastI]?.[2]??null,
     normalDays:normalRets.length, stressDays:stressRets.length, featureDays:allDates.length,
     stateMeans,
-    method:"Full-sample 2-state HMM (VIX + OVX + DXST.DE 30d ann. vol, diag cov, 100 EM iters) on 5Y — chart & stats: last 1Y",
+    method:"Full-sample 2-state HMM (VIX + MOVE + DXST.DE 30d ann. vol, diag cov, 100 EM iters) on 5Y — chart & stats: last 1Y",
   };
 }
 

@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import fetch from "node-fetch";
 import webpush from "web-push";
 import { XMLParser } from "fast-xml-parser";
+import fs from "fs";
 
 const app = express();
 app.use(cors());
@@ -89,7 +90,10 @@ async function buildPortfolio(force = false) {
     const info      = stmt?.AccountInformation || {};
     const fxRates   = getFxRates(stmt);
     const equityRows = toArr(stmt?.EquitySummaryInBase?.EquitySummaryByReportDateInBase);
-    const equity    = equityRows[equityRows.length - 1] || {};
+    // Explicitly pick the row with the MAX reportDate (don't trust array order)
+    const equity = equityRows.length
+      ? equityRows.reduce((latest, r) => (!latest || (r.reportDate||"") > (latest.reportDate||"")) ? r : latest, null)
+      : {};
     const positions = toArr(stmt?.OpenPositions?.OpenPosition).filter(p => p.levelOfDetail === "SUMMARY" || !p.levelOfDetail);
     const mtmBySymbol = {};
     toArr(stmt?.MTMPerformanceSummaryInBase?.MTMPerformanceSummaryUnderlying).filter(p => p.symbol).forEach(p => { mtmBySymbol[p.symbol] = p; });
@@ -268,6 +272,185 @@ function correlationMatrixFromReturns(items) {
   return out;
 }
 
+
+// ─── PCA via Jacobi eigenvalue algorithm ──────────────────────────
+// Symmetric matrix eigendecomposition — no external libs needed
+function jacobiEigen(matrix, maxIter = 100, tol = 1e-9) {
+  const n = matrix.length;
+  let A = matrix.map(r => [...r]);
+  let V = Array.from({length:n}, (_,i) => Array.from({length:n}, (_,j) => i===j?1:0));
+
+  for (let iter = 0; iter < maxIter; iter++) {
+    // Find largest off-diagonal element
+    let p = 0, q = 1, maxOff = 0;
+    for (let i = 0; i < n; i++)
+      for (let j = i+1; j < n; j++)
+        if (Math.abs(A[i][j]) > maxOff) { maxOff = Math.abs(A[i][j]); p = i; q = j; }
+
+    if (maxOff < tol) break;
+
+    const app = A[p][p], aqq = A[q][q], apq = A[p][q];
+    const theta = (aqq - app) / (2 * apq);
+    const t = Math.sign(theta || 1) / (Math.abs(theta) + Math.sqrt(theta*theta + 1));
+    const c = 1 / Math.sqrt(t*t + 1);
+    const s = t * c;
+
+    // Rotate A
+    const newApp = app - t*apq, newAqq = aqq + t*apq;
+    A[p][p] = newApp; A[q][q] = newAqq; A[p][q] = 0; A[q][p] = 0;
+    for (let i = 0; i < n; i++) {
+      if (i !== p && i !== q) {
+        const aip = A[i][p], aiq = A[i][q];
+        A[i][p] = c*aip - s*aiq; A[p][i] = A[i][p];
+        A[i][q] = s*aip + c*aiq; A[q][i] = A[i][q];
+      }
+    }
+    // Rotate V (eigenvectors)
+    for (let i = 0; i < n; i++) {
+      const vip = V[i][p], viq = V[i][q];
+      V[i][p] = c*vip - s*viq;
+      V[i][q] = s*vip + c*viq;
+    }
+  }
+
+  const eigenvalues = A.map((row,i) => row[i]);
+  // Sort descending by eigenvalue
+  const idx = eigenvalues.map((v,i) => i).sort((a,b) => eigenvalues[b] - eigenvalues[a]);
+  return {
+    eigenvalues: idx.map(i => eigenvalues[i]),
+    eigenvectors: idx.map(i => V.map(row => row[i])), // each row = one PC's loadings across assets
+  };
+}
+
+function computePCA(items, weights) {
+  const n = items.length;
+  if (n < 2) return null;
+
+  // Correlation matrix (standardised PCA — recommended when assets have different vol)
+  const corrMat = Array.from({length:n}, (_,i) => Array.from({length:n}, (_,j) => corrFn(items[i].returns, items[j].returns) || 0));
+
+  const { eigenvalues, eigenvectors } = jacobiEigen(corrMat);
+  const totalVar = eigenvalues.reduce((a,b) => a+b, 0);
+
+  // Cumulative variance explained
+  let cumVar = 0;
+  const components = [];
+  for (let k = 0; k < eigenvalues.length; k++) {
+    const varExplained = eigenvalues[k] / totalVar;
+    cumVar += varExplained;
+    components.push({
+      pc: k+1,
+      eigenvalue: +eigenvalues[k].toFixed(4),
+      varExplainedPct: +(varExplained*100).toFixed(2),
+      cumVarExplainedPct: +(cumVar*100).toFixed(2),
+      loadings: items.map((it,i) => ({ symbol: it.symbol, loading: +eigenvectors[k][i].toFixed(4) })),
+    });
+    if (cumVar >= 0.80) break; // stop once we hit 80% explained variance
+  }
+
+  return {
+    nAssets: n,
+    nComponents: components.length,
+    totalVarianceExplainedPct: +(cumVar*100).toFixed(2),
+    components,
+  };
+}
+
+// ─── Fama-French 3-factor regression (ETF proxies) ────────────────
+// Mkt-RF: ^GSPC (market)
+// SMB (Size): IWM (small cap) minus SPY (large cap)
+// HML (Value): IVE (value) minus IVW (growth)
+async function computeFamaFrenchRegression(portfolioReturns, dates) {
+  try {
+    const [spyData, iwmData, iveData, ivwData] = await Promise.all([
+      fetchYahooReturnSeries("SPY", "1y"),
+      fetchYahooReturnSeries("IWM", "1y"),
+      fetchYahooReturnSeries("IVE", "1y"),
+      fetchYahooReturnSeries("IVW", "1y"),
+    ]);
+    const spyMap = new Map(spyData.map(r => [r.date, r.ret]));
+    const iwmMap = new Map(iwmData.map(r => [r.date, r.ret]));
+    const iveMap = new Map(iveData.map(r => [r.date, r.ret]));
+    const ivwMap = new Map(ivwData.map(r => [r.date, r.ret]));
+
+    // Align all factors + portfolio returns on common dates
+    const rows = [];
+    dates.forEach((d, i) => {
+      const mkt = spyMap.get(d), iwm = iwmMap.get(d), ive = iveMap.get(d), ivw = ivwMap.get(d);
+      if (Number.isFinite(mkt) && Number.isFinite(iwm) && Number.isFinite(ive) && Number.isFinite(ivw) && Number.isFinite(portfolioReturns[i])) {
+        rows.push({
+          y: portfolioReturns[i],
+          mkt,
+          smb: iwm - mkt,   // size factor: small minus large
+          hml: ive - ivw,   // value factor: value minus growth
+        });
+      }
+    });
+
+    if (rows.length < 60) return null; // need reasonable sample size
+
+    // Multiple linear regression: y = alpha + b1*mkt + b2*smb + b3*hml + error
+    // Solve via normal equations: (X'X)^-1 X'y
+    const X = rows.map(r => [1, r.mkt, r.smb, r.hml]); // design matrix with intercept
+    const y = rows.map(r => r.y);
+    const k = 4; // params: alpha, beta_mkt, beta_smb, beta_hml
+
+    // X'X
+    const XtX = Array.from({length:k}, (_,i) => Array.from({length:k}, (_,j) =>
+      X.reduce((s,row) => s + row[i]*row[j], 0)
+    ));
+    // X'y
+    const Xty = Array.from({length:k}, (_,i) => X.reduce((s,row,t) => s + row[i]*y[t], 0));
+
+    // Solve XtX * beta = Xty via Gaussian elimination
+    const beta = solveLinearSystem(XtX, Xty);
+    if (!beta) return null;
+
+    const [alpha, betaMkt, betaSmb, betaHml] = beta;
+
+    // R-squared
+    const yMean = mean(y);
+    const yPred = X.map(row => row[0]*alpha + row[1]*betaMkt + row[2]*betaSmb + row[3]*betaHml);
+    const ssRes = y.reduce((s,v,i) => s + (v-yPred[i])**2, 0);
+    const ssTot = y.reduce((s,v) => s + (v-yMean)**2, 0);
+    const r2 = ssTot > 0 ? 1 - ssRes/ssTot : 0;
+
+    return {
+      n: rows.length,
+      alpha: +(alpha*252*100).toFixed(3),       // annualised alpha %
+      alphaDailyPct: +(alpha*100).toFixed(4),
+      betaMarket: +betaMkt.toFixed(3),
+      betaSize:   +betaSmb.toFixed(3),   // positive = tilted small-cap, negative = large-cap
+      betaValue:  +betaHml.toFixed(3),   // positive = tilted value, negative = growth
+      rSquared:   +r2.toFixed(3),
+      method: "OLS regression: portfolio daily returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IVE-IVW), 1Y daily data",
+    };
+  } catch (e) {
+    console.error("Fama-French error:", e.message);
+    return null;
+  }
+}
+
+function solveLinearSystem(A, b) {
+  const n = A.length;
+  const M = A.map((row,i) => [...row, b[i]]);
+  for (let col = 0; col < n; col++) {
+    let pivot = col;
+    for (let row = col+1; row < n; row++) if (Math.abs(M[row][col]) > Math.abs(M[pivot][col])) pivot = row;
+    if (Math.abs(M[pivot][col]) < 1e-10) return null; // singular
+    [M[col], M[pivot]] = [M[pivot], M[col]];
+    const div = M[col][col];
+    for (let j = col; j <= n; j++) M[col][j] /= div;
+    for (let row = 0; row < n; row++) {
+      if (row === col) continue;
+      const factor = M[row][col];
+      for (let j = col; j <= n; j++) M[row][j] -= factor * M[col][j];
+    }
+  }
+  return M.map(row => row[n]);
+}
+
+
 async function computePortfolioMetrics(positions, totalNLV) {
   try {
     const rawItems = [];
@@ -324,6 +507,12 @@ async function computePortfolioMetrics(positions, totalNLV) {
     const downsideVol = downside.length ? Math.sqrt(downside.reduce((s, v) => s + v * v, 0) / downside.length) * Math.sqrt(252) : 0;
     const var95 = histVaR(pr, 0.95), var99 = histVaR(pr, 0.99), cvar95 = histCVaR(pr, 0.95), cvar99 = histCVaR(pr, 0.99);
 
+    // PCA on correlation matrix of holdings' 1Y daily returns
+    const pca = computePCA(items, weights);
+
+    // Fama-French 3-factor regression on weighted portfolio returns
+    const famaFrench = await computeFamaFrenchRegression(pr, dates);
+
     return {
       period: "1y",
       days: pr.length,
@@ -351,7 +540,9 @@ async function computePortfolioMetrics(positions, totalNLV) {
       weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
-      method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix; Sharpe = annualized return / covariance-based annualized volatility"
+      method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix; Sharpe = annualized return / covariance-based annualized volatility",
+      pca,
+      famaFrench,
     };
   } catch { return null; }
 }
@@ -1275,7 +1466,25 @@ async function runAgent(prompt, history = []) {
 }
 
 // ─── Push ─────────────────────────────────────────────────────────
+// Persist push subscriptions to disk so they survive Railway restarts
+const PUSH_SUBS_FILE = "/tmp/push-subs.json";
 const pushSubs = new Map();
+function loadPushSubs() {
+  try {
+    if (fs.existsSync(PUSH_SUBS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PUSH_SUBS_FILE, "utf8"));
+      Object.entries(data).forEach(([id, sub]) => pushSubs.set(id, sub));
+      console.log(`📱 Loaded ${pushSubs.size} push subscriptions from disk`);
+    }
+  } catch (e) { console.error("Failed to load push subs:", e.message); }
+}
+function savePushSubs() {
+  try {
+    const obj = Object.fromEntries(pushSubs);
+    fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(obj));
+  } catch (e) { console.error("Failed to save push subs:", e.message); }
+}
+loadPushSubs();
 async function sendPush(title, body, icon = "📈") {
   console.log(`🔔 sendPush "${title}" subs=${pushSubs.size} vapid=${!!(VAPID_PUBLIC&&VAPID_PRIVATE)}`);
   if (!VAPID_PUBLIC || !VAPID_PRIVATE || !pushSubs.size) return;
@@ -1285,7 +1494,7 @@ async function sendPush(title, body, icon = "📈") {
     try { await webpush.sendNotification(sub, payload); }
     catch (e) { if (e.statusCode === 410 || e.statusCode === 404) expired.push(id); }
   }
-  expired.forEach(id => pushSubs.delete(id));
+  if (expired.length) { expired.forEach(id => pushSubs.delete(id)); savePushSubs(); }
 }
 
 // ─── Scheduled tasks ──────────────────────────────────────────────
@@ -1428,8 +1637,8 @@ app.get("/api/analytics/:symbol", (req, res) => {
 
 // Push
 app.get("/api/push/vapid-key",    (req, res) => res.json({ publicKey: VAPID_PUBLIC }));
-app.post("/api/push/subscribe",   (req, res) => { const sub = req.body; if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" }); const id=Buffer.from(sub.endpoint).toString("base64").slice(0,32); pushSubs.set(id,sub); console.log(`📱 Push registered total=${pushSubs.size}`); res.json({ ok: true }); });
-app.post("/api/push/unsubscribe", (req, res) => { pushSubs.delete(Buffer.from(req.body.endpoint || "").toString("base64").slice(0, 32)); res.json({ ok: true }); });
+app.post("/api/push/subscribe",   (req, res) => { const sub = req.body; if (!sub?.endpoint) return res.status(400).json({ error: "Invalid" }); const id=Buffer.from(sub.endpoint).toString("base64").slice(0,32); pushSubs.set(id,sub); savePushSubs(); console.log(`📱 Push registered total=${pushSubs.size}`); res.json({ ok: true }); });
+app.post("/api/push/unsubscribe", (req, res) => { pushSubs.delete(Buffer.from(req.body.endpoint || "").toString("base64").slice(0, 32)); savePushSubs(); res.json({ ok: true }); });
 app.post("/api/push/test",        async (req, res) => { await sendPush("✅ Test", "Push notifications working!", "✅"); res.json({ ok: true }); });
 
 app.get("/api/ibkr/status", async (req, res) => {

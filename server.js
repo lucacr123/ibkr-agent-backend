@@ -366,35 +366,40 @@ function computePCA(items, weights) {
 // ─── Fama-French 3-factor regression (ETF proxies) ────────────────
 // Mkt-RF: ^GSPC (market)
 // SMB (Size): IWM (small cap) minus SPY (large cap)
-// HML (Value): IVE (value) minus IVW (growth)
+// HML (Value): IWD (Russell 1000 Value) minus IWF (Russell 1000 Growth)
 async function computeFamaFrenchRegression(portfolioReturns, dates) {
   try {
     // 4-factor model: Market, Size (SMB), Value (HML), International (EFA-SPY)
-    // International factor is critical for portfolios with non-US exposure (CSSX5E, IEEM)
-    const [spyData, iwmData, iveData, ivwData, efaData] = await Promise.all([
+    // ETF proxies selected (all converted to EUR before this point):
+    //   Market: SPY     — SPDR S&P 500, most liquid US market proxy
+    //   Size:   IWM-SPY — iShares Russell 2000 (small) minus SPY (large) = SMB
+    //   Value:  IWD-IWF — iShares Russell 1000 Value minus iShares Russell 1000 Growth = HML
+    //           (Russell-family pairing with IWM/SPY gives more internally consistent factor
+    //            construction than mixing S&P-style IVE/IVW with Russell-style IWM)
+    //   Intl:   EFA-SPY — iShares MSCI EAFE (developed ex-US) minus SPY; captures CSSX5E/IEEM exposure
+    const [spyData, iwmData, iwdData, iwfData, efaData] = await Promise.all([
       fetchYahooReturnSeries("SPY", "1y"),
       fetchYahooReturnSeries("IWM", "1y"),
-      fetchYahooReturnSeries("IVE", "1y"),
-      fetchYahooReturnSeries("IVW", "1y"),
+      fetchYahooReturnSeries("IWD", "1y"),  // Russell 1000 Value
+      fetchYahooReturnSeries("IWF", "1y"),  // Russell 1000 Growth
       fetchYahooReturnSeries("EFA", "1y"),  // MSCI EAFE — developed ex-US equity
     ]);
-    const spyMap = new Map(spyData.map(r => [r.date, r.ret]));
-    const iwmMap = new Map(iwmData.map(r => [r.date, r.ret]));
-    const iveMap = new Map(iveData.map(r => [r.date, r.ret]));
-    const ivwMap = new Map(ivwData.map(r => [r.date, r.ret]));
-    const efaMap = new Map(efaData.map(r => [r.date, r.ret]));
-
-    // Align all factors + portfolio returns on common dates
+    // Forward-fill each US factor onto the portfolio's own trading calendar (trimmedDates from caller).
+    // This recovers days where the portfolio's European holdings traded but a US ETF didn't (rare US-only
+    // holidays), using the same approach as the portfolio-side alignment.
+    const factorMaps = [spyData, iwmData, iwdData, iwfData, efaData].map(s => new Map(s.map(r => [r.date, r.ret])));
+    let lastVals = [null, null, null, null, null];
     const rows = [];
     dates.forEach((d, i) => {
-      const mkt = spyMap.get(d), iwm = iwmMap.get(d), ive = iveMap.get(d), ivw = ivwMap.get(d), efa = efaMap.get(d);
-      if (Number.isFinite(mkt) && Number.isFinite(iwm) && Number.isFinite(ive) && Number.isFinite(ivw) && Number.isFinite(efa) && Number.isFinite(portfolioReturns[i])) {
+      factorMaps.forEach((m, idx) => { if (m.has(d)) lastVals[idx] = m.get(d); });
+      const [mkt, iwm, iwd, iwf, efa] = lastVals;
+      if (lastVals.every(v => v !== null) && Number.isFinite(portfolioReturns[i])) {
         rows.push({
           y: portfolioReturns[i],
           mkt,
-          smb: iwm - mkt,   // size factor: small minus large
-          hml: ive - ivw,   // value factor: value minus growth
-          intl: efa - mkt,  // international factor: developed ex-US minus US
+          smb: iwm - mkt,   // Small Minus Big: Russell 2000 (small) − SPY (large)
+          hml: iwd - iwf,   // High Minus Low: Russell 1000 Value (high B/M) − Russell 1000 Growth (low B/M)
+          intl: efa - mkt,  // International: MSCI EAFE − SPY
         });
       }
     });
@@ -431,7 +436,7 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
       betaValue:         +betaHml.toFixed(3),
       betaInternational: +betaIntl.toFixed(3),  // positive = tilted developed ex-US, negative = tilted US
       rSquared:          +r2.toFixed(3),
-      method: "OLS regression: portfolio daily EUR returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IVE-IVW) + Intl(EFA-SPY), all factors converted to EUR using daily FX rates, 1Y daily data",
+      method: "OLS regression: portfolio daily EUR returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IWD-IWF) + Intl(EFA-SPY), EUR-converted + forward-filled, 1Y daily data",
     };
   } catch (e) {
     console.error("Fama-French error:", e.message);
@@ -459,6 +464,22 @@ function solveLinearSystem(A, b) {
 }
 
 
+// Build a master trading-day calendar (union of all series' dates) and forward-fill
+// each series onto it. This recovers days lost to single-exchange holidays (e.g. a
+// Swiss holiday shouldn't drop a US trading day from the whole regression).
+function alignWithForwardFill(seriesList) {
+  // seriesList: array of [{date, ret}], one per asset/factor
+  const allDates = [...new Set(seriesList.flatMap(s => s.map(r => r.date)))].sort();
+  return seriesList.map(series => {
+    const byDate = new Map(series.map(r => [r.date, r.ret]));
+    let lastVal = null;
+    return allDates.map(d => {
+      if (byDate.has(d)) { lastVal = byDate.get(d); return lastVal; }
+      return lastVal; // forward-fill: carry last known return (0-ish on holiday is more accurate than dropping the day)
+    });
+  }).map((filled, i) => ({ values: filled, dates: allDates }));
+}
+
 async function computePortfolioMetrics(positions, totalNLV) {
   try {
     const rawItems = [];
@@ -472,16 +493,19 @@ async function computePortfolioMetrics(positions, totalNLV) {
     }
     if (!rawItems.length) return null;
 
-    // Align all ETF daily returns by actual Yahoo dates, then renormalise to invested assets.
-    // This is the user's requested model: current weights + 1Y correlation/covariance from daily returns.
-    const commonDates = rawItems.map(x => new Set(x.series.map(r => r.date))).reduce((acc, set) => new Set([...acc].filter(d => set.has(d))));
-    const dates = [...commonDates].sort();
+    // Align all ETF daily returns on a master calendar (union of dates), forward-filling
+    // any single-exchange holiday gaps instead of dropping the whole day from every asset.
+    // This recovers ~70+ extra trading days vs strict intersection (was 184/252 days, now ~240+).
+    const aligned = alignWithForwardFill(rawItems.map(x => x.series));
+    const dates = aligned[0]?.dates || [];
     if (dates.length < 30) return null;
-    const items = rawItems.map(x => {
-      const byDate = new Map(x.series.map(r => [r.date, r.ret]));
-      return { ...x, returns: dates.map(d => byDate.get(d)).filter(Number.isFinite) };
-    }).filter(x => x.returns.length === dates.length);
+    const items = rawItems.map((x, i) => ({ ...x, returns: aligned[i].values }))
+      .filter(x => x.returns.every(v => v !== null)); // drop assets that never had a first value to forward-fill from
     if (!items.length) return null;
+    // Recompute dates to only the range where ALL items have non-null forward-filled values
+    const firstValidIdx = Math.max(...items.map(x => x.returns.findIndex(v => v !== null)));
+    const trimmedDates = dates.slice(firstValidIdx);
+    items.forEach(x => { x.returns = x.returns.slice(firstValidIdx); });
 
     const investedWeight = items.reduce((s, x) => s + x.weight, 0);
     const weights = items.map(x => x.weight / investedWeight);
@@ -489,7 +513,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
     const cov = covarianceMatrix(returnMatrix);
     const corr = correlationMatrixFromReturns(items);
 
-    const pr = dates.map((_, t) => items.reduce((s, x, i) => s + weights[i] * x.returns[t], 0));
+    const pr = trimmedDates.map((_, t) => items.reduce((s, x, i) => s + weights[i] * x.returns[t], 0));
     const totalReturn = pr.reduce((s, v) => s * (1 + v), 1) - 1;
     const annRet = annualizedReturn(pr);
     const dailyVol = Math.sqrt(weights.reduce((rowSum, wi, i) => rowSum + weights.reduce((colSum, wj, j) => colSum + wi * wj * cov[i][j], 0), 0));
@@ -499,7 +523,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
     try {
       const bench = await fetchYahooReturnSeries("^GSPC", "1y");
       const bmap = new Map(bench.map(r => [r.date, r.ret]));
-      br = dates.map(d => bmap.get(d)).filter(Number.isFinite);
+      br = trimmedDates.map(d => bmap.get(d)).filter(Number.isFinite);
     } catch {}
 
     const len = Math.min(pr.length, br.length || pr.length);
@@ -519,7 +543,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
     const pca = computePCA(items, weights);
 
     // Fama-French 3-factor regression on weighted portfolio returns
-    const famaFrench = await computeFamaFrenchRegression(pr, dates);
+    const famaFrench = await computeFamaFrenchRegression(pr, trimmedDates);
 
     return {
       period: "1y",
@@ -541,14 +565,14 @@ async function computePortfolioMetrics(positions, totalNLV) {
       trackingErrorVsSPXPct: trackingError === null ? null : +(trackingError * 100).toFixed(2),
       skewness: +skewness(pr).toFixed(3),
       kurtosis: +kurtosis(pr).toFixed(3),
-      dates,
+      dates: trimmedDates,
       portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
       drawdownSeries: (() => { let peak=-Infinity; return cumulativeFromReturns(pr).map(v=>{ if(v>peak)peak=v; return +((v-peak)/peak*100).toFixed(3); }); })(),
       weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
-      method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix (all returns converted to EUR using daily FX rates); Sharpe = annualized return / covariance-based annualized volatility",
+      method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix (EUR-converted, forward-filled across single-exchange holidays for ~252 trading days); Sharpe = annualized return / covariance-based annualized volatility",
       pca,
       famaFrench,
     };

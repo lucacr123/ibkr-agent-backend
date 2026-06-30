@@ -362,68 +362,69 @@ function computePCA(items, weights) {
 // HML (Value): IVE (value) minus IVW (growth)
 async function computeFamaFrenchRegression(portfolioReturns, dates) {
   try {
-    const [spyData, iwmData, iveData, ivwData] = await Promise.all([
+    // 4-factor model: Market, Size (SMB), Value (HML), International (EFA-SPY)
+    // International factor is critical for portfolios with non-US exposure (CSSX5E, IEEM)
+    const [spyData, iwmData, iveData, ivwData, efaData] = await Promise.all([
       fetchYahooReturnSeries("SPY", "1y"),
       fetchYahooReturnSeries("IWM", "1y"),
       fetchYahooReturnSeries("IVE", "1y"),
       fetchYahooReturnSeries("IVW", "1y"),
+      fetchYahooReturnSeries("EFA", "1y"),  // MSCI EAFE — developed ex-US equity
     ]);
     const spyMap = new Map(spyData.map(r => [r.date, r.ret]));
     const iwmMap = new Map(iwmData.map(r => [r.date, r.ret]));
     const iveMap = new Map(iveData.map(r => [r.date, r.ret]));
     const ivwMap = new Map(ivwData.map(r => [r.date, r.ret]));
+    const efaMap = new Map(efaData.map(r => [r.date, r.ret]));
 
     // Align all factors + portfolio returns on common dates
     const rows = [];
     dates.forEach((d, i) => {
-      const mkt = spyMap.get(d), iwm = iwmMap.get(d), ive = iveMap.get(d), ivw = ivwMap.get(d);
-      if (Number.isFinite(mkt) && Number.isFinite(iwm) && Number.isFinite(ive) && Number.isFinite(ivw) && Number.isFinite(portfolioReturns[i])) {
+      const mkt = spyMap.get(d), iwm = iwmMap.get(d), ive = iveMap.get(d), ivw = ivwMap.get(d), efa = efaMap.get(d);
+      if (Number.isFinite(mkt) && Number.isFinite(iwm) && Number.isFinite(ive) && Number.isFinite(ivw) && Number.isFinite(efa) && Number.isFinite(portfolioReturns[i])) {
         rows.push({
           y: portfolioReturns[i],
           mkt,
           smb: iwm - mkt,   // size factor: small minus large
           hml: ive - ivw,   // value factor: value minus growth
+          intl: efa - mkt,  // international factor: developed ex-US minus US
         });
       }
     });
 
-    if (rows.length < 60) return null; // need reasonable sample size
+    if (rows.length < 60) return null;
 
-    // Multiple linear regression: y = alpha + b1*mkt + b2*smb + b3*hml + error
-    // Solve via normal equations: (X'X)^-1 X'y
-    const X = rows.map(r => [1, r.mkt, r.smb, r.hml]); // design matrix with intercept
+    // y = alpha + b1*mkt + b2*smb + b3*hml + b4*intl + error
+    const X = rows.map(r => [1, r.mkt, r.smb, r.hml, r.intl]);
     const y = rows.map(r => r.y);
-    const k = 4; // params: alpha, beta_mkt, beta_smb, beta_hml
+    const k = 5; // params: alpha, beta_mkt, beta_smb, beta_hml, beta_intl
 
-    // X'X
     const XtX = Array.from({length:k}, (_,i) => Array.from({length:k}, (_,j) =>
       X.reduce((s,row) => s + row[i]*row[j], 0)
     ));
-    // X'y
     const Xty = Array.from({length:k}, (_,i) => X.reduce((s,row,t) => s + row[i]*y[t], 0));
 
-    // Solve XtX * beta = Xty via Gaussian elimination
     const beta = solveLinearSystem(XtX, Xty);
     if (!beta) return null;
 
-    const [alpha, betaMkt, betaSmb, betaHml] = beta;
+    const [alpha, betaMkt, betaSmb, betaHml, betaIntl] = beta;
 
-    // R-squared
     const yMean = mean(y);
-    const yPred = X.map(row => row[0]*alpha + row[1]*betaMkt + row[2]*betaSmb + row[3]*betaHml);
+    const yPred = X.map(row => row[0]*alpha + row[1]*betaMkt + row[2]*betaSmb + row[3]*betaHml + row[4]*betaIntl);
     const ssRes = y.reduce((s,v,i) => s + (v-yPred[i])**2, 0);
     const ssTot = y.reduce((s,v) => s + (v-yMean)**2, 0);
     const r2 = ssTot > 0 ? 1 - ssRes/ssTot : 0;
 
     return {
       n: rows.length,
-      alpha: +(alpha*252*100).toFixed(3),       // annualised alpha %
+      alpha: +(alpha*252*100).toFixed(3),
       alphaDailyPct: +(alpha*100).toFixed(4),
-      betaMarket: +betaMkt.toFixed(3),
-      betaSize:   +betaSmb.toFixed(3),   // positive = tilted small-cap, negative = large-cap
-      betaValue:  +betaHml.toFixed(3),   // positive = tilted value, negative = growth
-      rSquared:   +r2.toFixed(3),
-      method: "OLS regression: portfolio daily returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IVE-IVW), 1Y daily data",
+      betaMarket:        +betaMkt.toFixed(3),
+      betaSize:          +betaSmb.toFixed(3),
+      betaValue:         +betaHml.toFixed(3),
+      betaInternational: +betaIntl.toFixed(3),  // positive = tilted developed ex-US, negative = tilted US
+      rSquared:          +r2.toFixed(3),
+      method: "OLS regression: portfolio daily returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IVE-IVW) + Intl(EFA-SPY), 1Y daily data",
     };
   } catch (e) {
     console.error("Fama-French error:", e.message);

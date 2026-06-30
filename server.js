@@ -191,41 +191,7 @@ async function buildPortfolio(force = false) {
   const totalYtdGainEUR = +accounts.reduce((s, a) => s + (a.ytdGainEUR || 0), 0).toFixed(2);
   const portfolioMetrics = await computePortfolioMetrics(combinedPositions, totalNLV);
 
-  // ── Real broker-reported combined NLV drawdown ─────────────────
-  // This is the TRUE drawdown from your actual account history, NOT the Yahoo-reconstructed
-  // proxy in portfolioMetrics.drawdownSeries (which uses TODAY's weights applied backward and
-  // can drift from reality if your weights changed during the year).
-  const realDrawdown = (() => {
-    // Merge each account's NLV history by date, summing across accounts present on that date
-    const byDate = new Map();
-    accounts.forEach(a => {
-      (a.nlvHistoryEUR || []).forEach(({ date, nlvEUR }) => {
-        byDate.set(date, (byDate.get(date) || 0) + nlvEUR);
-      });
-    });
-    const sortedDates = [...byDate.keys()].sort();
-    if (sortedDates.length < 2) return null;
 
-    let peak = -Infinity, maxDD = 0, peakDate = null, troughDate = null;
-    const series = sortedDates.map(date => {
-      const nlv = byDate.get(date);
-      if (nlv > peak) { peak = nlv; peakDate = date; }
-      const dd = ((nlv - peak) / peak) * 100;
-      if (dd < maxDD) { maxDD = dd; troughDate = date; }
-      return { date, nlv: +nlv.toFixed(2), drawdownPct: +dd.toFixed(3) };
-    });
-
-    return {
-      series,
-      maxDrawdownPct: +maxDD.toFixed(2),
-      currentDrawdownPct: series[series.length - 1]?.drawdownPct ?? 0,
-      peakNLV: +peak.toFixed(2),
-      peakDate, troughDate,
-      currentNLV: series[series.length - 1]?.nlv,
-      daysOfHistory: series.length,
-      method: "Real broker-reported NLV from IBKR Flex EquitySummaryByReportDateInBase, EUR-converted, summed across both accounts daily — true drawdown vs Yahoo-reconstructed proxy.",
-    };
-  })();
 
   return {
     accounts,
@@ -244,7 +210,6 @@ async function buildPortfolio(force = false) {
       positionCount:         combinedPositions.length,
       positions:             combinedPositions,
       metrics1Y:             portfolioMetrics,
-      realDrawdown,  // true broker-reported drawdown — use this over metrics1Y.drawdownSeries for accuracy
     },
   };
 }
@@ -768,11 +733,8 @@ async function buildAndSendReport(to) {
   }).join("");
 
   // ── 2b. Portfolio metrics with plain-English explanations ─────────
-  // Prefer REAL broker-reported drawdown over the Yahoo-reconstructed proxy — it matches
-  // your actual account history and won't drift if your portfolio weights changed mid-year.
-  const realDD     = combined.realDrawdown;
-  const maxDD      = realDD ? realDD.maxDrawdownPct : (metrics?.maxDrawdownPct || 0);
-  const curDD      = realDD ? realDD.currentDrawdownPct : (metrics?.drawdownSeries ? (() => { const d=metrics.drawdownSeries; return d[d.length-1]||0; })() : 0);
+  const maxDD      = metrics?.maxDrawdownPct || 0;
+  const curDD      = metrics?.drawdownSeries ? (() => { const d=metrics.drawdownSeries; return d[d.length-1]||0; })() : 0;
   const sharpe     = metrics?.sharpe || 0;
   const annVol     = metrics?.annualizedVolPct || 0;
   const annRet     = metrics?.annualizedReturnPct || 0;

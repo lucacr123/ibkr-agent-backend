@@ -21,6 +21,13 @@ const VAPID_EMAIL   = process.env.VAPID_EMAIL       || "mailto:you@example.com";
 
 const RESEND_KEY  = process.env.RESEND_API_KEY  || "";
 const REPORT_TO   = process.env.REPORT_EMAIL_TO || "luca-ciampiruiz@hotmail.com";  // must match Resend account email
+
+// Risk-free rate (SOFR, annualised %) used in Sharpe, Sortino, and Fama-French alpha.
+// FRED now requires an API key for programmatic access, so this is set manually —
+// update periodically from https://www.newyorkfed.org/markets/reference-rates/sofr
+// Last updated: 2026-06-25, SOFR = 3.64%
+const RISK_FREE_RATE_PCT = +(process.env.RISK_FREE_RATE_PCT || 3.64); // annualised %
+const RISK_FREE_RATE_DAILY = RISK_FREE_RATE_PCT / 100 / 252; // daily decimal, simple division (252 trading days)
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
@@ -220,7 +227,7 @@ function mean(arr)       { return arr.length ? arr.reduce((s, v) => s + v, 0) / 
 function std(arr)        { if (!arr.length) return 0; const m = mean(arr); return Math.sqrt(arr.reduce((s, v) => s + (v - m) ** 2, 0) / arr.length); }
 function rollingFn(arr, w, fn) { if (arr.length < w) return new Array(arr.length).fill(null); const out = new Array(Math.max(w - 1, 0)).fill(null); for (let i = w - 1; i < arr.length; i++) out.push(fn(arr.slice(i - w + 1, i + 1))); return out; }
 function sharpe(r, period = 252) { const m = mean(r), s = std(r); return s === 0 ? 0 : (m / s) * Math.sqrt(period); }
-function sortino(r, period = 252) { const m = mean(r); const neg = r.filter(v => v < 0); const ds = neg.length ? Math.sqrt(neg.reduce((s, v) => s + v * v, 0) / neg.length) : 0; return ds === 0 ? 0 : (m / ds) * Math.sqrt(period); }
+function sortino(r, period = 252) { const m = mean(r) - RISK_FREE_RATE_DAILY; const neg = r.filter(v => v < 0); const ds = neg.length ? Math.sqrt(neg.reduce((s, v) => s + v * v, 0) / neg.length) : 0; return ds === 0 ? 0 : (m / ds) * Math.sqrt(period); }
 function maxDD(closes)   { let peak = -Infinity, dd = 0; for (const c of closes) { if (c > peak) peak = c; const d = (c - peak) / peak * 100; if (d < dd) dd = d; } return dd; }
 function quantile(arr, q) { const xs = arr.filter(Number.isFinite).sort((a,b)=>a-b); if (!xs.length) return null; const pos = (xs.length - 1) * q; const base = Math.floor(pos), rest = pos - base; return xs[base + 1] !== undefined ? xs[base] + rest * (xs[base + 1] - xs[base]) : xs[base]; }
 function histVaR(r, level = 0.95) { const q = quantile(r, 1 - level); return q === null ? null : -q; }
@@ -567,8 +574,9 @@ async function computePortfolioMetrics(positions, totalNLV) {
       annualizedReturnPct: +(annRet * 100).toFixed(2),
       averageDailyReturnPct: +(mean(pr) * 100).toFixed(4),
       annualizedVolPct: +(annVol * 100).toFixed(2),
-      sharpe: annVol === 0 ? null : +(annRet / annVol).toFixed(3),  // annRet/sqrt(w'Σw)sqrt(252)
-      sortino: downsideVol === 0 ? null : +(annRet / downsideVol).toFixed(3),
+      sharpe: annVol === 0 ? null : +((annRet - RISK_FREE_RATE_PCT/100) / annVol).toFixed(3),  // (annRet - Rf)/sqrt(w'Σw)sqrt(252)
+      sortino: downsideVol === 0 ? null : +((annRet - RISK_FREE_RATE_PCT/100) / downsideVol).toFixed(3),
+      riskFreeRatePct: RISK_FREE_RATE_PCT,  // SOFR, used in Sharpe/Sortino above
       maxDrawdownPct: +mdd.toFixed(2),
       var95Pct: var95 === null ? null : +(var95 * 100).toFixed(2),
       var99Pct: var99 === null ? null : +(var99 * 100).toFixed(2),
@@ -1462,7 +1470,7 @@ async function executeTool(name, input) {
         totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
         meanDailyReturn:     +(mean(r) * 100).toFixed(4),
-        sharpe:              std(r)===0 ? 0 : +((mean(r)/std(r))*Math.sqrt(252)).toFixed(3),
+        sharpe:              std(r)===0 ? 0 : +(((mean(r)-RISK_FREE_RATE_DAILY)/std(r))*Math.sqrt(252)).toFixed(3),
         sortino:             +sortino(r).toFixed(4),
         maxDrawdown:         +maxDD(closes).toFixed(2),
         var95:               (() => { const v = histVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),

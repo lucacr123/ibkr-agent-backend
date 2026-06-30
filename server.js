@@ -1753,6 +1753,47 @@ app.get("/api/ibkr/status", async (req, res) => {
   catch (e) { res.status(503).json({ authenticated: false, error: e.message }); }
 });
 
+// Debug endpoint: dump raw FX-conversion pipeline for one symbol so we can
+// verify by hand that currency detection, FX rate direction, and the daily
+// return conversion are all correct. Returns first/last 5 rows of each stage.
+app.get("/api/debug/fx/:symbol", async (req, res) => {
+  try {
+    const symbol = req.params.symbol;
+    const ySym = yfSymbol(symbol);
+    const { bars, meta } = await fetchYahooCloses(ySym, "1mo");
+    const currency = meta?.currency || "EUR";
+
+    // Raw local-currency returns (before any EUR conversion)
+    const localReturns = [];
+    for (let i = 1; i < bars.length; i++) {
+      const prev = bars[i-1]?.close, cur = bars[i]?.close;
+      if (prev && cur) localReturns.push({ date: bars[i].date, localClose: cur, localRet: (cur-prev)/prev });
+    }
+
+    // FX rate series used for conversion
+    let fxSample = null, fxMeta = null;
+    if (currency !== "EUR") {
+      const pair = FX_PAIR_FOR[currency];
+      const fxResult = await fetchYahooCloses(pair, "1mo");
+      fxMeta = { pair, currency: fxResult.meta?.currency, sampleRaw: fxResult.bars.slice(-5).map(b => ({ date: b.date, rawClose: b.close, eurPerUnit: +(1/b.close).toFixed(6) })) };
+    }
+
+    // Final EUR-converted returns (what the app actually uses)
+    const eurReturns = await fetchYahooReturnSeries(symbol, "1mo", true);
+
+    res.json({
+      symbol, yahooSymbol: ySym, detectedCurrency: currency,
+      localCloses_last5: bars.slice(-5),
+      localReturns_last5: localReturns.slice(-5),
+      fxConversion: fxMeta,
+      eurReturns_last5: eurReturns.slice(-5),
+      sanityCheck: currency === "EUR"
+        ? "No conversion needed (already EUR) — localReturns should equal eurReturns exactly"
+        : `Converted ${currency}->EUR. Compare localRet vs eurRet for same date: difference should equal the FX move that day (a few bps to ~1% on volatile days, NOT systematically one-sided).`,
+    });
+  } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+});
+
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
 
 const PORT = process.env.PORT || 3001;

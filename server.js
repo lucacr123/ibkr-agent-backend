@@ -1439,19 +1439,10 @@ async function executeTool(name, input) {
       const bench  = input.benchmark || "^GSPC";
       const win    = input.rolling_window || 30;
 
-      // Raw local-currency closes — used ONLY for the price chart display (@@CHART@@ tag)
-      // and "currentPrice" stat, where showing local currency is expected/normal.
       const { bars, meta } = await fetchYahooCloses(sym, range);
       const dates  = bars.map(b => b.date);
       const closes = bars.map(b => b.close);
-
-      // EUR-converted daily returns — used for ALL statistics (Z-score, Sharpe, vol, VaR,
-      // drawdown, beta, correlation) so chat-computed analytics match the Portfolio tab.
-      const eurSeries = await fetchYahooReturnSeries(sym, range, true);
-      const r = eurSeries.map(x => x.ret);
-      // Reconstruct a EUR-equivalent price index (base=100) so drawdown/maxDD use EUR returns
-      // instead of local-currency price levels.
-      const eurIndex = cumulativeFromReturns(r).map(v => v * 100);
+      const r      = rets(closes);
 
       // ── Rolling series ──────────────────────────────────────────
       // r = daily returns, length = closes.length - 1
@@ -1488,31 +1479,30 @@ async function executeTool(name, input) {
       const rollingVaR95 = [null, ...rollingVaR95Raw];
       const rollingVaR99 = [null, ...rollingVaR99Raw];
 
-      // Drawdown on EUR-equivalent index (not local-currency closes)
+      // Drawdown on closes
       const drawdownSeries = (() => {
         let peak = -Infinity;
-        return eurIndex.map(c => { if (c > peak) peak = c; return +((c - peak) / peak * 100).toFixed(4); });
+        return closes.map(c => { if (c > peak) peak = c; return +((c - peak) / peak * 100).toFixed(4); });
       })();
 
-      // Scalar beta/corr for summary only — benchmark also EUR-converted for consistency
+      // Scalar beta/corr for summary only
       let betaVal = null, corrVal = null;
       try {
-        const benchSeries = await fetchYahooReturnSeries(bench, range, true);
-        const br  = benchSeries.map(x => x.ret);
+        const { bars: bb } = await fetchYahooCloses(bench, range);
+        const br  = rets(bb.map(b => b.close));
         const len = Math.min(r.length, br.length);
         betaVal = betaFn(r.slice(-len), br.slice(-len));
         corrVal = corrFn(r.slice(-len), br.slice(-len));
       } catch {}
 
       const summary = {
-        currentPrice:        closes[closes.length - 1],  // local currency, for display only
-        currentPriceCurrency: meta?.currency || null,
-        totalReturn:         +((eurIndex[eurIndex.length - 1] / 100 - 1) * 100).toFixed(2), // EUR-based total return
+        currentPrice:        closes[closes.length - 1],
+        totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
         meanDailyReturn:     +(mean(r) * 100).toFixed(4),
         sharpe:              std(r)===0 ? 0 : +((mean(r)/std(r))*Math.sqrt(252)).toFixed(3),
         sortino:             +sortino(r).toFixed(4),
-        maxDrawdown:         +maxDD(eurIndex).toFixed(2),
+        maxDrawdown:         +maxDD(closes).toFixed(2),
         var95:               (() => { const v = histVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),
         var99:               (() => { const v = histVaR(r, 0.99); return v === null ? null : +(v * 100).toFixed(2); })(),
         cvar95:              (() => { const v = histCVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),
@@ -1523,19 +1513,16 @@ async function executeTool(name, input) {
         correlation:         corrVal !== null ? +corrVal.toFixed(4) : null,
         currentReturnZscore: zs252raw[zs252raw.length - 1] ?? zs30raw[zs30raw.length - 1] ?? null,
         currentReturnZscore30: zs30raw[zs30raw.length - 1] ?? null,
-        note: "All statistics (vol, Sharpe, VaR, drawdown, beta, correlation) computed on EUR-converted daily returns. currentPrice is shown in local currency for reference.",
       };
 
       const distribution = returnDistribution(r, input.bins || 20);
-      // closes: local-currency price levels (for chart display)
-      // returns/drawdownSeries/priceZscore etc: all EUR-converted statistics
-      const series = { dates, closes, eurIndex: eurIndex.map(v => +v.toFixed(3)), returns: [null, ...r.map(v => +(v * 100).toFixed(4))], priceZscore, priceZscore30, rollingVol, rollingVaR95, rollingVaR99, drawdownSeries, distribution };
+      const series = { dates, closes, returns: [null, ...r.map(v => +(v * 100).toFixed(4))], priceZscore, priceZscore30, rollingVol, rollingVaR95, rollingVaR99, drawdownSeries, distribution };
 
       // Cache for GET endpoint
       analyticsCache.set(`${sym}:${range}`, { ...series, summary, computedAt: Date.now() });
 
       return {
-        symbol: sym, benchmark: bench, range, currency: meta?.currency, statsCurrency: "EUR", summary, series,
+        symbol: sym, benchmark: bench, range, currency: meta?.currency, summary, series,
         chartTags: {
           price:         `@@CHART:${sym}:${range}@@`,
           zscore:        `@@QUANT:${sym}:priceZscore:${range}:Z-Score (${win}d rolling)@@`,
@@ -1554,14 +1541,13 @@ async function executeTool(name, input) {
       const symbols = input.symbols || [];
       const range   = input.range || "1y";
       const seriesMap = {};
-      // EUR-converted returns for every symbol — consistent with Portfolio tab correlation matrix
       for (const sym of symbols) {
-        try { const eurSeries = await fetchYahooReturnSeries(sym, range, true); seriesMap[sym] = eurSeries.map(x => x.ret); } catch {}
+        try { const { bars } = await fetchYahooCloses(sym, range); seriesMap[sym] = rets(bars.map(b => b.close)); } catch {}
       }
       const syms = Object.keys(seriesMap);
       const matrix = {};
       for (const a of syms) { matrix[a] = {}; for (const b of syms) { const len = Math.min(seriesMap[a].length, seriesMap[b].length); matrix[a][b] = a === b ? 1 : +(corrFn(seriesMap[a].slice(-len), seriesMap[b].slice(-len)) || 0).toFixed(3); } }
-      return { symbols: syms, matrix, range, currency: "EUR", method: "Correlation of daily EUR-converted returns" };
+      return { symbols: syms, matrix, range };
     }
 
     case "get_market_news":
@@ -1590,8 +1576,8 @@ const TOOLS = [
   { name: "get_historical_data", description: "OHLCV history for charting. range: 1mo,3mo,6mo,1y,2y,5y,ytd. interval: 1d,1wk,1mo.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string" }, interval: { type: "string" } }, required: ["symbol"] } },
   { name: "get_multiple_quotes", description: "Live quotes for multiple symbols at once.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } } }, required: ["symbols"] } },
   { name: "search_symbol",   description: "Search for a ticker by company name.", input_schema: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
-  { name: "compute_analytics", description: "Compute quant analytics: returns, return distribution, historical VaR 95/99, CVaR 95/99, skewness, kurtosis, rolling VaR, Z-score, rolling Sharpe, rolling vol, beta, correlation and drawdown. ALL statistics computed on EUR-converted daily returns (currentPrice shown in local currency for reference only). Returns series data + chart tags. Use for ANY quant, risk, distribution, VaR/CVaR, skew/kurtosis, or chart request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" }, bins: { type: "number", description: "Histogram bins for return distribution, default 20" } }, required: ["symbol"] } },
-  { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols, computed on EUR-converted daily returns (consistent with Portfolio tab).", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
+  { name: "compute_analytics", description: "Compute quant analytics: returns, return distribution, historical VaR 95/99, CVaR 95/99, skewness, kurtosis, rolling VaR, Z-score, rolling Sharpe, rolling vol, beta, correlation and drawdown. Returns series data + chart tags. Use for ANY quant, risk, distribution, VaR/CVaR, skew/kurtosis, or chart request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" }, bins: { type: "number", description: "Histogram bins for return distribution, default 20" } }, required: ["symbol"] } },
+  { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
   { name: "get_market_news", description: "Get current market news headlines from finance RSS feeds. Use for morning, midday, end-of-day briefs and any latest-news request.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, limit: { type: "number" } }, required: [] } },
   { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
 ];

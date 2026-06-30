@@ -384,16 +384,20 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
       fetchYahooReturnSeries("IWF", "1y"),  // Russell 1000 Growth
       fetchYahooReturnSeries("EFA", "1y"),  // MSCI EAFE — developed ex-US equity
     ]);
-    // Forward-fill each US factor onto the portfolio's own trading calendar (trimmedDates from caller).
-    // This recovers days where the portfolio's European holdings traded but a US ETF didn't (rare US-only
-    // holidays), using the same approach as the portfolio-side alignment.
+    // Fill each US factor onto the portfolio's own trading calendar (trimmedDates from caller).
+    // On a day a US exchange was closed, that factor's TRUE return is 0% (no trading = no price
+    // change), not a repeat of the previous day's move. Recovers days where European holdings
+    // traded but a US ETF didn't (rare US-only holidays).
     const factorMaps = [spyData, iwmData, iwdData, iwfData, efaData].map(s => new Map(s.map(r => [r.date, r.ret])));
-    let lastVals = [null, null, null, null, null];
+    let started = [false, false, false, false, false];
     const rows = [];
     dates.forEach((d, i) => {
-      factorMaps.forEach((m, idx) => { if (m.has(d)) lastVals[idx] = m.get(d); });
-      const [mkt, iwm, iwd, iwf, efa] = lastVals;
-      if (lastVals.every(v => v !== null) && Number.isFinite(portfolioReturns[i])) {
+      const vals = factorMaps.map((m, idx) => {
+        if (m.has(d)) { started[idx] = true; return m.get(d); }
+        return started[idx] ? 0 : null; // 0% on holiday gap, null only before first trading day
+      });
+      const [mkt, iwm, iwd, iwf, efa] = vals;
+      if (vals.every(v => v !== null) && Number.isFinite(portfolioReturns[i])) {
         rows.push({
           y: portfolioReturns[i],
           mkt,
@@ -468,14 +472,18 @@ function solveLinearSystem(A, b) {
 // each series onto it. This recovers days lost to single-exchange holidays (e.g. a
 // Swiss holiday shouldn't drop a US trading day from the whole regression).
 function alignWithForwardFill(seriesList) {
-  // seriesList: array of [{date, ret}], one per asset/factor
+  // seriesList: array of [{date, ret}], one per asset/factor.
+  // On a day this asset's exchange was closed (holiday), its TRUE return is 0%
+  // (price didn't change because it didn't trade) — NOT a repeat of the prior
+  // day's % move. We only need to know "has this asset started trading yet"
+  // to decide whether to emit 0 or null (pre-IPO / no data yet).
   const allDates = [...new Set(seriesList.flatMap(s => s.map(r => r.date)))].sort();
   return seriesList.map(series => {
     const byDate = new Map(series.map(r => [r.date, r.ret]));
-    let lastVal = null;
+    let hasStarted = false;
     return allDates.map(d => {
-      if (byDate.has(d)) { lastVal = byDate.get(d); return lastVal; }
-      return lastVal; // forward-fill: carry last known return (0-ish on holiday is more accurate than dropping the day)
+      if (byDate.has(d)) { hasStarted = true; return byDate.get(d); }
+      return hasStarted ? 0 : null; // 0% on holiday gaps; null only before first trading day
     });
   }).map((filled, i) => ({ values: filled, dates: allDates }));
 }

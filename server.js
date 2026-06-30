@@ -1759,8 +1759,9 @@ app.get("/api/ibkr/status", async (req, res) => {
 app.get("/api/debug/fx/:symbol", async (req, res) => {
   try {
     const symbol = req.params.symbol;
+    const range = req.query.range || "1y";
     const ySym = yfSymbol(symbol);
-    const { bars, meta } = await fetchYahooCloses(ySym, "1mo");
+    const { bars, meta } = await fetchYahooCloses(ySym, range);
     const currency = meta?.currency || "EUR";
 
     // Raw local-currency returns (before any EUR conversion)
@@ -1770,26 +1771,59 @@ app.get("/api/debug/fx/:symbol", async (req, res) => {
       if (prev && cur) localReturns.push({ date: bars[i].date, localClose: cur, localRet: (cur-prev)/prev });
     }
 
-    // FX rate series used for conversion
-    let fxSample = null, fxMeta = null;
+    let fxMeta = null, coverage = null;
     if (currency !== "EUR") {
       const pair = FX_PAIR_FOR[currency];
-      const fxResult = await fetchYahooCloses(pair, "1mo");
-      fxMeta = { pair, currency: fxResult.meta?.currency, sampleRaw: fxResult.bars.slice(-5).map(b => ({ date: b.date, rawClose: b.close, eurPerUnit: +(1/b.close).toFixed(6) })) };
+      const fxResult = await fetchYahooCloses(pair, range);
+      const fxDateSet = new Set(fxResult.bars.map(b => b.date));
+
+      // Coverage: what % of the asset's trading dates have a SAME-DAY FX bar?
+      const assetDates = localReturns.map(r => r.date);
+      const sameDayHits = assetDates.filter(d => fxDateSet.has(d)).length;
+      const missingDates = assetDates.filter(d => !fxDateSet.has(d));
+
+      fxMeta = {
+        pair, fxBarCount: fxResult.bars.length, assetBarCount: assetDates.length,
+        sameDayCoveragePct: +((sameDayHits / assetDates.length) * 100).toFixed(1),
+        missingDatesCount: missingDates.length,
+        missingDatesSample: missingDates.slice(0, 10), // first 10 gaps, to spot patterns (e.g. always weekends)
+        sampleRaw: fxResult.bars.slice(-5).map(b => ({ date: b.date, rawClose: b.close, eurPerUnit: +(1/b.close).toFixed(6) })),
+      };
     }
 
     // Final EUR-converted returns (what the app actually uses)
-    const eurReturns = await fetchYahooReturnSeries(symbol, "1mo", true);
+    const eurReturns = await fetchYahooReturnSeries(symbol, range, true);
+
+    // Bias check: sum of (eurRet - localRet) across the WHOLE period.
+    // If forward-fill / conversion is unbiased, this should be small and roughly
+    // centered around the asset's actual currency drift vs EUR over the period —
+    // NOT a large one-directional number disconnected from real FX moves.
+    const localMap = new Map(localReturns.map(r => [r.date, r.localRet]));
+    let sumDiff = 0, nDiff = 0, sumLocal = 0, sumEur = 0;
+    eurReturns.forEach(r => {
+      const lr = localMap.get(r.date);
+      if (Number.isFinite(lr)) { sumDiff += (r.ret - lr); nDiff++; sumLocal += lr; sumEur += r.ret; }
+    });
+    const cumLocal = localReturns.reduce((acc,r) => acc*(1+r.localRet), 1) - 1;
+    const cumEur   = eurReturns.reduce((acc,r) => acc*(1+r.ret), 1) - 1;
 
     res.json({
-      symbol, yahooSymbol: ySym, detectedCurrency: currency,
+      symbol, yahooSymbol: ySym, detectedCurrency: currency, range,
       localCloses_last5: bars.slice(-5),
       localReturns_last5: localReturns.slice(-5),
       fxConversion: fxMeta,
       eurReturns_last5: eurReturns.slice(-5),
+      biasCheck: currency === "EUR" ? null : {
+        nDaysCompared: nDiff,
+        cumulativeLocalReturnPct: +(cumLocal*100).toFixed(2),
+        cumulativeEURReturnPct: +(cumEur*100).toFixed(2),
+        impliedFXMovePct: +((cumEur - cumLocal)*100/(1+cumLocal)).toFixed(2), // approx FX drift implied by the conversion
+        avgDailyDiffBps: +((sumDiff/nDiff)*10000).toFixed(3), // avg (eurRet-localRet) per day in basis points
+        note: "cumulativeEURReturnPct minus cumulativeLocalReturnPct should roughly match the REAL EURUSD/EURGBP/EURCHF move over the period (check against a live FX chart). If it's wildly different, conversion is biased.",
+      },
       sanityCheck: currency === "EUR"
         ? "No conversion needed (already EUR) — localReturns should equal eurReturns exactly"
-        : `Converted ${currency}->EUR. Compare localRet vs eurRet for same date: difference should equal the FX move that day (a few bps to ~1% on volatile days, NOT systematically one-sided).`,
+        : `Converted ${currency}->EUR over ${range}. Check fxConversion.sameDayCoveragePct (should be >90%) and biasCheck.impliedFXMovePct (compare to real ${currency}/EUR move over the period).`,
     });
   } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
 });

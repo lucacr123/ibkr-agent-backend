@@ -364,26 +364,26 @@ function computePCA(items, weights) {
 }
 
 // ─── Fama-French 5-factor regression (ETF proxies) ────────────────
-// Mkt-RF: ^GSPC (market)
-// SMB (Size): IWM (small cap) minus SPY (large cap)
+// Mkt-RF: URTH (iShares MSCI World) — GLOBAL market, not just US
+// SMB (Size): IWM (small cap) minus URTH (global market)
 // HML (Value): IWD (Russell 1000 Value) minus IWF (Russell 1000 Growth)
-// Intl (Developed ex-US): EFA minus SPY
-// EM (Emerging Markets): EEM minus SPY — closes the gap EFA leaves (EFA excludes EM entirely)
+// USD (Dollar strength): UUP (Invesco DB US Dollar Index Bullish Fund, tracks DXY) minus URTH
+// EM (Emerging Markets): EEM minus URTH — captures IEEM/VFEM exposure
 async function computeFamaFrenchRegression(portfolioReturns, dates) {
   try {
-    const [spyData, iwmData, iwdData, iwfData, efaData, eemData] = await Promise.all([
-      fetchYahooReturnSeries("SPY", "1y"),
-      fetchYahooReturnSeries("IWM", "1y"),
-      fetchYahooReturnSeries("IWD", "1y"),  // Russell 1000 Value
-      fetchYahooReturnSeries("IWF", "1y"),  // Russell 1000 Growth
-      fetchYahooReturnSeries("EFA", "1y"),  // MSCI EAFE — developed ex-US equity
-      fetchYahooReturnSeries("EEM", "1y"),  // MSCI Emerging Markets — captures IEEM/VFEM exposure
+    const [urthData, iwmData, iwdData, iwfData, uupData, eemData] = await Promise.all([
+      fetchYahooReturnSeries("URTH", "1y"), // iShares MSCI World — global equity market
+      fetchYahooReturnSeries("IWM",  "1y"),
+      fetchYahooReturnSeries("IWD",  "1y"),  // Russell 1000 Value
+      fetchYahooReturnSeries("IWF",  "1y"),  // Russell 1000 Growth
+      fetchYahooReturnSeries("UUP",  "1y"),  // US Dollar Index (DXY) bullish ETF
+      fetchYahooReturnSeries("EEM",  "1y"),  // MSCI Emerging Markets — captures IEEM/VFEM exposure
     ]);
-    // Fill each US factor onto the portfolio's own trading calendar (trimmedDates from caller).
-    // On a day a US exchange was closed, that factor's TRUE return is 0% (no trading = no price
+    // Fill each factor onto the portfolio's own trading calendar (trimmedDates from caller).
+    // On a day a factor's exchange was closed, its TRUE return is 0% (no trading = no price
     // change), not a repeat of the previous day's move. Recovers days where European holdings
-    // traded but a US ETF didn't (rare US-only holidays).
-    const factorMaps = [spyData, iwmData, iwdData, iwfData, efaData, eemData].map(s => new Map(s.map(r => [r.date, r.ret])));
+    // traded but a US-listed ETF didn't (rare US-only holidays).
+    const factorMaps = [urthData, iwmData, iwdData, iwfData, uupData, eemData].map(s => new Map(s.map(r => [r.date, r.ret])));
     let started = [false, false, false, false, false, false];
     const rows = [];
     dates.forEach((d, i) => {
@@ -391,25 +391,25 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
         if (m.has(d)) { started[idx] = true; return m.get(d); }
         return started[idx] ? 0 : null; // 0% on holiday gap, null only before first trading day
       });
-      const [mkt, iwm, iwd, iwf, efa, eem] = vals;
+      const [mkt, iwm, iwd, iwf, uup, eem] = vals;
       if (vals.every(v => v !== null) && Number.isFinite(portfolioReturns[i])) {
         rows.push({
           y: portfolioReturns[i],
           mkt,
-          smb: iwm - mkt,   // Small Minus Big: Russell 2000 (small) − SPY (large)
-          hml: iwd - iwf,   // High Minus Low: Russell 1000 Value (high B/M) − Russell 1000 Growth (low B/M)
-          intl: efa - mkt,  // Developed ex-US: MSCI EAFE − SPY
-          em: eem - mkt,    // Emerging Markets: MSCI EM − SPY
+          smb: iwm - mkt,   // Small Minus Big: Russell 2000 (small) − MSCI World (global market)
+          hml: iwd - iwf,   // High Minus Low: Russell 1000 Value − Russell 1000 Growth
+          usd: uup - mkt,   // Dollar strength: DXY bullish ETF − MSCI World (replaces developed-ex-US factor)
+          em:  eem - mkt,   // Emerging Markets: MSCI EM − MSCI World
         });
       }
     });
 
     if (rows.length < 60) return null;
 
-    // y = alpha + b1*mkt + b2*smb + b3*hml + b4*intl + b5*em + error
-    const X = rows.map(r => [1, r.mkt, r.smb, r.hml, r.intl, r.em]);
+    // y = alpha + b1*mkt + b2*smb + b3*hml + b4*usd + b5*em + error
+    const X = rows.map(r => [1, r.mkt, r.smb, r.hml, r.usd, r.em]);
     const y = rows.map(r => r.y);
-    const k = 6; // params: alpha, beta_mkt, beta_smb, beta_hml, beta_intl, beta_em
+    const k = 6; // params: alpha, beta_mkt, beta_smb, beta_hml, beta_usd, beta_em
 
     const XtX = Array.from({length:k}, (_,i) => Array.from({length:k}, (_,j) =>
       X.reduce((s,row) => s + row[i]*row[j], 0)
@@ -419,10 +419,10 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
     const beta = solveLinearSystem(XtX, Xty);
     if (!beta) return null;
 
-    const [alpha, betaMkt, betaSmb, betaHml, betaIntl, betaEm] = beta;
+    const [alpha, betaMkt, betaSmb, betaHml, betaUsd, betaEm] = beta;
 
     const yMean = mean(y);
-    const yPred = X.map(row => row[0]*alpha + row[1]*betaMkt + row[2]*betaSmb + row[3]*betaHml + row[4]*betaIntl + row[5]*betaEm);
+    const yPred = X.map(row => row[0]*alpha + row[1]*betaMkt + row[2]*betaSmb + row[3]*betaHml + row[4]*betaUsd + row[5]*betaEm);
     const ssRes = y.reduce((s,v,i) => s + (v-yPred[i])**2, 0);
     const ssTot = y.reduce((s,v) => s + (v-yMean)**2, 0);
     const r2 = ssTot > 0 ? 1 - ssRes/ssTot : 0;
@@ -431,13 +431,13 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
       n: rows.length,
       alpha: +(((1+alpha)**252 - 1)*100).toFixed(3),  // geometric annualisation, not linear ×252
       alphaDailyPct: +(alpha*100).toFixed(4),
-      betaMarket:        +betaMkt.toFixed(3),
-      betaSize:          +betaSmb.toFixed(3),
-      betaValue:         +betaHml.toFixed(3),
-      betaInternational: +betaIntl.toFixed(3),  // positive = tilted developed ex-US, negative = tilted US
-      betaEmergingMkts:  +betaEm.toFixed(3),    // positive = tilted EM, negative = tilted US/developed
-      rSquared:          +r2.toFixed(3),
-      method: "OLS regression: portfolio daily EUR returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IWD-IWF) + Intl(EFA-SPY) + EM(EEM-SPY), EUR-converted + forward-filled, 1Y daily data",
+      betaMarket:     +betaMkt.toFixed(3),  // beta to MSCI World (global equity market)
+      betaSize:       +betaSmb.toFixed(3),
+      betaValue:      +betaHml.toFixed(3),
+      betaUSDStrength: +betaUsd.toFixed(3), // positive = portfolio benefits when USD strengthens (DXY up)
+      betaEmergingMkts: +betaEm.toFixed(3), // positive = tilted EM, negative = tilted developed
+      rSquared:       +r2.toFixed(3),
+      method: "OLS regression: portfolio daily EUR returns ~ Mkt(URTH) + SMB(IWM-URTH) + HML(IWD-IWF) + USD(UUP-URTH) + EM(EEM-URTH), EUR-converted + forward-filled, 1Y daily data",
     };
   } catch (e) {
     console.error("Fama-French error:", e.message);

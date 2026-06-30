@@ -239,13 +239,20 @@ function cumulativeFromReturns(r) { let v = 1; return r.map(x => (v *= (1 + x)))
 function maxDDFromReturns(r) { const c = cumulativeFromReturns(r); return maxDD(c.map(v => v * 100)); }
 function annualizedReturn(r) { if (!r.length) return 0; const total = r.reduce((s,v)=>s*(1+v),1); return Math.pow(total, 252 / r.length) - 1; }
 function informationRatio(a, b) { const len = Math.min(a.length, b.length); if (!len) return null; const active = a.slice(-len).map((v,i)=>v - b.slice(-len)[i]); const te = std(active); return te === 0 ? null : (mean(active) / te) * Math.sqrt(252); }
-async function fetchYahooReturnSeries(symbol, range = "1y") {
-  const { bars } = await fetchYahooCloses(yfSymbol(symbol), range);
+// convertToEUR=true converts local-currency returns to EUR using daily FX rates.
+// Default true for portfolio analytics; pass false only for raw-currency analysis (e.g. single-symbol charts).
+async function fetchYahooReturnSeries(symbol, range = "1y", convertToEUR = true) {
+  const ySym = yfSymbol(symbol);
+  const { bars, meta } = await fetchYahooCloses(ySym, range);
   const out = [];
   for (let i = 1; i < bars.length; i++) {
     const prev = bars[i - 1]?.close;
     const cur = bars[i]?.close;
     if (prev && cur && Number.isFinite(prev) && Number.isFinite(cur)) out.push({ date: bars[i].date, ret: (cur - prev) / prev });
+  }
+  const currency = meta?.currency || "EUR";
+  if (convertToEUR && currency !== "EUR") {
+    return convertReturnsToEUR(out, currency, range);
   }
   return out;
 }
@@ -424,7 +431,7 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
       betaValue:         +betaHml.toFixed(3),
       betaInternational: +betaIntl.toFixed(3),  // positive = tilted developed ex-US, negative = tilted US
       rSquared:          +r2.toFixed(3),
-      method: "OLS regression: portfolio daily returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IVE-IVW) + Intl(EFA-SPY), 1Y daily data",
+      method: "OLS regression: portfolio daily EUR returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IVE-IVW) + Intl(EFA-SPY), all factors converted to EUR using daily FX rates, 1Y daily data",
     };
   } catch (e) {
     console.error("Fama-French error:", e.message);
@@ -541,7 +548,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
-      method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix; Sharpe = annualized return / covariance-based annualized volatility",
+      method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix (all returns converted to EUR using daily FX rates); Sharpe = annualized return / covariance-based annualized volatility",
       pca,
       famaFrench,
     };
@@ -1170,6 +1177,55 @@ async function computeRegimeModel(portfolioRetMap) {
   };
 }
 
+
+
+// ─── FX conversion: bring any local-currency return series to EUR ─
+// Uses daily EURUSD=X, EURGBP=X, EURCHF=X rates (Yahoo) so all portfolio
+// analytics (Sharpe, Calmar, PCA, Fama-French) use true EUR returns.
+const FX_PAIR_FOR = { USD: "EURUSD=X", GBP: "EURGBP=X", CHF: "EURCHF=X", EUR: null };
+const _fxCache = new Map(); // currency -> Map(date -> EURXXX rate)
+
+async function getFxRateSeries(currency, range = "1y") {
+  if (currency === "EUR") return null; // no conversion needed
+  const pair = FX_PAIR_FOR[currency];
+  if (!pair) { console.warn(`No FX pair configured for currency ${currency} — returns NOT converted to EUR`); return null; }
+  const cacheKey = `${pair}:${range}`;
+  if (_fxCache.has(cacheKey)) return _fxCache.get(cacheKey);
+  try {
+    const { bars } = await fetchYahooCloses(pair, range);
+    // EURUSD=X gives "USD per 1 EUR". We need "EUR per 1 USD" = 1/rate to convert USD->EUR.
+    const map = new Map(bars.map(b => [b.date, 1 / b.close]));
+    _fxCache.set(cacheKey, map);
+    return map;
+  } catch (e) {
+    console.error(`FX fetch failed for ${pair}:`, e.message);
+    return null;
+  }
+}
+
+// Convert a local-currency daily return series to EUR daily returns.
+// series: [{date, ret}], currency: "USD"|"GBP"|"CHF"|"EUR"
+async function convertReturnsToEUR(series, currency, range = "1y") {
+  if (currency === "EUR" || !series.length) return series;
+  const fxMap = await getFxRateSeries(currency, range);
+  if (!fxMap) return series; // fallback: leave unconverted rather than crash, but this is wrong — logged above
+
+  // Build EUR-per-unit rate aligned to series dates, compute daily FX % change
+  const out = [];
+  let prevFx = null;
+  for (const { date, ret } of series) {
+    const fx = fxMap.get(date);
+    if (fx === undefined) { prevFx = null; continue; } // skip days without FX data
+    if (prevFx !== null) {
+      const fxChange = (fx - prevFx) / prevFx;
+      // Combined return: (1+local_ret)(1+fx_change) - 1
+      const eurRet = (1 + ret) * (1 + fxChange) - 1;
+      out.push({ date, ret: eurRet });
+    }
+    prevFx = fx;
+  }
+  return out;
+}
 
 // ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {

@@ -1211,7 +1211,10 @@ async function computeRegimeModel(portfolioRetMap) {
 // ─── FX conversion: bring any local-currency return series to EUR ─
 // Uses daily EURUSD=X, EURGBP=X, EURCHF=X rates (Yahoo) so all portfolio
 // analytics (Sharpe, Calmar, PCA, Fama-French) use true EUR returns.
-const FX_PAIR_FOR = { USD: "EURUSD=X", GBP: "EURGBP=X", CHF: "EURCHF=X", EUR: null };
+// Yahoo Finance sometimes reports UK-listed instruments as "GBp" (pence, lowercase p)
+// instead of "GBP" (pounds). GBp is NOT a different currency — it's the same GBP, just
+// quoted ×100. We normalise it to GBP here so FX lookup never silently fails.
+const FX_PAIR_FOR = { USD: "EURUSD=X", GBP: "EURGBP=X", GBp: "EURGBP=X", CHF: "EURCHF=X", EUR: null };
 const _fxCache = new Map(); // currency -> Map(date -> EURXXX rate)
 
 async function getFxRateSeries(currency, range = "1y") {

@@ -363,57 +363,53 @@ function computePCA(items, weights) {
   };
 }
 
-// ─── Fama-French 3-factor regression (ETF proxies) ────────────────
+// ─── Fama-French 5-factor regression (ETF proxies) ────────────────
 // Mkt-RF: ^GSPC (market)
 // SMB (Size): IWM (small cap) minus SPY (large cap)
 // HML (Value): IWD (Russell 1000 Value) minus IWF (Russell 1000 Growth)
+// Intl (Developed ex-US): EFA minus SPY
+// EM (Emerging Markets): EEM minus SPY — closes the gap EFA leaves (EFA excludes EM entirely)
 async function computeFamaFrenchRegression(portfolioReturns, dates) {
   try {
-    // 4-factor model: Market, Size (SMB), Value (HML), International (EFA-SPY)
-    // ETF proxies selected (all converted to EUR before this point):
-    //   Market: SPY     — SPDR S&P 500, most liquid US market proxy
-    //   Size:   IWM-SPY — iShares Russell 2000 (small) minus SPY (large) = SMB
-    //   Value:  IWD-IWF — iShares Russell 1000 Value minus iShares Russell 1000 Growth = HML
-    //           (Russell-family pairing with IWM/SPY gives more internally consistent factor
-    //            construction than mixing S&P-style IVE/IVW with Russell-style IWM)
-    //   Intl:   EFA-SPY — iShares MSCI EAFE (developed ex-US) minus SPY; captures CSSX5E/IEEM exposure
-    const [spyData, iwmData, iwdData, iwfData, efaData] = await Promise.all([
+    const [spyData, iwmData, iwdData, iwfData, efaData, eemData] = await Promise.all([
       fetchYahooReturnSeries("SPY", "1y"),
       fetchYahooReturnSeries("IWM", "1y"),
       fetchYahooReturnSeries("IWD", "1y"),  // Russell 1000 Value
       fetchYahooReturnSeries("IWF", "1y"),  // Russell 1000 Growth
       fetchYahooReturnSeries("EFA", "1y"),  // MSCI EAFE — developed ex-US equity
+      fetchYahooReturnSeries("EEM", "1y"),  // MSCI Emerging Markets — captures IEEM/VFEM exposure
     ]);
     // Fill each US factor onto the portfolio's own trading calendar (trimmedDates from caller).
     // On a day a US exchange was closed, that factor's TRUE return is 0% (no trading = no price
     // change), not a repeat of the previous day's move. Recovers days where European holdings
     // traded but a US ETF didn't (rare US-only holidays).
-    const factorMaps = [spyData, iwmData, iwdData, iwfData, efaData].map(s => new Map(s.map(r => [r.date, r.ret])));
-    let started = [false, false, false, false, false];
+    const factorMaps = [spyData, iwmData, iwdData, iwfData, efaData, eemData].map(s => new Map(s.map(r => [r.date, r.ret])));
+    let started = [false, false, false, false, false, false];
     const rows = [];
     dates.forEach((d, i) => {
       const vals = factorMaps.map((m, idx) => {
         if (m.has(d)) { started[idx] = true; return m.get(d); }
         return started[idx] ? 0 : null; // 0% on holiday gap, null only before first trading day
       });
-      const [mkt, iwm, iwd, iwf, efa] = vals;
+      const [mkt, iwm, iwd, iwf, efa, eem] = vals;
       if (vals.every(v => v !== null) && Number.isFinite(portfolioReturns[i])) {
         rows.push({
           y: portfolioReturns[i],
           mkt,
           smb: iwm - mkt,   // Small Minus Big: Russell 2000 (small) − SPY (large)
           hml: iwd - iwf,   // High Minus Low: Russell 1000 Value (high B/M) − Russell 1000 Growth (low B/M)
-          intl: efa - mkt,  // International: MSCI EAFE − SPY
+          intl: efa - mkt,  // Developed ex-US: MSCI EAFE − SPY
+          em: eem - mkt,    // Emerging Markets: MSCI EM − SPY
         });
       }
     });
 
     if (rows.length < 60) return null;
 
-    // y = alpha + b1*mkt + b2*smb + b3*hml + b4*intl + error
-    const X = rows.map(r => [1, r.mkt, r.smb, r.hml, r.intl]);
+    // y = alpha + b1*mkt + b2*smb + b3*hml + b4*intl + b5*em + error
+    const X = rows.map(r => [1, r.mkt, r.smb, r.hml, r.intl, r.em]);
     const y = rows.map(r => r.y);
-    const k = 5; // params: alpha, beta_mkt, beta_smb, beta_hml, beta_intl
+    const k = 6; // params: alpha, beta_mkt, beta_smb, beta_hml, beta_intl, beta_em
 
     const XtX = Array.from({length:k}, (_,i) => Array.from({length:k}, (_,j) =>
       X.reduce((s,row) => s + row[i]*row[j], 0)
@@ -423,24 +419,25 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
     const beta = solveLinearSystem(XtX, Xty);
     if (!beta) return null;
 
-    const [alpha, betaMkt, betaSmb, betaHml, betaIntl] = beta;
+    const [alpha, betaMkt, betaSmb, betaHml, betaIntl, betaEm] = beta;
 
     const yMean = mean(y);
-    const yPred = X.map(row => row[0]*alpha + row[1]*betaMkt + row[2]*betaSmb + row[3]*betaHml + row[4]*betaIntl);
+    const yPred = X.map(row => row[0]*alpha + row[1]*betaMkt + row[2]*betaSmb + row[3]*betaHml + row[4]*betaIntl + row[5]*betaEm);
     const ssRes = y.reduce((s,v,i) => s + (v-yPred[i])**2, 0);
     const ssTot = y.reduce((s,v) => s + (v-yMean)**2, 0);
     const r2 = ssTot > 0 ? 1 - ssRes/ssTot : 0;
 
     return {
       n: rows.length,
-      alpha: +(alpha*252*100).toFixed(3),
+      alpha: +(((1+alpha)**252 - 1)*100).toFixed(3),  // geometric annualisation, not linear ×252
       alphaDailyPct: +(alpha*100).toFixed(4),
       betaMarket:        +betaMkt.toFixed(3),
       betaSize:          +betaSmb.toFixed(3),
       betaValue:         +betaHml.toFixed(3),
       betaInternational: +betaIntl.toFixed(3),  // positive = tilted developed ex-US, negative = tilted US
+      betaEmergingMkts:  +betaEm.toFixed(3),    // positive = tilted EM, negative = tilted US/developed
       rSquared:          +r2.toFixed(3),
-      method: "OLS regression: portfolio daily EUR returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IWD-IWF) + Intl(EFA-SPY), EUR-converted + forward-filled, 1Y daily data",
+      method: "OLS regression: portfolio daily EUR returns ~ Mkt(SPY) + SMB(IWM-SPY) + HML(IWD-IWF) + Intl(EFA-SPY) + EM(EEM-SPY), EUR-converted + forward-filled, 1Y daily data",
     };
   } catch (e) {
     console.error("Fama-French error:", e.message);
@@ -1237,22 +1234,43 @@ async function getFxRateSeries(currency, range = "1y") {
 
 // Convert a local-currency daily return series to EUR daily returns.
 // series: [{date, ret}], currency: "USD"|"GBP"|"CHF"|"EUR"
+//
+// CRITICAL: every entry in `series` MUST get an output entry on the SAME date.
+// Never skip a date — skipping shifts the array and lets a local return on day X
+// get matched against the FX move from a different day, fabricating a systematic
+// (non-random) bias in the EUR-converted return that looks like fake alpha.
 async function convertReturnsToEUR(series, currency, range = "1y") {
   if (currency === "EUR" || !series.length) return series;
   const fxMap = await getFxRateSeries(currency, range);
-  if (!fxMap) return series; // fallback: leave unconverted rather than crash, but this is wrong — logged above
+  if (!fxMap) return series; // no FX data at all — leave unconverted (logged in getFxRateSeries)
 
-  // Build EUR-per-unit rate aligned to series dates, compute daily FX % change
+  // Build a sorted list of all FX dates so we can forward-fill (and back-fill for the
+  // very first day) the FX rate for any date the asset traded but FX data is missing
+  // (rare: FX markets trade ~24/5, asset-side gaps are the asset's own exchange holidays).
+  const fxDatesSorted = [...fxMap.keys()].sort();
+  function fxRateOnOrBefore(date) {
+    // Find the latest FX date <= `date`. fxDatesSorted is sorted ascending.
+    let lo = 0, hi = fxDatesSorted.length - 1, ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (fxDatesSorted[mid] <= date) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    return ans >= 0 ? fxMap.get(fxDatesSorted[ans]) : (fxDatesSorted.length ? fxMap.get(fxDatesSorted[0]) : null);
+  }
+
   const out = [];
   let prevFx = null;
   for (const { date, ret } of series) {
-    const fx = fxMap.get(date);
-    if (fx === undefined) { prevFx = null; continue; } // skip days without FX data
-    if (prevFx !== null) {
+    const fx = fxRateOnOrBefore(date); // SAME-DATE or most-recent-prior FX rate — never skips/shifts
+    if (fx === null) { out.push({ date, ret }); continue; } // no FX data anywhere yet — pass through unconverted for this one day
+    if (prevFx === null) {
+      // First convertible day: no prior FX rate to diff against, so just pass the local
+      // return through unchanged (no FX move can be computed for day 1 of the series).
+      out.push({ date, ret });
+    } else {
       const fxChange = (fx - prevFx) / prevFx;
-      // Combined return: (1+local_ret)(1+fx_change) - 1
       const eurRet = (1 + ret) * (1 + fxChange) - 1;
-      out.push({ date, ret: eurRet });
+      out.push({ date, ret: eurRet }); // ALWAYS pushed on the same date as the input
     }
     prevFx = fx;
   }

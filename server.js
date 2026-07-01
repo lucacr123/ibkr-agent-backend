@@ -1309,6 +1309,96 @@ async function convertReturnsToEUR(series, currency, range = "1y") {
   return out;
 }
 
+
+// ─── Server-side backtest engine ──────────────────────────────────
+async function runBacktest(input) {
+  const { symbols, weights, range = "5y", strategy = "buy_hold", label = "Portfolio" } = input;
+  if (!symbols?.length) return { error: "symbols required" };
+
+  // Fetch EUR-converted return series for each symbol
+  const seriesArr = await Promise.all(symbols.map(async sym => {
+    try {
+      const s = await fetchYahooReturnSeries(sym, range, true);
+      return { sym, series: s };
+    } catch(e) { return { sym, series: [] }; }
+  }));
+
+  // Align on union of dates, forward-fill with 0%
+  const allDates = [...new Set(seriesArr.flatMap(x => x.series.map(r => r.date)))].sort();
+  if (allDates.length < 20) return { error: "Not enough data" };
+
+  // Build return matrix
+  const n = symbols.length;
+  const w = weights && weights.length === n
+    ? weights.map(v => v / weights.reduce((a,b) => a+b, 0))
+    : symbols.map(() => 1/n);
+
+  const retsByDate = {};
+  allDates.forEach(d => { retsByDate[d] = new Array(n).fill(0); });
+  seriesArr.forEach(({ series }, i) => {
+    const byDate = new Map(series.map(r => [r.date, r.ret]));
+    let lastRet = 0, started = false;
+    allDates.forEach(d => {
+      if (byDate.has(d)) { lastRet = byDate.get(d); started = true; }
+      if (started) retsByDate[d][i] = byDate.has(d) ? lastRet : 0;
+    });
+  });
+
+  // Build equity curve
+  let equity = 100;
+  let peak = 100;
+  let maxDD = 0;
+  const equityCurve = [];
+  const drawdownCurve = [];
+  const dailyRets = [];
+
+  allDates.forEach(d => {
+    const portRet = retsByDate[d].reduce((s, r, i) => s + w[i] * r, 0);
+    equity *= (1 + portRet);
+    if (equity > peak) peak = equity;
+    const dd = (equity - peak) / peak * 100;
+    if (dd < maxDD) maxDD = dd;
+    equityCurve.push({ date: d, value: +equity.toFixed(4) });
+    drawdownCurve.push({ date: d, value: +dd.toFixed(4) });
+    dailyRets.push(portRet);
+  });
+
+  // Metrics
+  const totalRet = (equity / 100 - 1) * 100;
+  const nYears   = allDates.length / 252;
+  const annRet   = ((equity / 100) ** (1/nYears) - 1) * 100;
+  const meanRet  = dailyRets.reduce((a,b) => a+b, 0) / dailyRets.length;
+  const variance = dailyRets.reduce((a,b) => a + (b-meanRet)**2, 0) / dailyRets.length;
+  const annVol   = Math.sqrt(variance) * Math.sqrt(252) * 100;
+  const RF       = RISK_FREE_RATE_PCT / 100;
+  const sharpe   = annVol === 0 ? 0 : +((annRet/100 - RF) / (annVol/100)).toFixed(3);
+  const negRets  = dailyRets.filter(r => r < 0);
+  const downVol  = negRets.length ? Math.sqrt(negRets.reduce((a,b) => a+b*b, 0)/negRets.length) * Math.sqrt(252) * 100 : 0;
+  const sortino  = downVol === 0 ? 0 : +((annRet/100 - RF) / (downVol/100)).toFixed(3);
+  const calmar   = maxDD === 0 ? 0 : +(annRet / Math.abs(maxDD)).toFixed(3);
+  const sorted   = [...dailyRets].sort((a,b) => a-b);
+  const var95    = +(sorted[Math.floor(sorted.length * 0.05)] * 100).toFixed(3);
+
+  return {
+    label, symbols, weights: w, range, strategy,
+    dates: allDates,
+    equityCurve,
+    drawdownCurve,
+    metrics: {
+      totalReturnPct:    +totalRet.toFixed(2),
+      annualizedRetPct:  +annRet.toFixed(2),
+      annualizedVolPct:  +annVol.toFixed(2),
+      maxDrawdownPct:    +maxDD.toFixed(2),
+      sharpe,
+      sortino,
+      calmar,
+      var95DailyPct:     var95,
+      nDays:             allDates.length,
+      nYears:            +nYears.toFixed(1),
+    },
+  };
+}
+
 // ─── Tool executor ────────────────────────────────────────────────
 async function executeTool(name, input) {
   switch (name) {
@@ -1538,15 +1628,8 @@ async function executeTool(name, input) {
     case "get_macro_snapshot":
       return marketSnapshot();
 
-    case "execute_python":
-      // This tool is handled client-side (Pyodide in browser).
-      // The server returns a special marker that the frontend intercepts
-      // and routes to the Pyodide Web Worker.
-      return {
-        __pyodide__: true,
-        code: input.code,
-        description: input.description,
-      };
+    case "run_backtest":
+      return runBacktest(input);
 
     default:
       return { error: `Unknown tool: ${name}` };
@@ -1571,25 +1654,7 @@ const TOOLS = [
   { name: "compute_analytics", description: "Compute quant analytics: returns, return distribution, historical VaR 95/99, CVaR 95/99, skewness, kurtosis, rolling VaR, Z-score, rolling Sharpe, rolling vol, beta, correlation and drawdown. Returns series data + chart tags. Use for ANY quant, risk, distribution, VaR/CVaR, skew/kurtosis, or chart request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" }, bins: { type: "number", description: "Histogram bins for return distribution, default 20" } }, required: ["symbol"] } },
   { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
   { name: "get_market_news", description: "Get current market news headlines from finance RSS feeds. Use for morning, midday, end-of-day briefs and any latest-news request.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, limit: { type: "number" } }, required: [] } },
-  { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
-  {
-    name: "execute_python",
-    description: "Execute Python code in a Pyodide (WebAssembly) sandbox in the user's browser. Use for backtests, custom analytics, data manipulation, chart generation, CSV exports. Data is fetched via fetch_data() helper which proxies through the backend. Returns stdout text, matplotlib charts as base64 PNG, and downloadable CSV files. Available packages: numpy, pandas, matplotlib, scipy. No yfinance — use fetch_data() instead.",
-    input_schema: {
-      type: "object",
-      properties: {
-        code: {
-          type: "string",
-          description: "Python code to execute. Use fetch_data(symbol, range) to get OHLCV data. range: '1mo','3mo','6mo','1y','2y','5y','10y','max'. Returns a pandas DataFrame with columns: Date, Open, High, Low, Close, Volume. Use matplotlib for charts — they are captured automatically. Use print() for text output. To produce a CSV, call save_csv(df, 'filename.csv')."
-        },
-        description: {
-          type: "string",
-          description: "Brief description of what this code does, shown to the user while it runs."
-        }
-      },
-      required: ["code", "description"]
-    }
-  },
+  { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } }
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
@@ -1616,28 +1681,18 @@ Always use combined portfolio percentages, not per-account NAV%. Format matrices
 1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
 Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.
 
-PYTHON IDE RULES:
-- When asked for a backtest, simulation, or any quantitative analysis, ALWAYS call execute_python immediately with complete, runnable code. Never say "I'll now run..." or ask for confirmation — just call the tool.
-- Use fetch_data(symbol, range_) to get data. Examples: fetch_data("CSPX.L", "5y"), fetch_data("^GSPC", "max").
-- Always produce at least one matplotlib chart. Always print a summary of results.
-- If the task requires portfolio data, fetch each holding separately using the Yahoo symbols above.
-- Write the full analysis in a single execute_python call — don't split into multiple steps.`;
+BACKTEST RULES:
+- When asked for a backtest, simulation, or quantitative analysis, ALWAYS call run_backtest immediately. Never ask for confirmation. Use the Yahoo Finance symbols listed above.
+- Default: backtest the full portfolio (CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L) with equal weights over 5y unless specified otherwise.
+- After run_backtest returns, embed @@BACKTEST:1@@ in your reply to render the chart inline.`;
 
 async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
   let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages });
   let loop = [...messages], i = 0;
-  let pyodidePayload = null; // capture if Claude calls execute_python
 
   while (response.stop_reason === "tool_use" && i++ < 10) {
     loop.push({ role: "assistant", content: response.content });
-    // Check if any tool call is execute_python — if so, capture and break immediately
-    const toolBlocks = response.content.filter(b => b.type === "tool_use");
-    const pyBlock = toolBlocks.find(b => b.name === "execute_python");
-    if (pyBlock) {
-      pyodidePayload = { __pyodide__: true, code: pyBlock.input.code, description: pyBlock.input.description };
-      break; // Don't continue agentic loop — execution happens client-side
-    }
 
     const toolResults = await Promise.all(toolBlocks.map(async b => {
       let result;
@@ -1649,90 +1704,7 @@ async function runAgent(prompt, history = []) {
   }
 
   const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-  if (pyodidePayload) return { __pyodide__: true, reply, ...pyodidePayload };
-  return reply;
-}
-
-// ─── Push ─────────────────────────────────────────────────────────
-// Persist push subscriptions to disk so they survive Railway restarts
-const PUSH_SUBS_FILE = "/tmp/push-subs.json";
-const pushSubs = new Map();
-function loadPushSubs() {
-  try {
-    if (fs.existsSync(PUSH_SUBS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(PUSH_SUBS_FILE, "utf8"));
-      Object.entries(data).forEach(([id, sub]) => pushSubs.set(id, sub));
-      console.log(`📱 Loaded ${pushSubs.size} push subscriptions from disk`);
-    }
-  } catch (e) { console.error("Failed to load push subs:", e.message); }
-}
-function savePushSubs() {
-  try {
-    const obj = Object.fromEntries(pushSubs);
-    fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(obj));
-  } catch (e) { console.error("Failed to save push subs:", e.message); }
-}
-loadPushSubs();
-async function sendPush(title, body, icon = "📈") {
-  console.log(`🔔 sendPush "${title}" subs=${pushSubs.size} vapid=${!!(VAPID_PUBLIC&&VAPID_PRIVATE)}`);
-  if (!VAPID_PUBLIC || !VAPID_PRIVATE || !pushSubs.size) return;
-  const payload = JSON.stringify({ title, body, icon, timestamp: Date.now() });
-  const expired = [];
-  for (const [id, sub] of pushSubs.entries()) {
-    try { await webpush.sendNotification(sub, payload); }
-    catch (e) { if (e.statusCode === 410 || e.statusCode === 404) expired.push(id); }
-  }
-  if (expired.length) { expired.forEach(id => pushSubs.delete(id)); savePushSubs(); }
-}
-
-// ─── Scheduled tasks ──────────────────────────────────────────────
-const TASKS = [
-  { id: "morning", label: "Morning briefing",   icon: "🌅", cron: "30 7 * * 1-5", cronDisplay: "8:30 AM London",
-    prompt: "Morning briefing: get market news, macro snapshot, portfolio and allocation. Cover main overnight headlines, movements in indices/rates/FX/commodities, combined NLV, top 5 positions by %, combined unrealized P&L, and key portfolio risks. Concise." },
-  { id: "midday",  label: "Midday check",        icon: "☀️", cron: "0 11 * * 1-5",  cronDisplay: "12:00 PM London",
-    prompt: "Midday check: get market news, macro snapshot and portfolio. Mention any new market news since the morning, asset-class/index movements, combined NLV and unrealized P&L. Under 150 words." },
-  { id: "eod",     label: "End-of-day summary",  icon: "🌆", cron: "0 16 * * 1-5",  cronDisplay: "5:00 PM London",
-    prompt: "End of day: get market news, macro snapshot, portfolio and trades. Summarize today's key headlines, asset-class/index movements, portfolio movement, combined NLV, unrealized P&L, trades today, and biggest movers." },
-  { id: "weekly",  label: "Weekly review",       icon: "⚖️", cron: "30 15 * * 5",   cronDisplay: "4:30 PM London (Fri)",
-    prompt: "Weekly review: get market news, macro snapshot, portfolio, allocation, P&L and trades. Include weekly market headlines, asset-class/index movements, combined NLV, full allocation breakdown, unrealized P&L, trades this week, commissions, concentration risk, and 1Y portfolio metrics." },
-];
-const taskState = {};
-TASKS.forEach(t => { taskState[t.id] = { enabled: true, lastRun: null, lastResult: null, running: false }; });
-const taskLog = [];
-
-console.log("⏰ Registering cron tasks:", TASKS.map(t=>t.cron).join(", "));
-TASKS.forEach(task => {
-  cron.schedule(task.cron, async () => {  // UTC times: London BST = UTC+1
-    if (!taskState[task.id].enabled || taskState[task.id].running) return;
-    taskState[task.id].running = true;
-    taskLog.unshift({ task: task.label, status: "running", time: new Date().toISOString() });
-    await sendPush(`${task.icon} ${task.label}`, "Running now…", task.icon);
-    try {
-      const result = await runAgent(task.prompt);
-      taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
-      taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
-      await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
-      if (task.id === "morning") buildAndSendReport(REPORT_TO).catch(e=>console.error("Email:",e.message));
-    } catch (e) {
-      taskState[task.id].running = false;
-      taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message };
-      await sendPush(`❌ ${task.label} failed`, e.message.slice(0, 120), "❌");
-    }
-  });
-});
-
-// ─── Routes ───────────────────────────────────────────────────────
-app.post("/api/chat", async (req, res) => {
-  const { message, history = [] } = req.body;
-  if (!message) return res.status(400).json({ error: "message required" });
-  try {
-    const result = await runAgent(message, history);
-    // If Claude called execute_python, return structured pyodide payload
-    if (typeof result === "object" && result.__pyodide__) {
-      res.json({ pyodide: { code: result.code, description: result.description, reply: result.reply } });
-    } else {
-      res.json({ reply: result });
-    }
+  if (backtestData) return { reply, backtestData };
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

@@ -30,6 +30,24 @@ const RISK_FREE_RATE_PCT = +(process.env.RISK_FREE_RATE_PCT || 3.64); // annuali
 const RISK_FREE_RATE_DAILY = RISK_FREE_RATE_PCT / 100 / 252; // daily decimal, simple division (252 trading days)
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
+
+// ── Push subscription persistence ─────────────────────────────────
+const PUSH_SUBS_FILE = "/tmp/push-subs.json";
+const pushSubs = new Map();
+function loadPushSubs() {
+  try {
+    if (fs.existsSync(PUSH_SUBS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(PUSH_SUBS_FILE, "utf8"));
+      Object.entries(data).forEach(([id, sub]) => pushSubs.set(id, sub));
+      console.log(`📱 Loaded ${pushSubs.size} push subscriptions`);
+    }
+  } catch (e) { console.error("Failed to load push subs:", e.message); }
+}
+function savePushSubs() {
+  try { fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(Object.fromEntries(pushSubs))); }
+  catch (e) { console.error("Failed to save push subs:", e.message); }
+}
+loadPushSubs();
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -1397,6 +1415,18 @@ async function runBacktest(input) {
       nYears:            +nYears.toFixed(1),
     },
   };
+}
+
+// ── Send push notification ────────────────────────────────────────
+async function sendPush(title, body, icon = "📊") {
+  if (!pushSubs.size) return;
+  const payload = JSON.stringify({ title, body, icon });
+  const expired = [];
+  for (const [id, sub] of pushSubs.entries()) {
+    try { await webpush.sendNotification(sub, payload); }
+    catch (e) { if (e.statusCode === 410 || e.statusCode === 404) expired.push(id); }
+  }
+  if (expired.length) { expired.forEach(id => pushSubs.delete(id)); savePushSubs(); }
 }
 
 // ─── Tool executor ────────────────────────────────────────────────

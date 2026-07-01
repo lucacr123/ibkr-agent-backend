@@ -266,7 +266,8 @@ async function fetchYahooReturnSeries(symbol, range = "1y", convertToEUR = true)
     const cur = bars[i]?.close;
     if (prev && cur && Number.isFinite(prev) && Number.isFinite(cur)) out.push({ date: bars[i].date, ret: (cur - prev) / prev });
   }
-  const currency = meta?.currency || "EUR";
+  // Use explicit override if known (e.g. CSSX5E.SW is EUR despite SIX listing)
+  const currency = CURRENCY_OVERRIDE[ySym] || meta?.currency || "EUR";
   if (convertToEUR && currency !== "EUR") {
     return convertReturnsToEUR(out, currency, range);
   }
@@ -387,13 +388,16 @@ function computePCA(items, weights) {
 // EM (Emerging Markets): EEM minus URTH — captures IEEM/VFEM exposure
 async function computeFamaFrenchRegression(portfolioReturns, dates) {
   try {
+    // Factors kept in LOCAL currency (USD) — no EUR conversion.
+    // Portfolio returns are EUR-converted; factors stay USD so the regression
+    // correctly captures cross-currency exposure without FX timing noise.
     const [urthData, iwmData, iwdData, iwfData, uupData, eemData] = await Promise.all([
-      fetchYahooReturnSeries("URTH", "1y"), // iShares MSCI World — global equity market
-      fetchYahooReturnSeries("IWM",  "1y"),
-      fetchYahooReturnSeries("IWD",  "1y"),  // Russell 1000 Value
-      fetchYahooReturnSeries("IWF",  "1y"),  // Russell 1000 Growth
-      fetchYahooReturnSeries("UUP",  "1y"),  // US Dollar Index (DXY) bullish ETF
-      fetchYahooReturnSeries("EEM",  "1y"),  // MSCI Emerging Markets — captures IEEM/VFEM exposure
+      fetchYahooReturnSeries("URTH", "1y", false), // iShares MSCI World — USD, no conversion
+      fetchYahooReturnSeries("IWM",  "1y", false),
+      fetchYahooReturnSeries("IWD",  "1y", false),  // Russell 1000 Value
+      fetchYahooReturnSeries("IWF",  "1y", false),  // Russell 1000 Growth
+      fetchYahooReturnSeries("UUP",  "1y", false),  // US Dollar Index (DXY) bullish ETF
+      fetchYahooReturnSeries("EEM",  "1y", false),  // MSCI Emerging Markets
     ]);
     // Fill each factor onto the portfolio's own trading calendar (trimmedDates from caller).
     // On a day a factor's exchange was closed, its TRUE return is 0% (no trading = no price
@@ -453,7 +457,7 @@ async function computeFamaFrenchRegression(portfolioReturns, dates) {
       betaUSDStrength: +betaUsd.toFixed(3), // positive = portfolio benefits when USD strengthens (DXY up)
       betaEmergingMkts: +betaEm.toFixed(3), // positive = tilted EM, negative = tilted developed
       rSquared:       +r2.toFixed(3),
-      method: "OLS regression: portfolio daily EUR returns ~ Mkt(URTH) + SMB(IWM-URTH) + HML(IWD-IWF) + USD(UUP-URTH) + EM(EEM-URTH), EUR-converted + forward-filled, 1Y daily data",
+      method: "OLS regression: portfolio daily EUR returns ~ Mkt(URTH) + SMB(IWM-URTH) + HML(IWD-IWF) + USD(UUP-URTH) + EM(EEM-URTH); portfolio EUR-converted, factors in local USD (no FX conversion on factors)",
     };
   } catch (e) {
     console.error("Fama-French error:", e.message);
@@ -1231,7 +1235,15 @@ async function computeRegimeModel(portfolioRetMap) {
 // Yahoo Finance sometimes reports UK-listed instruments as "GBp" (pence, lowercase p)
 // instead of "GBP" (pounds). GBp is NOT a different currency — it's the same GBP, just
 // quoted ×100. We normalise it to GBP here so FX lookup never silently fails.
-const FX_PAIR_FOR = { USD: "EURUSD=X", GBP: "EURGBP=X", GBp: "EURGBP=X", CHF: "EURCHF=X", EUR: null };
+const FX_PAIR_FOR = { USD: "EURUSD=X", GBP: "EURGBP=X", GBp: "EURGBP=X", EUR: null };
+// CHF removed: CSSX5E.SW is listed on SIX but is EUR-denominated (Euro Stoxx 50 ETF).
+// Yahoo may report "CHF" for it — we override that explicitly below.
+
+// Explicit currency overrides for tickers Yahoo misreports.
+// These take priority over meta.currency from Yahoo.
+const CURRENCY_OVERRIDE = {
+  "CSSX5E.SW": "EUR",  // Euro Stoxx 50 ETF — EUR-denominated despite SIX listing
+};
 const _fxCache = new Map(); // currency -> Map(date -> EURXXX rate)
 
 async function getFxRateSeries(currency, range = "1y") {
@@ -1782,7 +1794,7 @@ app.get("/api/debug/fx/:symbol", async (req, res) => {
     const range = req.query.range || "1y";
     const ySym = yfSymbol(symbol);
     const { bars, meta } = await fetchYahooCloses(ySym, range);
-    const currency = meta?.currency || "EUR";
+    const currency = CURRENCY_OVERRIDE[ySym] || meta?.currency || "EUR";
 
     // Raw local-currency returns (before any EUR conversion)
     const localReturns = [];

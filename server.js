@@ -1614,7 +1614,14 @@ MARKET NEWS WORKFLOW: for morning, midday, end-of-day, latest news, headlines, a
 
 Always use combined portfolio percentages, not per-account NAV%. Format matrices and tabular data as markdown tables with concise columns; never dump raw JSON objects into the chat.
 1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
-Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.`;
+Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.
+
+PYTHON IDE RULES:
+- When asked for a backtest, simulation, or any quantitative analysis, ALWAYS call execute_python immediately with complete, runnable code. Never say "I'll now run..." or ask for confirmation — just call the tool.
+- Use fetch_data(symbol, range_) to get data. Examples: fetch_data("CSPX.L", "5y"), fetch_data("^GSPC", "max").
+- Always produce at least one matplotlib chart. Always print a summary of results.
+- If the task requires portfolio data, fetch each holding separately using the Yahoo symbols above.
+- Write the full analysis in a single execute_python call — don't split into multiple steps.`;
 
 async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
@@ -1624,15 +1631,17 @@ async function runAgent(prompt, history = []) {
 
   while (response.stop_reason === "tool_use" && i++ < 10) {
     loop.push({ role: "assistant", content: response.content });
-    const toolResults = await Promise.all(response.content.filter(b => b.type === "tool_use").map(async b => {
+    // Check if any tool call is execute_python — if so, capture and break immediately
+    const toolBlocks = response.content.filter(b => b.type === "tool_use");
+    const pyBlock = toolBlocks.find(b => b.name === "execute_python");
+    if (pyBlock) {
+      pyodidePayload = { __pyodide__: true, code: pyBlock.input.code, description: pyBlock.input.description };
+      break; // Don't continue agentic loop — execution happens client-side
+    }
+
+    const toolResults = await Promise.all(toolBlocks.map(async b => {
       let result;
       try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
-      // Intercept Pyodide tool — don't try to resolve server-side
-      if (result?.__pyodide__) {
-        pyodidePayload = result;
-        // Return a placeholder so Claude knows execution will happen client-side
-        result = { status: "queued_for_client_execution", description: b.input.description };
-      }
       return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
     }));
     loop.push({ role: "user", content: toolResults });

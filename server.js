@@ -1690,13 +1690,15 @@ async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
   let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages });
   let loop = [...messages], i = 0;
+  let backtestData = null;
 
   while (response.stop_reason === "tool_use" && i++ < 10) {
     loop.push({ role: "assistant", content: response.content });
-
+    const toolBlocks = response.content.filter(b => b.type === "tool_use");
     const toolResults = await Promise.all(toolBlocks.map(async b => {
       let result;
       try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
+      if (b.name === "run_backtest" && result && result.equityCurve) backtestData = result;
       return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
     }));
     loop.push({ role: "user", content: toolResults });
@@ -1705,6 +1707,19 @@ async function runAgent(prompt, history = []) {
 
   const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
   if (backtestData) return { reply, backtestData };
+  return reply;
+}
+
+app.post("/api/chat", async (req, res) => {
+  const { message, history = [] } = req.body;
+  if (!message) return res.status(400).json({ error: "message required" });
+  try {
+    const result = await runAgent(message, history);
+    if (typeof result === "object" && result.backtestData) {
+      res.json({ reply: result.reply, backtestData: result.backtestData });
+    } else {
+      res.json({ reply: result });
+    }
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

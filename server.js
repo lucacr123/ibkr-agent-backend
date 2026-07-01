@@ -1538,6 +1538,16 @@ async function executeTool(name, input) {
     case "get_macro_snapshot":
       return marketSnapshot();
 
+    case "execute_python":
+      // This tool is handled client-side (Pyodide in browser).
+      // The server returns a special marker that the frontend intercepts
+      // and routes to the Pyodide Web Worker.
+      return {
+        __pyodide__: true,
+        code: input.code,
+        description: input.description,
+      };
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -1562,6 +1572,24 @@ const TOOLS = [
   { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
   { name: "get_market_news", description: "Get current market news headlines from finance RSS feeds. Use for morning, midday, end-of-day briefs and any latest-news request.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, limit: { type: "number" } }, required: [] } },
   { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
+  {
+    name: "execute_python",
+    description: "Execute Python code in a Pyodide (WebAssembly) sandbox in the user's browser. Use for backtests, custom analytics, data manipulation, chart generation, CSV exports. Data is fetched via fetch_data() helper which proxies through the backend. Returns stdout text, matplotlib charts as base64 PNG, and downloadable CSV files. Available packages: numpy, pandas, matplotlib, scipy. No yfinance — use fetch_data() instead.",
+    input_schema: {
+      type: "object",
+      properties: {
+        code: {
+          type: "string",
+          description: "Python code to execute. Use fetch_data(symbol, range) to get OHLCV data. range: '1mo','3mo','6mo','1y','2y','5y','10y','max'. Returns a pandas DataFrame with columns: Date, Open, High, Low, Close, Volume. Use matplotlib for charts — they are captured automatically. Use print() for text output. To produce a CSV, call save_csv(df, 'filename.csv')."
+        },
+        description: {
+          type: "string",
+          description: "Brief description of what this code does, shown to the user while it runs."
+        }
+      },
+      required: ["code", "description"]
+    }
+  },
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
@@ -1590,18 +1618,30 @@ Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateStri
 
 async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
-  let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 2000, system: SYSTEM, tools: TOOLS, messages });
+  let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages });
   let loop = [...messages], i = 0;
+  let pyodidePayload = null; // capture if Claude calls execute_python
+
   while (response.stop_reason === "tool_use" && i++ < 10) {
     loop.push({ role: "assistant", content: response.content });
-    const results = await Promise.all(response.content.filter(b => b.type === "tool_use").map(async b => {
-      let result; try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
+    const toolResults = await Promise.all(response.content.filter(b => b.type === "tool_use").map(async b => {
+      let result;
+      try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
+      // Intercept Pyodide tool — don't try to resolve server-side
+      if (result?.__pyodide__) {
+        pyodidePayload = result;
+        // Return a placeholder so Claude knows execution will happen client-side
+        result = { status: "queued_for_client_execution", description: b.input.description };
+      }
       return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
     }));
-    loop.push({ role: "user", content: results });
-    response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 2000, system: SYSTEM, tools: TOOLS, messages: loop });
+    loop.push({ role: "user", content: toolResults });
+    response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
   }
-  return response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+
+  const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+  if (pyodidePayload) return { __pyodide__: true, reply, ...pyodidePayload };
+  return reply;
 }
 
 // ─── Push ─────────────────────────────────────────────────────────
@@ -1676,8 +1716,15 @@ TASKS.forEach(task => {
 app.post("/api/chat", async (req, res) => {
   const { message, history = [] } = req.body;
   if (!message) return res.status(400).json({ error: "message required" });
-  try { res.json({ reply: await runAgent(message, history) }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
+  try {
+    const result = await runAgent(message, history);
+    // If Claude called execute_python, return structured pyodide payload
+    if (typeof result === "object" && result.__pyodide__) {
+      res.json({ pyodide: { code: result.code, description: result.description, reply: result.reply } });
+    } else {
+      res.json({ reply: result });
+    }
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/api/account", async (req, res) => {
@@ -1858,6 +1905,44 @@ app.get("/api/debug/fx/:symbol", async (req, res) => {
         : `Converted ${currency}->EUR over ${range}. Check fxConversion.sameDayCoveragePct (should be >90%) and biasCheck.impliedFXMovePct (compare to real ${currency}/EUR move over the period).`,
     });
   } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
+});
+
+// ── Yahoo Finance proxy for Pyodide (browser can't call Yahoo directly due to CORS) ──
+// Supports any range Yahoo supports: 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, max
+app.get("/api/proxy/yahoo", async (req, res) => {
+  const { symbol, range = "1y", interval = "1d" } = req.query;
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
+    const r   = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    const data = await r.json();
+    const result = data?.chart?.result?.[0];
+    if (!result) return res.status(404).json({ error: "No data", symbol, range });
+
+    const timestamps = result.timestamps || result.timestamp || [];
+    const q = result.indicators?.quote?.[0] || {};
+    const adjClose = result.indicators?.adjclose?.[0]?.adjclose || q.close;
+
+    const rows = timestamps.map((t, i) => ({
+      Date:   new Date(t * 1000).toISOString().slice(0, 10),
+      Open:   q.open?.[i]  ?? null,
+      High:   q.high?.[i]  ?? null,
+      Low:    q.low?.[i]   ?? null,
+      Close:  adjClose?.[i] ?? q.close?.[i] ?? null,
+      Volume: q.volume?.[i] ?? null,
+    })).filter(r => r.Close !== null);
+
+    res.json({
+      symbol,
+      range,
+      interval,
+      currency: result.meta?.currency,
+      rows,
+      count: rows.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message, symbol });
+  }
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));

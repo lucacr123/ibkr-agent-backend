@@ -1330,7 +1330,10 @@ async function convertReturnsToEUR(series, currency, range = "1y") {
 
 // ─── Server-side backtest engine ──────────────────────────────────
 async function runBacktest(input) {
-  const { symbols, weights, range = "5y", strategy = "buy_hold", label = "Portfolio" } = input;
+  const {
+    symbols, weights, range = "5y", strategy = "buy_hold", label = "Portfolio",
+    signal_symbol, signal_window = 30, signal_threshold = 1.0,
+  } = input;
   if (!symbols?.length) return { error: "symbols required" };
 
   // Fetch EUR-converted return series for each symbol
@@ -1345,7 +1348,6 @@ async function runBacktest(input) {
   const allDates = [...new Set(seriesArr.flatMap(x => x.series.map(r => r.date)))].sort();
   if (allDates.length < 20) return { error: "Not enough data" };
 
-  // Build return matrix
   const n = symbols.length;
   const w = weights && weights.length === n
     ? weights.map(v => v / weights.reduce((a,b) => a+b, 0))
@@ -1355,23 +1357,71 @@ async function runBacktest(input) {
   allDates.forEach(d => { retsByDate[d] = new Array(n).fill(0); });
   seriesArr.forEach(({ series }, i) => {
     const byDate = new Map(series.map(r => [r.date, r.ret]));
-    let lastRet = 0, started = false;
+    let started = false;
     allDates.forEach(d => {
-      if (byDate.has(d)) { lastRet = byDate.get(d); started = true; }
-      if (started) retsByDate[d][i] = byDate.has(d) ? lastRet : 0;
+      if (byDate.has(d)) { started = true; }
+      if (started) retsByDate[d][i] = byDate.get(d) ?? 0;
     });
   });
 
-  // Build equity curve
-  let equity = 100;
-  let peak = 100;
-  let maxDD = 0;
-  const equityCurve = [];
-  const drawdownCurve = [];
-  const dailyRets = [];
+  // ── Signal series for signal-based strategies ──────────────────
+  // Z-score: rolling z-score of price returns on signal_symbol
+  // Residuals: rolling OLS residual of signal_symbol vs market (URTH)
+  let signalByDate = null;
+  if ((strategy === "zscore_momentum" || strategy === "residuals_mean_reversion") && signal_symbol) {
+    try {
+      const sigSeries = await fetchYahooReturnSeries(signal_symbol, range, true);
+      const sigMap = new Map(sigSeries.map(r => [r.date, r.ret]));
 
-  allDates.forEach(d => {
-    const portRet = retsByDate[d].reduce((s, r, i) => s + w[i] * r, 0);
+      if (strategy === "zscore_momentum") {
+        // Rolling z-score: buy when z > threshold (momentum), neutral otherwise
+        const win = signal_window;
+        const vals = allDates.map(d => sigMap.get(d) ?? 0);
+        signalByDate = new Map();
+        allDates.forEach((d, i) => {
+          if (i < win) { signalByDate.set(d, 0); return; }
+          const slice = vals.slice(i - win, i);
+          const mu = slice.reduce((a,b) => a+b, 0) / win;
+          const sigma = Math.sqrt(slice.reduce((a,b) => a+(b-mu)**2, 0) / win) || 1e-9;
+          signalByDate.set(d, (vals[i] - mu) / sigma);
+        });
+      } else {
+        // Residuals mean-reversion: fetch URTH as market factor, compute rolling OLS residual
+        const mktSeries = await fetchYahooReturnSeries("URTH", range, false);
+        const mktMap = new Map(mktSeries.map(r => [r.date, r.ret]));
+        const win = signal_window;
+        const ys = allDates.map(d => sigMap.get(d) ?? 0);
+        const xs = allDates.map(d => mktMap.get(d) ?? 0);
+        signalByDate = new Map();
+        allDates.forEach((d, i) => {
+          if (i < win) { signalByDate.set(d, 0); return; }
+          const yw = ys.slice(i-win,i), xw = xs.slice(i-win,i);
+          const mx = xw.reduce((a,b)=>a+b,0)/win, my = yw.reduce((a,b)=>a+b,0)/win;
+          const beta = xw.reduce((a,b,j)=>a+(b-mx)*(yw[j]-my),0) / (xw.reduce((a,b)=>a+(b-mx)**2,0)||1e-9);
+          const alpha = my - beta*mx;
+          const resid = ys[i] - (alpha + beta*xs[i]);
+          const residStd = Math.sqrt(yw.reduce((a,b,j)=>a+(b-my)**2,0)/win)||1e-9;
+          signalByDate.set(d, resid / residStd);
+        });
+      }
+    } catch(e) { signalByDate = null; }
+  }
+
+  // ── Build equity curve ─────────────────────────────────────────
+  let equity = 100, peak = 100, maxDD = 0;
+  const equityCurve = [], drawdownCurve = [], dailyRets = [];
+  let inMarket = true; // for signal strategies
+
+  allDates.forEach((d, idx) => {
+    // Signal-based position sizing
+    if (signalByDate) {
+      const z = signalByDate.get(d) ?? 0;
+      if (strategy === "zscore_momentum") inMarket = z > signal_threshold;
+      if (strategy === "residuals_mean_reversion") inMarket = z < -signal_threshold; // buy when cheap
+    }
+
+    const rawRet = retsByDate[d].reduce((s, r, i) => s + w[i] * r, 0);
+    const portRet = inMarket ? rawRet : 0; // out of market = cash (0% return)
     equity *= (1 + portRet);
     if (equity > peak) peak = equity;
     const dd = (equity - peak) / peak * 100;
@@ -1381,7 +1431,7 @@ async function runBacktest(input) {
     dailyRets.push(portRet);
   });
 
-  // Metrics
+  // ── Metrics ───────────────────────────────────────────────────
   const totalRet = (equity / 100 - 1) * 100;
   const nYears   = allDates.length / 252;
   const annRet   = ((equity / 100) ** (1/nYears) - 1) * 100;
@@ -1400,19 +1450,16 @@ async function runBacktest(input) {
   return {
     label, symbols, weights: w, range, strategy,
     dates: allDates,
-    equityCurve,
-    drawdownCurve,
+    equityCurve, drawdownCurve,
     metrics: {
-      totalReturnPct:    +totalRet.toFixed(2),
-      annualizedRetPct:  +annRet.toFixed(2),
-      annualizedVolPct:  +annVol.toFixed(2),
-      maxDrawdownPct:    +maxDD.toFixed(2),
-      sharpe,
-      sortino,
-      calmar,
-      var95DailyPct:     var95,
-      nDays:             allDates.length,
-      nYears:            +nYears.toFixed(1),
+      totalReturnPct:   +totalRet.toFixed(2),
+      annualizedRetPct: +annRet.toFixed(2),
+      annualizedVolPct: +annVol.toFixed(2),
+      maxDrawdownPct:   +maxDD.toFixed(2),
+      sharpe, sortino, calmar,
+      var95DailyPct:    var95,
+      nDays:            allDates.length,
+      nYears:           +nYears.toFixed(1),
     },
   };
 }
@@ -1684,7 +1731,17 @@ const TOOLS = [
   { name: "compute_analytics", description: "Compute quant analytics: returns, return distribution, historical VaR 95/99, CVaR 95/99, skewness, kurtosis, rolling VaR, Z-score, rolling Sharpe, rolling vol, beta, correlation and drawdown. Returns series data + chart tags. Use for ANY quant, risk, distribution, VaR/CVaR, skew/kurtosis, or chart request.", input_schema: { type: "object", properties: { symbol: { type: "string" }, range: { type: "string", description: "1mo,3mo,6mo,1y,2y,5y,ytd" }, benchmark: { type: "string", description: "Default ^GSPC" }, rolling_window: { type: "number", description: "Default 30" }, bins: { type: "number", description: "Histogram bins for return distribution, default 20" } }, required: ["symbol"] } },
   { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
   { name: "get_market_news", description: "Get current market news headlines from finance RSS feeds. Use for morning, midday, end-of-day briefs and any latest-news request.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, limit: { type: "number" } }, required: [] } },
-  { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } }
+  { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
+  { name: "run_backtest", description: "Run a portfolio backtest server-side. Returns equity curve, drawdown and full performance metrics. ALWAYS default to range=5y. For the user's portfolio always use: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.", input_schema: { type: "object", properties: {
+    symbols:          { type: "array", items: { type: "string" }, description: "Yahoo Finance symbols to backtest" },
+    weights:          { type: "array", items: { type: "number" }, description: "Weights summing to 1. Omit for equal weight." },
+    range:            { type: "string", description: "ALWAYS 5y unless user says otherwise. Options: 1y 2y 5y 10y max." },
+    strategy:         { type: "string", description: "buy_hold | monthly_rebalance | zscore_momentum | residuals_mean_reversion" },
+    signal_symbol:    { type: "string", description: "Symbol to compute signal on (for zscore/residual strategies)" },
+    signal_window:    { type: "number", description: "Rolling window days for signal. Default 30." },
+    signal_threshold: { type: "number", description: "Signal threshold to enter/exit. Default 1.0." },
+    label:            { type: "string", description: "Label for this backtest" }
+  }, required: ["symbols"] } }
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
@@ -1712,8 +1769,10 @@ Always use combined portfolio percentages, not per-account NAV%. Format matrices
 Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.
 
 BACKTEST RULES:
-- When asked for a backtest, simulation, or quantitative analysis, ALWAYS call run_backtest immediately. Never ask for confirmation. Use the Yahoo Finance symbols listed above.
-- Default: backtest the full portfolio (CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L) with equal weights over 5y unless specified otherwise.
+- When asked for a backtest, ALWAYS call run_backtest immediately. Never ask for confirmation.
+- ALWAYS use range=5y unless the user explicitly says otherwise.
+- For the user's portfolio always pass ALL 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
+- Strategies: buy_hold (default), monthly_rebalance, zscore_momentum (buy when z-score > threshold), residuals_mean_reversion (buy when regression residual < -threshold = asset cheap vs market).
 - After run_backtest returns, embed @@BACKTEST:1@@ in your reply to render the chart inline.`;
 
 async function runAgent(prompt, history = []) {

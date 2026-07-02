@@ -1328,141 +1328,338 @@ async function convertReturnsToEUR(series, currency, range = "1y") {
 }
 
 
-// ─── Server-side backtest engine ──────────────────────────────────
+
+// ═══════════════════════════════════════════════════════════════════
+// SIGNAL LIBRARY — primitives Claude can compose freely
+// All functions operate on arrays of numbers (returns or prices)
+// ═══════════════════════════════════════════════════════════════════
+const SIG = {
+  // Rolling z-score of a series
+  zscore: (arr, win) => arr.map((v,i) => {
+    if (i < win) return 0;
+    const sl = arr.slice(i-win, i);
+    const mu = sl.reduce((a,b)=>a+b,0)/win;
+    const sd = Math.sqrt(sl.reduce((a,b)=>a+(b-mu)**2,0)/win) || 1e-9;
+    return (v - mu) / sd;
+  }),
+
+  // n-day momentum (price return over window)
+  momentum: (prices, win) => prices.map((v,i) =>
+    i < win ? 0 : (v - prices[i-win]) / prices[i-win]
+  ),
+
+  // RSI (14-period typical)
+  rsi: (prices, win=14) => {
+    const out = new Array(prices.length).fill(50);
+    for (let i = win; i < prices.length; i++) {
+      const chgs = prices.slice(i-win+1, i+1).map((p,j,a) => j===0?0:p-a[j-1]);
+      const gains = chgs.map(c=>c>0?c:0), losses = chgs.map(c=>c<0?-c:0);
+      const ag = gains.reduce((a,b)=>a+b,0)/win;
+      const al = losses.reduce((a,b)=>a+b,0)/win;
+      out[i] = al===0 ? 100 : 100 - 100/(1+ag/al);
+    }
+    return out;
+  },
+
+  // Bollinger Band %B position (0=lower band, 0.5=mid, 1=upper band)
+  bb_pct: (prices, win=20, nstd=2) => prices.map((v,i) => {
+    if (i < win) return 0.5;
+    const sl = prices.slice(i-win, i);
+    const mu = sl.reduce((a,b)=>a+b,0)/win;
+    const sd = Math.sqrt(sl.reduce((a,b)=>a+(b-mu)**2,0)/win) || 1e-9;
+    return (v - (mu - nstd*sd)) / (2*nstd*sd);
+  }),
+
+  // Rolling correlation between two arrays
+  corr: (a, b, win) => a.map((v,i) => {
+    if (i < win) return 0;
+    const as = a.slice(i-win,i), bs = b.slice(i-win,i);
+    const ma = as.reduce((x,y)=>x+y,0)/win, mb = bs.reduce((x,y)=>x+y,0)/win;
+    const cov  = as.reduce((s,x,j)=>s+(x-ma)*(bs[j]-mb),0)/win;
+    const sdA  = Math.sqrt(as.reduce((s,x)=>s+(x-ma)**2,0)/win)||1e-9;
+    const sdB  = Math.sqrt(bs.reduce((s,x)=>s+(x-mb)**2,0)/win)||1e-9;
+    return cov/(sdA*sdB);
+  }),
+
+  // Short/long vol ratio — >1 means vol is expanding (risk-off)
+  vol_ratio: (rets, short=10, long=60) => rets.map((v,i) => {
+    if (i < long) return 1;
+    const shortRets = rets.slice(i-short, i);
+    const longRets  = rets.slice(i-long,  i);
+    const sdS = Math.sqrt(shortRets.reduce((a,b)=>a+b*b,0)/short);
+    const sdL = Math.sqrt(longRets .reduce((a,b)=>a+b*b,0)/long);
+    return sdL===0 ? 1 : sdS/sdL;
+  }),
+
+  // Rolling drawdown from peak (negative number, 0=at peak)
+  drawdown: (prices, win) => prices.map((v,i) => {
+    const sl = prices.slice(Math.max(0,i-(win||i+1)), i+1);
+    const peak = Math.max(...sl);
+    return (v - peak) / peak;
+  }),
+
+  // VaR breach: 1 if today's return worse than rolling VaR, 0 otherwise
+  var_breach: (rets, win=60, pct=0.05) => rets.map((v,i) => {
+    if (i < win) return 0;
+    const sl = [...rets.slice(i-win,i)].sort((a,b)=>a-b);
+    const threshold = sl[Math.floor(win*pct)];
+    return v < threshold ? -1 : 0; // -1 on breach
+  }),
+
+  // Price spread between two assets (a - b, normalised by b)
+  spread: (pricesA, pricesB) => pricesA.map((v,i) =>
+    pricesB[i]===0 ? 0 : (v - pricesB[i]) / pricesB[i]
+  ),
+
+  // Z-score of spread — for pairs / mean-reversion
+  zscore_spread: (pricesA, pricesB, win=30) => {
+    const sp = pricesA.map((v,i) => pricesB[i]===0?0:(v-pricesB[i])/pricesB[i]);
+    return SIG.zscore(sp, win);
+  },
+
+  // Regime filter: mask signal to 0 when regime_signal < threshold
+  regime_filter: (signal, regime_signal, threshold=0) =>
+    signal.map((v,i) => regime_signal[i] >= threshold ? v : 0),
+
+  // Normalise any series to [-1, +1] range over a rolling window
+  normalise: (arr, win=60) => arr.map((v,i) => {
+    if (i < win) return 0;
+    const sl = arr.slice(i-win,i);
+    const min = Math.min(...sl), max = Math.max(...sl);
+    return max===min ? 0 : 2*(v-min)/(max-min)-1;
+  }),
+
+  // EMA
+  ema: (arr, win) => {
+    const k = 2/(win+1);
+    const out = [...arr];
+    for (let i=1;i<arr.length;i++) out[i] = arr[i]*k + out[i-1]*(1-k);
+    return out;
+  },
+
+  // MACD-style: EMA(short) - EMA(long), normalised
+  macd: (prices, short=12, long=26) => {
+    const es = SIG.ema(prices, short), el = SIG.ema(prices, long);
+    const raw = prices.map((_,i)=>es[i]-el[i]);
+    return SIG.zscore(raw, long);
+  },
+};
+
+// Fetch price array for a symbol aligned to a date array
+async function fetchAlignedPrices(sym, allDates, range) {
+  try {
+    const raw = await fetchYahooCloses(yfSymbol(sym), range);
+    const byDate = new Map(raw.bars.map(b=>[b.date, b.close]));
+    // Forward-fill
+    let last = null;
+    return allDates.map(d => { if (byDate.has(d)) last=byDate.get(d); return last??0; });
+  } catch(e) { return new Array(allDates.length).fill(0); }
+}
+
+async function fetchAlignedReturns(sym, allDates, range) {
+  try {
+    const s = await fetchYahooReturnSeries(yfSymbol(sym), range, true);
+    const byDate = new Map(s.map(r=>[r.date, r.ret]));
+    let started=false;
+    return allDates.map(d => {
+      if (byDate.has(d)) { started=true; return byDate.get(d); }
+      return started ? 0 : 0;
+    });
+  } catch(e) { return new Array(allDates.length).fill(0); }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// BACKTEST ENGINE v3 — composable signal primitives
+// ═══════════════════════════════════════════════════════════════════
 async function runBacktest(input) {
   const {
-    symbols, weights, range = "5y", strategy = "buy_hold", label = "Portfolio",
-    signal_symbol, signal_window = 30, signal_threshold = 1.0,
+    symbols, weights, range = "5y",
+    // Signal specification — Claude composes these
+    signal_type = "buy_hold",      // primitive name from SIG object, or "buy_hold" / "composite"
+    signal_params = {},            // { symbol, symbol2, window, window2, nstd, pct, short, long }
+    signal_direction = "momentum", // momentum | mean_reversion
+    entry_threshold = 1.0,
+    exit_threshold  = 0.0,
+    // Optional: second signal as regime filter
+    regime_signal_type = null,
+    regime_signal_params = {},
+    regime_threshold = 0.0,
+    label = "Backtest",
   } = input;
+
   if (!symbols?.length) return { error: "symbols required" };
 
-  // Fetch EUR-converted return series for each symbol
+  // ── Fetch portfolio returns ────────────────────────────────────
   const seriesArr = await Promise.all(symbols.map(async sym => {
     try {
-      const s = await fetchYahooReturnSeries(sym, range, true);
+      const s = await fetchYahooReturnSeries(yfSymbol(sym), range, true);
       return { sym, series: s };
     } catch(e) { return { sym, series: [] }; }
   }));
 
-  // Align on union of dates, forward-fill with 0%
-  const allDates = [...new Set(seriesArr.flatMap(x => x.series.map(r => r.date)))].sort();
-  if (allDates.length < 20) return { error: "Not enough data" };
+  const allDates = [...new Set(seriesArr.flatMap(x=>x.series.map(r=>r.date)))].sort();
+  if (allDates.length < 60) return { error: `Not enough data (${allDates.length} days)` };
 
   const n = symbols.length;
-  const w = weights && weights.length === n
-    ? weights.map(v => v / weights.reduce((a,b) => a+b, 0))
-    : symbols.map(() => 1/n);
+  const w = (weights?.length===n)
+    ? weights.map(v=>v/weights.reduce((a,b)=>a+b,0))
+    : symbols.map(()=>1/n);
 
-  const retsByDate = {};
-  allDates.forEach(d => { retsByDate[d] = new Array(n).fill(0); });
-  seriesArr.forEach(({ series }, i) => {
-    const byDate = new Map(series.map(r => [r.date, r.ret]));
+  // Portfolio daily returns
+  const retMatrix = seriesArr.map(({series})=>{
+    const byDate = new Map(series.map(r=>[r.date,r.ret]));
     let started = false;
-    allDates.forEach(d => {
-      if (byDate.has(d)) { started = true; }
-      if (started) retsByDate[d][i] = byDate.get(d) ?? 0;
-    });
+    return allDates.map(d=>{ if(byDate.has(d))started=true; return started?(byDate.get(d)??0):0; });
   });
+  const portRets = allDates.map((_,t)=>retMatrix.reduce((s,row,i)=>s+w[i]*row[t],0));
 
-  // ── Signal series for signal-based strategies ──────────────────
-  // Z-score: rolling z-score of price returns on signal_symbol
-  // Residuals: rolling OLS residual of signal_symbol vs market (URTH)
-  let signalByDate = null;
-  if ((strategy === "zscore_momentum" || strategy === "residuals_mean_reversion") && signal_symbol) {
-    try {
-      const sigSeries = await fetchYahooReturnSeries(signal_symbol, range, true);
-      const sigMap = new Map(sigSeries.map(r => [r.date, r.ret]));
+  // ── Compute primary signal ─────────────────────────────────────
+  let signalArr = new Array(allDates.length).fill(1); // default: buy_hold
 
-      if (strategy === "zscore_momentum") {
-        // Rolling z-score: buy when z > threshold (momentum), neutral otherwise
-        const win = signal_window;
-        const vals = allDates.map(d => sigMap.get(d) ?? 0);
-        signalByDate = new Map();
-        allDates.forEach((d, i) => {
-          if (i < win) { signalByDate.set(d, 0); return; }
-          const slice = vals.slice(i - win, i);
-          const mu = slice.reduce((a,b) => a+b, 0) / win;
-          const sigma = Math.sqrt(slice.reduce((a,b) => a+(b-mu)**2, 0) / win) || 1e-9;
-          signalByDate.set(d, (vals[i] - mu) / sigma);
-        });
-      } else {
-        // Residuals mean-reversion: fetch URTH as market factor, compute rolling OLS residual
-        const mktSeries = await fetchYahooReturnSeries("URTH", range, false);
-        const mktMap = new Map(mktSeries.map(r => [r.date, r.ret]));
-        const win = signal_window;
-        const ys = allDates.map(d => sigMap.get(d) ?? 0);
-        const xs = allDates.map(d => mktMap.get(d) ?? 0);
-        signalByDate = new Map();
-        allDates.forEach((d, i) => {
-          if (i < win) { signalByDate.set(d, 0); return; }
-          const yw = ys.slice(i-win,i), xw = xs.slice(i-win,i);
-          const mx = xw.reduce((a,b)=>a+b,0)/win, my = yw.reduce((a,b)=>a+b,0)/win;
-          const beta = xw.reduce((a,b,j)=>a+(b-mx)*(yw[j]-my),0) / (xw.reduce((a,b)=>a+(b-mx)**2,0)||1e-9);
-          const alpha = my - beta*mx;
-          const resid = ys[i] - (alpha + beta*xs[i]);
-          const residStd = Math.sqrt(yw.reduce((a,b,j)=>a+(b-my)**2,0)/win)||1e-9;
-          signalByDate.set(d, resid / residStd);
-        });
-      }
-    } catch(e) { signalByDate = null; }
-  }
+  if (signal_type !== "buy_hold") {
+    const sp = signal_params;
+    const sigSym  = sp.symbol  || symbols[0];
+    const sigSym2 = sp.symbol2 || null;
+    const win     = sp.window  || 30;
+    const win2    = sp.window2 || 60;
 
-  // ── Build equity curve ─────────────────────────────────────────
-  let equity = 100, peak = 100, maxDD = 0;
-  const equityCurve = [], drawdownCurve = [], dailyRets = [];
-  let inMarket = true; // for signal strategies
+    // Fetch signal asset data
+    const sigPrices = await fetchAlignedPrices(sigSym, allDates, range);
+    const sigRets   = await fetchAlignedReturns(sigSym, allDates, range);
+    let sig2Prices  = sigSym2 ? await fetchAlignedPrices(sigSym2, allDates, range) : null;
 
-  allDates.forEach((d, idx) => {
-    // Signal-based position sizing
-    if (signalByDate) {
-      const z = signalByDate.get(d) ?? 0;
-      if (strategy === "zscore_momentum") inMarket = z > signal_threshold;
-      if (strategy === "residuals_mean_reversion") inMarket = z < -signal_threshold; // buy when cheap
+    switch(signal_type) {
+      case "zscore":      signalArr = SIG.zscore(sigRets, win); break;
+      case "momentum":    signalArr = SIG.momentum(sigPrices, win); break;
+      case "rsi":         signalArr = SIG.rsi(sigPrices, win); break;
+      case "bb_pct":      signalArr = SIG.bb_pct(sigPrices, win, sp.nstd||2).map(v=>v-0.5); break; // centre at 0
+      case "corr":
+        const corSym = sp.symbol2||"^GSPC";
+        const corRets = await fetchAlignedReturns(corSym, allDates, range);
+        signalArr = SIG.corr(sigRets, corRets, win); break;
+      case "vol_ratio":   signalArr = SIG.vol_ratio(sigRets, win, win2).map(v=>v-1); break; // centre at 0
+      case "drawdown":    signalArr = SIG.drawdown(sigPrices, win).map(v=>v*10); break; // scale for threshold
+      case "var_breach":  signalArr = SIG.var_breach(sigRets, win, sp.pct||0.05); break;
+      case "spread":      if(sig2Prices) signalArr = SIG.zscore(SIG.spread(sigPrices,sig2Prices),win); break;
+      case "zscore_spread": if(sig2Prices) signalArr = SIG.zscore_spread(sigPrices,sig2Prices,win); break;
+      case "macd":        signalArr = SIG.macd(sigPrices, win, win2); break;
+      case "vol_zscore":  signalArr = SIG.zscore(sigRets.map(r=>r*r), win); break; // z-score of variance
+      case "port_zscore": signalArr = SIG.zscore(portRets, win); break; // z-score of portfolio's own returns
+      case "port_momentum":signalArr = SIG.momentum(portRets.reduce((a,r,i)=>{a.push((a[a.length-1]||100)*(1+r));return a;},[100]).slice(1), win); break;
+      default: signalArr = SIG.zscore(sigRets, win);
     }
 
-    const rawRet = retsByDate[d].reduce((s, r, i) => s + w[i] * r, 0);
-    const portRet = inMarket ? rawRet : 0; // out of market = cash (0% return)
-    equity *= (1 + portRet);
-    if (equity > peak) peak = equity;
-    const dd = (equity - peak) / peak * 100;
-    if (dd < maxDD) maxDD = dd;
-    equityCurve.push({ date: d, value: +equity.toFixed(4) });
-    drawdownCurve.push({ date: d, value: +dd.toFixed(4) });
-    dailyRets.push(portRet);
+    // Optional regime filter
+    if (regime_signal_type) {
+      const rsp = regime_signal_params;
+      const rSym = rsp.symbol || sigSym;
+      const rPrices = await fetchAlignedPrices(rSym, allDates, range);
+      const rRets   = await fetchAlignedReturns(rSym, allDates, range);
+      let regimeArr;
+      switch(regime_signal_type) {
+        case "zscore":   regimeArr = SIG.zscore(rRets, rsp.window||60); break;
+        case "vol_ratio":regimeArr = SIG.vol_ratio(rRets, rsp.window||10, rsp.window2||60).map(v=>1-v); break; // invert: low vol = good regime
+        case "momentum": regimeArr = SIG.momentum(rPrices, rsp.window||60); break;
+        case "rsi":      regimeArr = SIG.rsi(rPrices, rsp.window||14).map(v=>(v-50)/50); break;
+        default:         regimeArr = SIG.zscore(rRets, rsp.window||60);
+      }
+      signalArr = SIG.regime_filter(signalArr, regimeArr, regime_threshold);
+    }
+  }
+
+  // ── Generate positions from signal ─────────────────────────────
+  let pos = 0;
+  const positions = allDates.map((d,i) => {
+    if (signal_type === "buy_hold") return 1;
+    const sig = signalArr[i]??0;
+    if (pos===0) {
+      if (signal_direction==="momentum"       && sig >  entry_threshold) pos=1;
+      if (signal_direction==="mean_reversion" && sig < -entry_threshold) pos=1;
+    } else {
+      if (signal_direction==="momentum"       && sig <= exit_threshold) pos=0;
+      if (signal_direction==="mean_reversion" && sig >= exit_threshold) pos=0;
+    }
+    return pos;
+  });
+
+  // ── Trade log ─────────────────────────────────────────────────
+  const trades = [];
+  let tEntry = null, tRets = [];
+  positions.forEach((p,i) => {
+    const prev = i>0?positions[i-1]:0;
+    if (p===1&&prev===0) { tEntry=allDates[i]; tRets=[]; }
+    if (p===1) tRets.push(portRets[i]);
+    if (p===0&&prev===1&&tEntry) {
+      const r = tRets.reduce((a,b)=>a*(1+b),1)-1;
+      trades.push({entryDate:tEntry,exitDate:allDates[i],durationDays:tRets.length,returnPct:+(r*100).toFixed(3),profitable:r>0});
+      tEntry=null; tRets=[];
+    }
+  });
+  if (tEntry) {
+    const r = tRets.reduce((a,b)=>a*(1+b),1)-1;
+    trades.push({entryDate:tEntry,exitDate:allDates[allDates.length-1],durationDays:tRets.length,returnPct:+(r*100).toFixed(3),profitable:r>0,open:true});
+  }
+
+  // ── Equity curve ──────────────────────────────────────────────
+  let eq=100, peak=100, maxDD=0;
+  const equityCurve=[], drawdownCurve=[], dailyRets=[];
+  allDates.forEach((d,i)=>{
+    const ret = positions[i]*portRets[i];
+    eq*=(1+ret);
+    if(eq>peak)peak=eq;
+    const dd=(eq-peak)/peak*100;
+    if(dd<maxDD)maxDD=dd;
+    equityCurve.push({date:d,value:+eq.toFixed(4)});
+    drawdownCurve.push({date:d,value:+dd.toFixed(4)});
+    dailyRets.push(ret);
   });
 
   // ── Metrics ───────────────────────────────────────────────────
-  const totalRet = (equity / 100 - 1) * 100;
-  const nYears   = allDates.length / 252;
-  const annRet   = ((equity / 100) ** (1/nYears) - 1) * 100;
-  const meanRet  = dailyRets.reduce((a,b) => a+b, 0) / dailyRets.length;
-  const variance = dailyRets.reduce((a,b) => a + (b-meanRet)**2, 0) / dailyRets.length;
-  const annVol   = Math.sqrt(variance) * Math.sqrt(252) * 100;
-  const RF       = RISK_FREE_RATE_PCT / 100;
-  const sharpe   = annVol === 0 ? 0 : +((annRet/100 - RF) / (annVol/100)).toFixed(3);
-  const negRets  = dailyRets.filter(r => r < 0);
-  const downVol  = negRets.length ? Math.sqrt(negRets.reduce((a,b) => a+b*b, 0)/negRets.length) * Math.sqrt(252) * 100 : 0;
-  const sortino  = downVol === 0 ? 0 : +((annRet/100 - RF) / (downVol/100)).toFixed(3);
-  const calmar   = maxDD === 0 ? 0 : +(annRet / Math.abs(maxDD)).toFixed(3);
-  const sorted   = [...dailyRets].sort((a,b) => a-b);
-  const var95    = +(sorted[Math.floor(sorted.length * 0.05)] * 100).toFixed(3);
+  const nT=trades.length, prof=trades.filter(t=>t.profitable), loss=trades.filter(t=>!t.profitable);
+  const EV = nT?trades.reduce((a,t)=>a+t.returnPct,0)/nT:0;
+  const winR= nT?prof.length/nT:0;
+  const avgW= prof.length?prof.reduce((a,t)=>a+t.returnPct,0)/prof.length:0;
+  const avgL= loss.length?loss.reduce((a,t)=>a+t.returnPct,0)/loss.length:0;
+  const retStd=nT?Math.sqrt(trades.reduce((a,t)=>a+(t.returnPct-EV)**2,0)/nT):0;
+  const avgDur=nT?trades.reduce((a,t)=>a+t.durationDays,0)/nT:0;
+  const totalRet=(eq/100-1)*100, nYears=allDates.length/252;
+  const annRet=((eq/100)**(1/nYears)-1)*100;
+  const meanR=dailyRets.reduce((a,b)=>a+b,0)/dailyRets.length;
+  const annVol=Math.sqrt(dailyRets.reduce((a,b)=>a+(b-meanR)**2,0)/dailyRets.length)*Math.sqrt(252)*100;
+  const RF=RISK_FREE_RATE_PCT/100;
+  const sharpe=annVol===0?0:+((annRet/100-RF)/(annVol/100)).toFixed(3);
+  const negR=dailyRets.filter(r=>r<0);
+  const downVol=negR.length?Math.sqrt(negR.reduce((a,b)=>a+b*b,0)/negR.length)*Math.sqrt(252)*100:0;
+  const sortino=downVol===0?0:+((annRet/100-RF)/(downVol/100)).toFixed(3);
+  const calmar=maxDD===0?0:+(annRet/Math.abs(maxDD)).toFixed(3);
+  const sorted=[...dailyRets].sort((a,b)=>a-b);
+  const var95=+(sorted[Math.floor(sorted.length*0.05)]*100).toFixed(3);
+  const pctInMkt=+(positions.filter(p=>p===1).length/positions.length*100).toFixed(1);
 
   return {
-    label, symbols, weights: w, range, strategy,
-    dates: allDates,
+    label, symbols, weights:w, range,
+    signal_type, signal_params, signal_direction,
+    entry_threshold, exit_threshold,
+    regime_signal_type, regime_signal_params, regime_threshold,
+    dates:allDates,
     equityCurve, drawdownCurve,
-    metrics: {
-      totalReturnPct:   +totalRet.toFixed(2),
-      annualizedRetPct: +annRet.toFixed(2),
-      annualizedVolPct: +annVol.toFixed(2),
-      maxDrawdownPct:   +maxDD.toFixed(2),
-      sharpe, sortino, calmar,
-      var95DailyPct:    var95,
-      nDays:            allDates.length,
-      nYears:           +nYears.toFixed(1),
+    signalSeries:signalArr.map(v=>+v.toFixed(4)),
+    trades:trades.slice(0,500),
+    metrics:{
+      totalReturnPct:+totalRet.toFixed(2), annualizedRetPct:+annRet.toFixed(2),
+      annualizedVolPct:+annVol.toFixed(2), maxDrawdownPct:+maxDD.toFixed(2),
+      sharpe, sortino, calmar, var95DailyPct:var95,
+      nDays:allDates.length, nYears:+nYears.toFixed(1), pctTimeInMarket:pctInMkt,
+      nTrades:nT, nProfitable:prof.length, nLosing:loss.length,
+      winRatePct:+(winR*100).toFixed(1),
+      evPerTradePct:+EV.toFixed(3), condEvWinPct:+avgW.toFixed(3), condEvLossPct:+avgL.toFixed(3),
+      tradeRetStdPct:+retStd.toFixed(3), avgDurationDays:+avgDur.toFixed(1),
+      profitFactor:avgL===0?null:+Math.abs(avgW/avgL).toFixed(2),
     },
   };
 }
+
 
 // ── Send push notification ────────────────────────────────────────
 async function sendPush(title, body, icon = "📊") {
@@ -1732,16 +1929,28 @@ const TOOLS = [
   { name: "compute_correlation_matrix", description: "Pairwise correlation matrix for multiple symbols.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, range: { type: "string" } }, required: ["symbols"] } },
   { name: "get_market_news", description: "Get current market news headlines from finance RSS feeds. Use for morning, midday, end-of-day briefs and any latest-news request.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, limit: { type: "number" } }, required: [] } },
   { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
-  { name: "run_backtest", description: "Run a portfolio backtest server-side. Returns equity curve, drawdown and full performance metrics. ALWAYS default to range=5y. For the user's portfolio always use: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.", input_schema: { type: "object", properties: {
-    symbols:          { type: "array", items: { type: "string" }, description: "Yahoo Finance symbols to backtest" },
-    weights:          { type: "array", items: { type: "number" }, description: "Weights summing to 1. Omit for equal weight." },
-    range:            { type: "string", description: "ALWAYS 5y unless user says otherwise. Options: 1y 2y 5y 10y max." },
-    strategy:         { type: "string", description: "buy_hold | monthly_rebalance | zscore_momentum | residuals_mean_reversion" },
-    signal_symbol:    { type: "string", description: "Symbol to compute signal on (for zscore/residual strategies)" },
-    signal_window:    { type: "number", description: "Rolling window days for signal. Default 30." },
-    signal_threshold: { type: "number", description: "Signal threshold to enter/exit. Default 1.0." },
-    label:            { type: "string", description: "Label for this backtest" }
-  }, required: ["symbols"] } }
+  {
+    name: "run_backtest",
+    description: "Run a signal-based backtest. ALWAYS call immediately when asked — never ask for confirmation. ALWAYS use range=5y unless user specifies. For 'my portfolio' use all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L. Available signal_type values: buy_hold | zscore | momentum | rsi | bb_pct | corr | vol_ratio | drawdown | var_breach | spread | zscore_spread | macd | vol_zscore | port_zscore | port_momentum. Can add a regime_signal_type to filter trades to specific market conditions.",
+    input_schema: {
+      type: "object",
+      properties: {
+        symbols:              { type: "array", items: { type: "string" }, description: "Yahoo Finance symbols for the portfolio to trade." },
+        weights:              { type: "array", items: { type: "number" }, description: "Weights summing to 1. Omit for equal weight." },
+        range:                { type: "string", description: "ALWAYS 5y unless user says otherwise. Options: 1y 2y 5y 10y max." },
+        label:                { type: "string", description: "Human-readable strategy name." },
+        signal_type:          { type: "string", description: "Signal primitive: buy_hold | zscore (z-score of returns) | momentum (n-day price return) | rsi | bb_pct (Bollinger %B) | corr (rolling correlation with another asset) | vol_ratio (short/long vol ratio) | drawdown (rolling drawdown from peak) | var_breach (VaR breach flag) | spread (price spread vs another asset) | zscore_spread (z-score of spread) | macd | vol_zscore (z-score of variance) | port_zscore (z-score of portfolio's own returns) | port_momentum." },
+        signal_params:        { type: "object", description: "Signal parameters: { symbol: 'asset for signal e.g. CSPX.L or ^VIX', symbol2: 'second asset for corr/spread', window: 30, window2: 60, nstd: 2, pct: 0.05 }." },
+        signal_direction:     { type: "string", description: "momentum (long when signal > threshold) or mean_reversion (long when signal < -threshold). Default momentum." },
+        entry_threshold:      { type: "number", description: "Signal threshold to enter. Default 1.0 for z-score based, 70 for RSI, 0.3 for bb_pct." },
+        exit_threshold:       { type: "number", description: "Signal threshold to exit. Default 0." },
+        regime_signal_type:   { type: "string", description: "Optional regime filter — same signal_type options. E.g. vol_ratio to only trade in low-vol regimes, or momentum on ^GSPC to only trade in bull markets." },
+        regime_signal_params: { type: "object", description: "Params for regime filter (same structure as signal_params)." },
+        regime_threshold:     { type: "number", description: "Regime signal must be above this to allow trading. Default 0." }
+      },
+      required: ["symbols"]
+    }
+  }
 ];
 
 const SYSTEM = `You are a professional finance AI agent managing TWO Interactive Brokers accounts:
@@ -1768,12 +1977,13 @@ Always use combined portfolio percentages, not per-account NAV%. Format matrices
 1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
 Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.
 
-BACKTEST RULES:
-- When asked for a backtest, ALWAYS call run_backtest immediately. Never ask for confirmation.
-- ALWAYS use range=5y unless the user explicitly says otherwise.
-- For the user's portfolio always pass ALL 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
-- Strategies: buy_hold (default), monthly_rebalance, zscore_momentum (buy when z-score > threshold), residuals_mean_reversion (buy when regression residual < -threshold = asset cheap vs market).
-- After run_backtest returns, embed @@BACKTEST:1@@ in your reply to render the chart inline.`;
+BACKTEST RULES — follow strictly:
+- When asked for any backtest or strategy analysis, call run_backtest IMMEDIATELY. Never ask for confirmation.
+- ALWAYS use range=5y unless user specifies otherwise.
+- For "my portfolio" always pass all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
+- Signals available: zscore (z-score of rolling returns), var (rolling historical VaR breach), level (price vs rolling mean), crossasset_corr (rolling correlation vs signal_symbol), buy_hold.
+- After results return, present key metrics in a table and mention the email export button.
+`;
 
 async function runAgent(prompt, history = []) {
   const messages = [...history, { role: "user", content: prompt }];
@@ -1787,7 +1997,7 @@ async function runAgent(prompt, history = []) {
     const toolResults = await Promise.all(toolBlocks.map(async b => {
       let result;
       try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
-      if (b.name === "run_backtest" && result && result.equityCurve) backtestData = result;
+      if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
       return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
     }));
     loop.push({ role: "user", content: toolResults });
@@ -1992,42 +2202,67 @@ app.get("/api/debug/fx/:symbol", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
 });
 
-// ── Yahoo Finance proxy for Pyodide (browser can't call Yahoo directly due to CORS) ──
-// Supports any range Yahoo supports: 1mo, 3mo, 6mo, 1y, 2y, 5y, 10y, max
-app.get("/api/proxy/yahoo", async (req, res) => {
-  const { symbol, range = "1y", interval = "1d" } = req.query;
-  if (!symbol) return res.status(400).json({ error: "symbol required" });
-  try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval}&range=${range}`;
-    const r   = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
-    const data = await r.json();
-    const result = data?.chart?.result?.[0];
-    if (!result) return res.status(404).json({ error: "No data", symbol, range });
+// ── Backtest API endpoints ────────────────────────────────────────
+// Direct backtest (called from chat tool)
+app.post("/api/backtest", async (req, res) => {
+  try { res.json(await runBacktest(req.body)); }
+  catch(e) { res.status(500).json({ error: e.message }); }
+});
 
-    const timestamps = result.timestamps || result.timestamp || [];
-    const q = result.indicators?.quote?.[0] || {};
-    const adjClose = result.indicators?.adjclose?.[0]?.adjclose || q.close;
+// Email backtest results (strategy spec + key metrics) to user
+app.post("/api/backtest/email", async (req, res) => {
+  const { backtestResult } = req.body;
+  if (!backtestResult) return res.status(400).json({ error: "backtestResult required" });
+  const m = backtestResult.metrics || {};
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7;padding:24px">
+<h2 style="color:#C9A84C">📊 Backtest: ${backtestResult.label||"Strategy"}</h2>
+<p style="color:#5A6280">Exported from IBKR Agent · ${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>
 
-    const rows = timestamps.map((t, i) => ({
-      Date:   new Date(t * 1000).toISOString().slice(0, 10),
-      Open:   q.open?.[i]  ?? null,
-      High:   q.high?.[i]  ?? null,
-      Low:    q.low?.[i]   ?? null,
-      Close:  adjClose?.[i] ?? q.close?.[i] ?? null,
-      Volume: q.volume?.[i] ?? null,
-    })).filter(r => r.Close !== null);
+<h3 style="color:#E8C87A">Strategy Parameters</h3>
+<pre style="background:#13161E;padding:14px;border-radius:8px;font-size:12px;color:#EDF0F7">${JSON.stringify({
+  symbols: backtestResult.symbols,
+  weights: backtestResult.weights?.map(w=>+w.toFixed(3)),
+  range:   backtestResult.range,
+  signal:  backtestResult.signal,
+  signal_symbol: backtestResult.signal_symbol,
+  signal_window: backtestResult.signal_window,
+  entry_threshold: backtestResult.entry_threshold,
+  exit_threshold:  backtestResult.exit_threshold,
+  direction:       backtestResult.direction,
+}, null, 2)}</pre>
 
-    res.json({
-      symbol,
-      range,
-      interval,
-      currency: result.meta?.currency,
-      rows,
-      count: rows.length,
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message, symbol });
-  }
+<h3 style="color:#E8C87A">Performance Metrics</h3>
+<table style="border-collapse:collapse;width:100%;max-width:500px">
+  ${[
+    ["Total Return",         `${m.totalReturnPct}%`],
+    ["Annualized Return",    `${m.annualizedRetPct}%`],
+    ["Annualized Vol",       `${m.annualizedVolPct}%`],
+    ["Max Drawdown",         `${m.maxDrawdownPct}%`],
+    ["Sharpe",               m.sharpe],
+    ["Sortino",              m.sortino],
+    ["Calmar",               m.calmar],
+    ["VaR 95% (daily)",      `${m.var95DailyPct}%`],
+    ["% Time in Market",     `${m.pctTimeInMarket}%`],
+    ["N Trades",             m.nTrades],
+    ["Win Rate",             `${m.winRatePct}%`],
+    ["EV per Trade",         `${m.evPerTradePct}%`],
+    ["Cond. EV (wins)",      `${m.condEvWinPct}%`],
+    ["Cond. EV (losses)",    `${m.condEvLossPct}%`],
+    ["Trade Return Std",     `${m.tradeRetStdPct}%`],
+    ["Avg Duration",         `${m.avgDurationDays} days`],
+    ["Profit Factor",        m.profitFactor??"-"],
+  ].map(([k,v])=>`<tr style="border-bottom:1px solid #252A38"><td style="padding:7px 12px 7px 0;color:#8A9AC0;font-size:13px">${k}</td><td style="padding:7px 0;font-family:monospace;font-size:13px;color:#EDF0F7">${v}</td></tr>`).join("")}
+</table>
+
+<h3 style="color:#E8C87A">Trade List (last 20)</h3>
+<pre style="background:#13161E;padding:14px;border-radius:8px;font-size:11px;color:#EDF0F7;overflow:auto">${JSON.stringify((backtestResult.trades||[]).slice(-20).map(t=>({
+  entry: t.entryDate, exit: t.exitDate, days: t.durationDays, ret: t.returnPct+"%", win: t.profitable
+})), null, 2)}</pre>
+</body></html>`;
+
+  const result = await sendEmail(REPORT_TO, `📊 Backtest Export: ${backtestResult.label||"Strategy"}`, html);
+  res.json(result);
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));

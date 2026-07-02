@@ -1475,13 +1475,23 @@ async function fetchAlignedReturns(sym, allDates, range) {
 async function runBacktest(input) {
   const {
     symbols, weights, range = "5y",
-    // Signal specification — Claude composes these
-    signal_type = "buy_hold",      // primitive name from SIG object, or "buy_hold" / "composite"
-    signal_params = {},            // { symbol, symbol2, window, window2, nstd, pct, short, long }
-    signal_direction = "momentum", // momentum | mean_reversion
+    // ── Entry signal ──
+    signal_type = "buy_hold",
+    signal_params = {},
+    signal_direction = "momentum",
     entry_threshold = 1.0,
+    // ── Exit signal (independent from entry) ──
+    // If exit_signal_type is null, exit uses entry signal with exit_threshold (default behaviour)
+    // If provided, exit is triggered by a completely separate signal
+    exit_signal_type = null,       // null | primitive name | "hold" | "time_stop" | "trailing_stop" | "target"
+    exit_signal_params = {},
+    exit_signal_direction = null,  // if null, inherits opposite of entry
     exit_threshold  = 0.0,
-    // Optional: second signal as regime filter
+    hold_days       = null,        // exit after N days regardless of signal
+    trailing_stop_pct = null,      // exit if drawdown from peak-since-entry exceeds this %
+    take_profit_pct = null,        // exit if trade return exceeds this %
+    stop_loss_pct   = null,        // exit if trade return below this %
+    // ── Regime filter ──
     regime_signal_type = null,
     regime_signal_params = {},
     regime_threshold = 0.0,
@@ -1568,17 +1578,98 @@ async function runBacktest(input) {
     }
   }
 
-  // ── Generate positions from signal ─────────────────────────────
+  // ── Compute optional independent EXIT signal ───────────────────
+  // If exit_signal_type provided, computes a separate signal series that triggers exit
+  let exitSignalArr = null;
+  if (exit_signal_type && exit_signal_type !== "hold" && exit_signal_type !== "buy_hold") {
+    const esp = exit_signal_params;
+    const eSym  = esp.symbol  || signal_params.symbol || symbols[0];
+    const eSym2 = esp.symbol2 || null;
+    const eWin  = esp.window  || 30;
+    const eWin2 = esp.window2 || 60;
+    const ePrices = await fetchAlignedPrices(eSym, allDates, range);
+    const eRets   = await fetchAlignedReturns(eSym, allDates, range);
+    const eP2     = eSym2 ? await fetchAlignedPrices(eSym2, allDates, range) : null;
+    switch(exit_signal_type) {
+      case "zscore":         exitSignalArr = SIG.zscore(eRets, eWin); break;
+      case "momentum":       exitSignalArr = SIG.momentum(ePrices, eWin); break;
+      case "rsi":            exitSignalArr = SIG.rsi(ePrices, eWin); break;
+      case "bb_pct":         exitSignalArr = SIG.bb_pct(ePrices, eWin, esp.nstd||2).map(v=>v-0.5); break;
+      case "corr": {
+        const cSym = esp.symbol2 || "^GSPC";
+        const cRets = await fetchAlignedReturns(cSym, allDates, range);
+        exitSignalArr = SIG.corr(eRets, cRets, eWin); break;
+      }
+      case "vol_ratio":      exitSignalArr = SIG.vol_ratio(eRets, eWin, eWin2).map(v=>v-1); break;
+      case "drawdown":       exitSignalArr = SIG.drawdown(ePrices, eWin).map(v=>v*10); break;
+      case "var_breach":     exitSignalArr = SIG.var_breach(eRets, eWin, esp.pct||0.05); break;
+      case "spread":         if(eP2) exitSignalArr = SIG.zscore(SIG.spread(ePrices,eP2),eWin); break;
+      case "zscore_spread":  if(eP2) exitSignalArr = SIG.zscore_spread(ePrices,eP2,eWin); break;
+      case "macd":           exitSignalArr = SIG.macd(ePrices, eWin, eWin2); break;
+      case "vol_zscore":     exitSignalArr = SIG.zscore(eRets.map(r=>r*r), eWin); break;
+      case "port_zscore":    exitSignalArr = SIG.zscore(portRets, eWin); break;
+      default:               exitSignalArr = SIG.zscore(eRets, eWin);
+    }
+  }
+
+  // ── Generate positions ─────────────────────────────────────────
   let pos = 0;
+  let entryIdx = -1;
+  let peakSinceEntry = 0;
   const positions = allDates.map((d,i) => {
     if (signal_type === "buy_hold") return 1;
     const sig = signalArr[i]??0;
-    if (pos===0) {
-      if (signal_direction==="momentum"       && sig >  entry_threshold) pos=1;
-      if (signal_direction==="mean_reversion" && sig < -entry_threshold) pos=1;
+
+    if (pos === 0) {
+      // ── ENTRY LOGIC ──
+      let enter = false;
+      if (signal_direction==="momentum"       && sig >  entry_threshold) enter = true;
+      if (signal_direction==="mean_reversion" && sig < -entry_threshold) enter = true;
+      if (enter) {
+        pos = 1;
+        entryIdx = i;
+        peakSinceEntry = 0;
+      }
     } else {
-      if (signal_direction==="momentum"       && sig <= exit_threshold) pos=0;
-      if (signal_direction==="mean_reversion" && sig >= exit_threshold) pos=0;
+      // ── EXIT LOGIC ──
+      // 1. Exit if independent exit signal fires
+      if (exit_signal_type === "hold") {
+        // "hold" means don't exit on signal — only exit on time_stop / trailing_stop / take_profit / stop_loss
+      } else if (exitSignalArr) {
+        // Use independent exit signal (default direction = opposite of entry unless overridden)
+        const eSig = exitSignalArr[i] ?? 0;
+        const eDir = exit_signal_direction
+          || (signal_direction === "momentum" ? "mean_reversion" : "momentum");
+        if (eDir === "momentum"       && eSig >  exit_threshold) pos = 0;
+        if (eDir === "mean_reversion" && eSig < -exit_threshold) pos = 0;
+      } else {
+        // Default: use entry signal reverting to exit_threshold
+        if (signal_direction==="momentum"       && sig <= exit_threshold) pos = 0;
+        if (signal_direction==="mean_reversion" && sig >= exit_threshold) pos = 0;
+      }
+
+      // 2. Time-based stop
+      if (pos === 1 && hold_days && entryIdx >= 0 && (i - entryIdx) >= hold_days) pos = 0;
+
+      // 3. Compute trade return since entry (using cumulative portRet)
+      if (pos === 1 && entryIdx >= 0) {
+        const tradeRet = portRets.slice(entryIdx+1, i+1).reduce((a,r)=>a*(1+r),1) - 1;
+        if (tradeRet > peakSinceEntry) peakSinceEntry = tradeRet;
+
+        // 4. Take profit
+        if (take_profit_pct != null && tradeRet >= take_profit_pct/100) pos = 0;
+
+        // 5. Stop loss
+        if (stop_loss_pct != null && tradeRet <= stop_loss_pct/100) pos = 0;
+
+        // 6. Trailing stop (drawdown from peak-since-entry exceeds threshold)
+        if (trailing_stop_pct != null) {
+          const trailDD = (tradeRet - peakSinceEntry) / (1 + peakSinceEntry);
+          if (trailDD <= -trailing_stop_pct/100) pos = 0;
+        }
+      }
+
+      if (pos === 0) { entryIdx = -1; peakSinceEntry = 0; }
     }
     return pos;
   });
@@ -1641,10 +1732,13 @@ async function runBacktest(input) {
     label, symbols, weights:w, range,
     signal_type, signal_params, signal_direction,
     entry_threshold, exit_threshold,
+    exit_signal_type, exit_signal_params, exit_signal_direction,
+    hold_days, trailing_stop_pct, take_profit_pct, stop_loss_pct,
     regime_signal_type, regime_signal_params, regime_threshold,
     dates:allDates,
     equityCurve, drawdownCurve,
     signalSeries:signalArr.map(v=>+v.toFixed(4)),
+    exitSignalSeries: exitSignalArr ? exitSignalArr.map(v=>+v.toFixed(4)) : null,
     trades:trades.slice(0,500),
     metrics:{
       totalReturnPct:+totalRet.toFixed(2), annualizedRetPct:+annRet.toFixed(2),
@@ -1905,6 +1999,27 @@ async function executeTool(name, input) {
     case "run_backtest":
       return runBacktest(input);
 
+    case "send_email": {
+      // Convert markdown-ish body to HTML
+      let html = input.body || "";
+      html = html
+        .replace(/^### (.+)$/gm, '<h3 style="color:#E8C87A;margin:16px 0 6px">$1</h3>')
+        .replace(/^## (.+)$/gm,  '<h2 style="color:#E8C87A;margin:18px 0 8px">$1</h2>')
+        .replace(/^# (.+)$/gm,   '<h1 style="color:#C9A84C;margin:20px 0 10px">$1</h1>')
+        .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+        .replace(/^\- (.+)$/gm, '<li>$1</li>')
+        .replace(/(<li>[\s\S]*?<\/li>)/g, '<ul style="margin:6px 0 10px;padding-left:20px">$1</ul>')
+        .replace(/\n\n/g, '</p><p style="margin:8px 0">')
+        .replace(/\n/g, '<br/>');
+      const wrapped = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7;padding:24px;line-height:1.55">
+<div style="max-width:640px;margin:0 auto">
+<p style="color:#5A6280;font-size:12px;margin-bottom:20px">🤖 IBKR Agent · ${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>
+<p style="margin:8px 0">${html}</p>
+</div></body></html>`;
+      return await sendEmail(REPORT_TO, input.subject || "📊 Analysis from IBKR Agent", wrapped);
+    }
+
     default:
       return { error: `Unknown tool: ${name}` };
   }
@@ -1930,8 +2045,20 @@ const TOOLS = [
   { name: "get_market_news", description: "Get current market news headlines from finance RSS feeds. Use for morning, midday, end-of-day briefs and any latest-news request.", input_schema: { type: "object", properties: { symbols: { type: "array", items: { type: "string" } }, limit: { type: "number" } }, required: [] } },
   { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
   {
+    name: "send_email",
+    description: "Send an email to the user with any content (analysis summary, market commentary, custom report). Use this whenever the user asks you to email them anything. Content should be plain text or markdown — it will be converted to HTML. Sends to the user's registered email.",
+    input_schema: {
+      type: "object",
+      properties: {
+        subject: { type: "string", description: "Email subject line, e.g. '📊 Portfolio Analysis — Jul 2'" },
+        body:    { type: "string", description: "Email body content. Can be plain text or markdown with **bold**, headings (##), tables, bullet lists. Will be styled and sent as HTML." }
+      },
+      required: ["subject", "body"]
+    }
+  },
+  {
     name: "run_backtest",
-    description: "Run a signal-based backtest. ALWAYS call immediately when asked — never ask for confirmation. ALWAYS use range=5y unless user specifies. For 'my portfolio' use all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L. Available signal_type values: buy_hold | zscore | momentum | rsi | bb_pct | corr | vol_ratio | drawdown | var_breach | spread | zscore_spread | macd | vol_zscore | port_zscore | port_momentum. Can add a regime_signal_type to filter trades to specific market conditions.",
+    description: "Run a signal-based backtest. ALWAYS call immediately when asked — never ask for confirmation. ALWAYS use range=5y unless user specifies. For 'my portfolio' use all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L. IMPORTANT: entry and exit can use INDEPENDENT signals. Set exit_signal_type='hold' to only exit via stops (time/trailing/take_profit/stop_loss). Set exit_signal_type to any primitive to use a different signal for exit than entry.",
     input_schema: {
       type: "object",
       properties: {
@@ -1939,14 +2066,25 @@ const TOOLS = [
         weights:              { type: "array", items: { type: "number" }, description: "Weights summing to 1. Omit for equal weight." },
         range:                { type: "string", description: "ALWAYS 5y unless user says otherwise. Options: 1y 2y 5y 10y max." },
         label:                { type: "string", description: "Human-readable strategy name." },
-        signal_type:          { type: "string", description: "Signal primitive: buy_hold | zscore (z-score of returns) | momentum (n-day price return) | rsi | bb_pct (Bollinger %B) | corr (rolling correlation with another asset) | vol_ratio (short/long vol ratio) | drawdown (rolling drawdown from peak) | var_breach (VaR breach flag) | spread (price spread vs another asset) | zscore_spread (z-score of spread) | macd | vol_zscore (z-score of variance) | port_zscore (z-score of portfolio's own returns) | port_momentum." },
-        signal_params:        { type: "object", description: "Signal parameters: { symbol: 'asset for signal e.g. CSPX.L or ^VIX', symbol2: 'second asset for corr/spread', window: 30, window2: 60, nstd: 2, pct: 0.05 }." },
-        signal_direction:     { type: "string", description: "momentum (long when signal > threshold) or mean_reversion (long when signal < -threshold). Default momentum." },
-        entry_threshold:      { type: "number", description: "Signal threshold to enter. Default 1.0 for z-score based, 70 for RSI, 0.3 for bb_pct." },
-        exit_threshold:       { type: "number", description: "Signal threshold to exit. Default 0." },
-        regime_signal_type:   { type: "string", description: "Optional regime filter — same signal_type options. E.g. vol_ratio to only trade in low-vol regimes, or momentum on ^GSPC to only trade in bull markets." },
-        regime_signal_params: { type: "object", description: "Params for regime filter (same structure as signal_params)." },
-        regime_threshold:     { type: "number", description: "Regime signal must be above this to allow trading. Default 0." }
+
+        signal_type:          { type: "string", description: "Entry signal primitive: buy_hold | zscore | momentum | rsi | bb_pct | corr | vol_ratio | drawdown | var_breach | spread | zscore_spread | macd | vol_zscore | port_zscore | port_momentum" },
+        signal_params:        { type: "object", description: "Entry signal params: { symbol, symbol2, window (default 30), window2 (default 60), nstd (default 2), pct (default 0.05) }" },
+        signal_direction:     { type: "string", description: "Entry direction: momentum (enter when signal > threshold) or mean_reversion (enter when signal < -threshold). Default momentum." },
+        entry_threshold:      { type: "number", description: "Threshold to enter. Default 1.0 for z-score based, 70 for RSI, 0.3 for bb_pct." },
+
+        exit_signal_type:     { type: "string", description: "Optional INDEPENDENT exit signal. Options: null (use entry signal reverting to exit_threshold) | 'hold' (never exit on signal, only stops) | any primitive name (use different signal to exit). E.g. entry on zscore, exit on RSI overbought." },
+        exit_signal_params:   { type: "object", description: "Exit signal params (same structure as signal_params)." },
+        exit_signal_direction:{ type: "string", description: "Exit direction: momentum or mean_reversion. If null, uses opposite of entry_direction." },
+        exit_threshold:       { type: "number", description: "Exit signal threshold. Default 0." },
+
+        hold_days:            { type: "number", description: "Optional: exit after N days regardless of signal." },
+        trailing_stop_pct:    { type: "number", description: "Optional: exit if drawdown from peak-since-entry exceeds this % (e.g. 5 = 5%)." },
+        take_profit_pct:      { type: "number", description: "Optional: exit if trade return reaches this % (e.g. 10 = 10%)." },
+        stop_loss_pct:        { type: "number", description: "Optional: exit if trade return falls to this % (e.g. -5 = -5%). Should be negative." },
+
+        regime_signal_type:   { type: "string", description: "Optional regime filter — same options as signal_type. E.g. only trade when vol_ratio low or ^GSPC momentum positive." },
+        regime_signal_params: { type: "object", description: "Regime signal params." },
+        regime_threshold:     { type: "number", description: "Regime must be above this to allow trading. Default 0." }
       },
       required: ["symbols"]
     }
@@ -1983,6 +2121,9 @@ BACKTEST RULES — follow strictly:
 - For "my portfolio" always pass all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
 - Signals available: zscore (z-score of rolling returns), var (rolling historical VaR breach), level (price vs rolling mean), crossasset_corr (rolling correlation vs signal_symbol), buy_hold.
 - After results return, present key metrics in a table and mention the email export button.
+
+EMAIL RULE — follow strictly:
+- Whenever the user asks you to "email me", "send me an email", "send a recap by email", or anything similar, call send_email IMMEDIATELY with the requested content. Never say "I can't send emails" — you have the send_email tool. Never ask for confirmation on subject/body — just write a clean subject and a comprehensive markdown body and send it.
 `;
 
 async function runAgent(prompt, history = []) {
@@ -2026,6 +2167,68 @@ app.get("/api/account", async (req, res) => {
   try { res.json(await buildPortfolio()); } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════
+// SCHEDULED TASKS — morning brief, midday check, end-of-day report
+// ═══════════════════════════════════════════════════════════════════
+const TASKS = [
+  {
+    id: "morning",
+    label: "Morning Brief",
+    icon: "🌅",
+    cron: "30 7 * * 1-5",   // 07:30 UTC weekdays (~08:30 London BST)
+    prompt: "Summarise the pre-market state: overnight moves in ^GSPC, ^IXIC, ^STOXX50E, ^N225, ^HSI. Note any major macro events, top market news, and 1-2 key risks to watch today. Keep it under 200 words. End with 'FULL REPORT ATTACHED' if morning report email was sent."
+  },
+  {
+    id: "midday",
+    label: "Midday Check",
+    icon: "🕛",
+    cron: "0 11 * * 1-5",   // 11:00 UTC weekdays (~12:00 London BST)
+    prompt: "Give a concise midday market update: how are US futures / European markets doing vs open? Note any breaking news that could affect my portfolio (CSPX, CNDX, IEEM, VUAG, VWRL, NQSE, VFEM, CSSX5E). Keep under 150 words."
+  },
+  {
+    id: "eod",
+    label: "End of Day",
+    icon: "🌆",
+    cron: "0 16 * * 1-5",   // 16:00 UTC weekdays (~17:00 London BST, close of European markets)
+    prompt: "Summarise today's close: what moved in US and European markets, best/worst sectors, notable news from the day. Then check my portfolio holdings (CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L) and highlight the biggest daily movers. Keep under 200 words."
+  },
+  {
+    id: "weekly",
+    label: "Weekly Review",
+    icon: "📅",
+    cron: "30 15 * * 5",    // 15:30 UTC Friday (~16:30 London)
+    prompt: "Weekly review: how did my portfolio perform this week? Note the biggest movers among CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L, look at week-over-week PnL, and flag anything to watch next week. Keep under 250 words."
+  },
+];
+
+// In-memory state — persisted state would need Redis/DB
+const taskState = {};
+TASKS.forEach(t => { taskState[t.id] = { enabled: true, running: false, lastRun: null, lastResult: null }; });
+const taskLog = [];
+
+// Register cron jobs
+console.log(`⏰ Registering cron tasks: ${TASKS.map(t => t.cron).join(", ")}`);
+TASKS.forEach(task => {
+  cron.schedule(task.cron, async () => {
+    if (!taskState[task.id].enabled) return;
+    if (taskState[task.id].running) return;
+    taskState[task.id].running = true;
+    taskLog.unshift({ task: task.label, status: "running", time: new Date().toISOString() });
+    try {
+      const result = await runAgent(task.prompt);
+      const resultStr = typeof result === "string" ? result : (result?.reply || JSON.stringify(result));
+      taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: resultStr };
+      taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result: resultStr };
+      await sendPush(`${task.icon} ${task.label}`, resultStr.slice(0, 140), task.icon);
+      if (task.id === "morning") buildAndSendReport(REPORT_TO).catch(e => console.error("Email:", e.message));
+    } catch (e) {
+      taskState[task.id].running = false;
+      taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message };
+      console.error(`Task ${task.id} failed:`, e.message);
+    }
+  }, { timezone: "UTC" });
+});
+
 app.get("/api/tasks", (req, res) => res.json(TASKS.map(t => ({ ...t, ...taskState[t.id] }))));
 app.patch("/api/tasks/:id", (req, res) => { if (!taskState[req.params.id]) return res.status(404).json({ error: "Not found" }); taskState[req.params.id].enabled = req.body.enabled; res.json({ ok: true }); });
 app.post("/api/tasks/:id/run", async (req, res) => {
@@ -2037,9 +2240,10 @@ app.post("/api/tasks/:id/run", async (req, res) => {
   res.json({ ok: true });
   try {
     const result = await runAgent(task.prompt);
-    taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: result };
-    taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result };
-    await sendPush(`${task.icon} ${task.label} done`, result.slice(0, 140), task.icon);
+    const resultStr = typeof result === "string" ? result : (result?.reply || JSON.stringify(result));
+    taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: resultStr };
+    taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result: resultStr };
+    await sendPush(`${task.icon} ${task.label} done`, resultStr.slice(0, 140), task.icon);
     if (task.id === "morning") buildAndSendReport(REPORT_TO).catch(e=>console.error("Email:",e.message));
   } catch (e) { taskState[task.id].running = false; taskLog[0] = { task: task.label, status: "error", time: new Date().toISOString(), result: e.message }; }
 });

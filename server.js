@@ -2124,6 +2124,17 @@ BACKTEST RULES — follow strictly:
 
 EMAIL RULE — follow strictly:
 - Whenever the user asks you to "email me", "send me an email", "send a recap by email", or anything similar, call send_email IMMEDIATELY with the requested content. Never say "I can't send emails" — you have the send_email tool. Never ask for confirmation on subject/body — just write a clean subject and a comprehensive markdown body and send it.
+- If your email requires data (e.g. VIX levels, SPX prices, option premiums), you MUST fetch that data via compute_analytics, run_backtest, get_macro_snapshot, or web_search BEFORE calling send_email. Do NOT send an email with data you haven't verified.
+
+CRITICAL DATA HONESTY RULES — VIOLATION IS UNACCEPTABLE:
+- NEVER make up, estimate, or fabricate numbers. Every price, VIX level, return, option premium, or historical figure MUST come from an actual tool call in this conversation.
+- If you need SPX or VIX historical data, call compute_analytics with symbol="^GSPC" or "^VIX". If you need current prices, call get_macro_snapshot. If you need something not available via tools, use web_search.
+- If you cannot get the data via tools, say "I cannot compute this without real data — please provide the values" — do NOT invent numbers.
+- Do NOT say "I have real verified data" unless you literally just retrieved it in this conversation via a tool call. Do NOT bluff or role-play having data.
+
+NO-BLUFF RULE — CRITICAL:
+- Never end your turn with a phrase like "Let me now compute", "Let me send the email", "Let me do X", "I'll now run Y". These are bluffs — if you're going to do it, CALL THE TOOL in the same turn. If you say "Let me compute X" without a tool_use block, you have failed.
+- If your last message ends with an intention to do something (compute / send / analyse), the very next thing must be a tool call, not more text.
 `;
 
 async function runAgent(prompt, history = []) {
@@ -2132,17 +2143,42 @@ async function runAgent(prompt, history = []) {
   let loop = [...messages], i = 0;
   let backtestData = null;
 
-  while (response.stop_reason === "tool_use" && i++ < 10) {
-    loop.push({ role: "assistant", content: response.content });
-    const toolBlocks = response.content.filter(b => b.type === "tool_use");
-    const toolResults = await Promise.all(toolBlocks.map(async b => {
-      let result;
-      try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
-      if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
-      return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
-    }));
-    loop.push({ role: "user", content: toolResults });
-    response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
+  const BLUFF_PATTERNS = [
+    /let me (?:now )?(?:compute|send|run|calculate|analy[sz]e|fetch|check|do|redo)/i,
+    /i(?:'ll| will) (?:now )?(?:compute|send|run|calculate|analy[sz]e|fetch|check|do)/i,
+    /(?:now|let me) (?:compute|send|run|calculate) (?:everything|this|it|the)/i,
+    /computing (?:now|everything)/i,
+    /(?:i have|now i have|i now have) (?:the )?real (?:verified )?data/i,
+    /sending (?:the )?email (?:now|immediately)/i,
+  ];
+
+  while (i++ < 10) {
+    if (response.stop_reason === "tool_use") {
+      loop.push({ role: "assistant", content: response.content });
+      const toolBlocks = response.content.filter(b => b.type === "tool_use");
+      const toolResults = await Promise.all(toolBlocks.map(async b => {
+        let result;
+        try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
+        if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
+        return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
+      }));
+      loop.push({ role: "user", content: toolResults });
+      response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
+      continue;
+    }
+
+    // Bluff detection: if Claude ended turn WITHOUT a tool call but text hints at intent to act
+    const text = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+    const isBluff = BLUFF_PATTERNS.some(p => p.test(text));
+    if (isBluff) {
+      console.log(`⚠️  Bluff detected, forcing action: "${text.slice(-120)}"`);
+      loop.push({ role: "assistant", content: response.content });
+      loop.push({ role: "user", content: "STOP. You said you would do something but you didn't call a tool. Call the required tool NOW in this response. Do not describe your intent — execute it. If you meant to send an email, call send_email. If you meant to compute, call the compute tool. If you meant to run a backtest, call run_backtest. No more prose without a tool call." });
+      response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
+      continue;
+    }
+
+    break; // Normal end_turn
   }
 
   const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");

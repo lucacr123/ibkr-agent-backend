@@ -1731,6 +1731,26 @@ async function runBacktest(input) {
   const var95=+(sorted[Math.floor(sorted.length*0.05)]*100).toFixed(3);
   const pctInMkt=+(positions.filter(p=>p===1).length/positions.length*100).toFixed(1);
 
+  // ── Extract actual trigger dates from signal + position arrays ───
+  // These are the REAL dates — Claude must use ONLY these, never invent dates
+  const triggerDates = allDates
+    .map((d, i) => {
+      const prevPos = i > 0 ? positions[i-1] : 0;
+      const curPos  = positions[i];
+      const sig     = signalArr[i] ?? 0;
+      if (curPos === 1 && prevPos === 0) return { date: d, type: "ENTRY", signal: +sig.toFixed(4) };
+      if (curPos === 0 && prevPos === 1) return { date: d, type: "EXIT",  signal: +sig.toFixed(4) };
+      return null;
+    })
+    .filter(Boolean);
+
+  // Signal stats: min, max, mean, dates where signal crossed thresholds
+  const sigAboveEntry = allDates.filter((d,i) =>
+    signal_direction === "momentum"
+      ? signalArr[i] > entry_threshold
+      : signalArr[i] < -entry_threshold
+  );
+
   return {
     label, symbols, weights:w, range,
     signal_type, signal_params, signal_direction,
@@ -1742,6 +1762,14 @@ async function runBacktest(input) {
     equityCurve, drawdownCurve,
     signalSeries:signalArr.map(v=>+v.toFixed(4)),
     exitSignalSeries: exitSignalArr ? exitSignalArr.map(v=>+v.toFixed(4)) : null,
+    triggerDates,          // REAL entry/exit dates with actual signal values
+    datesAboveThreshold: sigAboveEntry,  // all dates where signal was in entry zone
+    signalStats: {
+      min: +Math.min(...signalArr).toFixed(4),
+      max: +Math.max(...signalArr).toFixed(4),
+      mean: +(signalArr.reduce((a,b)=>a+b,0)/signalArr.length).toFixed(4),
+      nAboveEntry: sigAboveEntry.length,
+    },
     trades:trades.slice(0,500),
     metrics:{
       totalReturnPct:+totalRet.toFixed(2), annualizedRetPct:+annRet.toFixed(2),
@@ -2175,19 +2203,22 @@ Always use combined portfolio percentages, not per-account NAV%. Format matrices
 Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.
 
 BACKTEST RULES — follow strictly:
-- When asked for any backtest or strategy analysis, call run_backtest IMMEDIATELY. Never ask for confirmation.
-- ALWAYS use range=5y unless user specifies otherwise.
-- For "my portfolio" always pass all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
-- Signals available: zscore (z-score of rolling returns), var (rolling historical VaR breach), level (price vs rolling mean), crossasset_corr (rolling correlation vs signal_symbol), buy_hold.
-- After results return, present key metrics in a table and mention the email export button.
+- Call run_backtest immediately when asked. ALWAYS use range=5y unless specified. For "my portfolio" use all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
+- After run_backtest returns, you MUST read data from the result fields. NEVER invent, estimate, or fabricate any dates, signal values, or trade returns:
+  * triggerDates[] — the REAL entry/exit dates with actual signal values. ONLY use these when describing when trades triggered.
+  * trades[] — REAL trade list with real returnPct per trade. ONLY use these.
+  * signalStats — real signal min/max/mean. ONLY use these.
+  * metrics — all performance numbers. ONLY use these.
+- If a date is not in triggerDates[], it did NOT trigger. Do not add dates that are not there.
+- Quote exact date and signal value from triggerDates[] when describing trigger events.
 
 EMAIL RULE:
-- When asked to email anything: fetch any needed data, then call send_email — all in the same response. Do not stop between fetching and sending.
-- send_email will actually send it. You do not need to confirm. Just call the tool.
+- When asked to email: fetch needed data first, then call send_email in the same response.
+- send_email sends it immediately. Do not ask for confirmation. Just call it.
 
 DATA RULE:
-- Never invent prices, returns, VIX levels or any market numbers. Fetch them via tools first.
-- Well-known formulas (Black-Scholes, Kelly, etc.) are fine to use on real fetched data.
+- Never invent market data. Fetch via tools first.
+- Analytical formulas (Black-Scholes, Kelly, Sharpe etc.) are allowed on real fetched data.
 `;
 
 async function runAgent(prompt, history = []) {

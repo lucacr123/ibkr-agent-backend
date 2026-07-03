@@ -2195,7 +2195,12 @@ NO-BLUFF RULE — CRITICAL:
 `;
 
 async function runAgent(prompt, history = []) {
-  const messages = [...history, { role: "user", content: prompt }];
+  // Only pass text-only messages in history to avoid malformed tool_use/tool_result pairs
+  const cleanHistory = history
+    .filter(m => m.role && typeof m.content === "string" && m.content.trim())
+    .map(m => ({ role: m.role, content: m.content }));
+
+  const messages = [...cleanHistory, { role: "user", content: prompt }];
   let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages });
   let loop = [...messages], i = 0;
   let backtestData = null;
@@ -2203,39 +2208,55 @@ async function runAgent(prompt, history = []) {
   const BLUFF_PATTERNS = [
     /let me (?:now )?(?:compute|send|run|calculate|analy[sz]e|fetch|check|do|redo)/i,
     /i(?:'ll| will) (?:now )?(?:compute|send|run|calculate|analy[sz]e|fetch|check|do)/i,
-    /(?:now|let me) (?:compute|send|run|calculate) (?:everything|this|it|the)/i,
-    /computing (?:now|everything)/i,
-    /(?:i have|now i have|i now have) (?:the )?real (?:verified )?data/i,
     /sending (?:the )?email (?:now|immediately)/i,
+    /(?:i have|now i have|i now have) (?:the )?real (?:verified )?data/i,
   ];
 
   while (i++ < 10) {
     if (response.stop_reason === "tool_use") {
-      loop.push({ role: "assistant", content: response.content });
-      const toolBlocks = response.content.filter(b => b.type === "tool_use");
+      const assistantContent = response.content;
+      loop.push({ role: "assistant", content: assistantContent });
+
+      // ALWAYS produce a tool_result for EVERY tool_use block — no exceptions
+      const toolBlocks = assistantContent.filter(b => b.type === "tool_use");
       const toolResults = await Promise.all(toolBlocks.map(async b => {
         let result;
         try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
         if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
         return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
       }));
+
+      // Push tool results as user message immediately after assistant tool_use
       loop.push({ role: "user", content: toolResults });
-      response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
+
+      try {
+        response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
+      } catch (e) {
+        console.error("API error in tool loop:", e.message);
+        return `Error: ${e.message}`;
+      }
       continue;
     }
 
-    // Bluff detection: if Claude ended turn WITHOUT a tool call but text hints at intent to act
-    const text = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-    const isBluff = BLUFF_PATTERNS.some(p => p.test(text));
-    if (isBluff) {
-      console.log(`⚠️  Bluff detected, forcing action: "${text.slice(-120)}"`);
-      loop.push({ role: "assistant", content: response.content });
-      loop.push({ role: "user", content: "STOP. You said you would do something but you didn't call a tool. Call the required tool NOW in this response. Do not describe your intent — execute it. If you meant to send an email, call send_email. If you meant to compute, call the compute tool. If you meant to run a backtest, call run_backtest. No more prose without a tool call." });
-      response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
-      continue;
+    // Bluff detection — only on end_turn (no pending tool_use blocks)
+    if (response.stop_reason === "end_turn") {
+      const text = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
+      const isBluff = BLUFF_PATTERNS.some(p => p.test(text));
+      if (isBluff) {
+        console.log(`⚠️  Bluff detected, forcing action`);
+        loop.push({ role: "assistant", content: response.content });
+        loop.push({ role: "user", content: [{ type: "text", text: "You described an action but didn't call a tool. Call the required tool NOW — send_email, run_backtest, compute_analytics, or web_search. No more prose." }] });
+        try {
+          response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
+        } catch (e) {
+          console.error("API error in bluff loop:", e.message);
+          break;
+        }
+        continue;
+      }
     }
 
-    break; // Normal end_turn
+    break;
   }
 
   const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");

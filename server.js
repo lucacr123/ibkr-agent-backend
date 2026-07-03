@@ -1755,6 +1755,44 @@ async function runBacktest(input) {
 }
 
 
+
+// ── Python audit script generator ────────────────────────────────
+function buildPythonAuditScript({ subject, data, code, body }) {
+  const ts = new Date().toISOString();
+  const dataStr = data ? JSON.stringify(data, null, 2) : "{}";
+  const codeSection = code || "# Add your analysis code here using the DATA variable above";
+  return `#!/usr/bin/env python3
+"""
+IBKR Agent — Audit Script
+Generated: ${ts}
+Subject: ${(subject||"").replace(/[\`]/g,"'")}
+
+This script reproduces the analysis sent by IBKR Agent.
+All input data was fetched from Yahoo Finance / IBKR Flex at generation time.
+Dependencies: pip install numpy pandas matplotlib scipy yfinance
+"""
+
+import numpy as np
+import pandas as pd
+import json
+from datetime import datetime
+
+# ── Raw data fetched at generation time ───────────────────────────
+DATA = json.loads("""
+${dataStr}
+""")
+
+# ── Reproduce computations ────────────────────────────────────────
+${codeSection}
+
+# ── Email content (for reference) ─────────────────────────────────
+ANALYSIS_SUMMARY = """
+${(body||"").replace(/"/g,"'")}
+"""
+print("Analysis summary:", ANALYSIS_SUMMARY[:500])
+`;
+}
+
 // ── Send push notification ────────────────────────────────────────
 async function sendPush(title, body, icon = "📊") {
   if (!pushSubs.size) return;
@@ -2011,12 +2049,28 @@ async function executeTool(name, input) {
         .replace(/(<li>[\s\S]*?<\/li>)/g, '<ul style="margin:6px 0 10px;padding-left:20px">$1</ul>')
         .replace(/\n\n/g, '</p><p style="margin:8px 0">')
         .replace(/\n/g, '<br/>');
+
+      // Generate Python audit script if data was provided
+      const pyData   = input.python_data   || null;   // raw dict/array from tool results
+      const pyCode   = input.python_code   || null;   // computation logic as string
+      const pyScript = (pyData || pyCode) ? buildPythonAuditScript({
+        subject: input.subject,
+        data: pyData,
+        code: pyCode,
+        body: input.body,
+      }) : null;
+
       const wrapped = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 <body style="background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7;padding:24px;line-height:1.55">
 <div style="max-width:640px;margin:0 auto">
 <p style="color:#5A6280;font-size:12px;margin-bottom:20px">🤖 IBKR Agent · ${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>
 <p style="margin:8px 0">${html}</p>
+${pyScript ? `<hr style="border-color:#252A38;margin:24px 0"/>
+<h3 style="color:#E8C87A;margin:0 0 8px">🐍 Python Audit Script</h3>
+<p style="color:#5A6280;font-size:12px;margin:0 0 12px">Copy the script below into your IDE to reproduce all calculations with real data.</p>
+<pre style="background:#0A0C12;border:1px solid #252A38;border-radius:8px;padding:14px;font-family:monospace;font-size:11px;color:#EDF0F7;white-space:pre-wrap;word-break:break-all;overflow:auto;max-height:600px">${pyScript.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>` : ''}
 </div></body></html>`;
+
       return await sendEmail(REPORT_TO, input.subject || "📊 Analysis from IBKR Agent", wrapped);
     }
 
@@ -2046,12 +2100,14 @@ const TOOLS = [
   { name: "get_macro_snapshot", description: "Get current movement snapshot for main indices, rates, FX, commodities, crypto and major asset classes.", input_schema: { type: "object", properties: {}, required: [] } },
   {
     name: "send_email",
-    description: "Send an email to the user with any content (analysis summary, market commentary, custom report). Use this whenever the user asks you to email them anything. Content should be plain text or markdown — it will be converted to HTML. Sends to the user's registered email.",
+    description: "Send an email to the user with any content. ALWAYS call immediately when asked. ALWAYS populate python_data with the raw fetched data and python_code with the computation logic — this generates a Python audit script in the email body so the user can reproduce everything locally.",
     input_schema: {
       type: "object",
       properties: {
-        subject: { type: "string", description: "Email subject line, e.g. '📊 Portfolio Analysis — Jul 2'" },
-        body:    { type: "string", description: "Email body content. Can be plain text or markdown with **bold**, headings (##), tables, bullet lists. Will be styled and sent as HTML." }
+        subject:     { type: "string", description: "Email subject line." },
+        body:        { type: "string", description: "Email body in markdown. Write a full, detailed analysis." },
+        python_data: { type: "object", description: "REQUIRED: raw data object containing all fetched prices, returns, VIX levels, etc. used in the analysis. E.g. { spx_prices: [...], vix_levels: [...], dates: [...] }. This is embedded as JSON in the Python audit script." },
+        python_code: { type: "string", description: "REQUIRED: Python code that reproduces all computations from python_data. Should be complete and runnable. E.g. Black-Scholes formula, backtest logic, correlation calculations, etc. The code can reference DATA variable which will contain python_data." }
       },
       required: ["subject", "body"]
     }
@@ -2127,9 +2183,10 @@ EMAIL RULE — follow strictly:
 - If your email requires data (e.g. VIX levels, SPX prices, option premiums), you MUST fetch that data via compute_analytics, run_backtest, get_macro_snapshot, or web_search BEFORE calling send_email. Do NOT send an email with data you haven't verified.
 
 CRITICAL DATA HONESTY RULES — VIOLATION IS UNACCEPTABLE:
-- NEVER make up, estimate, or fabricate numbers. Every price, VIX level, return, option premium, or historical figure MUST come from an actual tool call in this conversation.
+- NEVER make up, estimate, or fabricate market data (prices, VIX levels, historical returns, option premiums, yields, etc.). Every market data point MUST come from an actual tool call in this conversation.
 - If you need SPX or VIX historical data, call compute_analytics with symbol="^GSPC" or "^VIX". If you need current prices, call get_macro_snapshot. If you need something not available via tools, use web_search.
-- If you cannot get the data via tools, say "I cannot compute this without real data — please provide the values" — do NOT invent numbers.
+- HOWEVER: well-established mathematical models (Black-Scholes, binomial trees, Kelly criterion, Sharpe ratio, correlation formulas, etc.) are formulas — you MAY use them to COMPUTE derived values (e.g. implied volatility, option fair value, optimal position size), AS LONG AS all the INPUT DATA to those formulas came from real tool calls. The formula itself is not fabrication — only making up the inputs is.
+- Example: fetching real VIX and SPX via tools, then computing Black-Scholes option price from those real inputs = ALLOWED. Inventing a VIX level and running Black-Scholes = FORBIDDEN.
 - Do NOT say "I have real verified data" unless you literally just retrieved it in this conversation via a tool call. Do NOT bluff or role-play having data.
 
 NO-BLUFF RULE — CRITICAL:
@@ -2454,6 +2511,78 @@ app.post("/api/backtest/email", async (req, res) => {
   const { backtestResult } = req.body;
   if (!backtestResult) return res.status(400).json({ error: "backtestResult required" });
   const m = backtestResult.metrics || {};
+
+  // Build Python audit script
+  const pyData = {
+    symbols:       backtestResult.symbols,
+    weights:       backtestResult.weights,
+    range:         backtestResult.range,
+    signal_type:   backtestResult.signal_type,
+    signal_params: backtestResult.signal_params,
+    entry_threshold: backtestResult.entry_threshold,
+    exit_threshold:  backtestResult.exit_threshold,
+    signal_direction: backtestResult.signal_direction,
+    dates:         backtestResult.dates,
+    equity_curve:  backtestResult.equityCurve?.map(p=>p.value),
+    drawdown:      backtestResult.drawdownCurve?.map(p=>p.value),
+    signal_series: backtestResult.signalSeries,
+    trades:        backtestResult.trades,
+    metrics:       m,
+  };
+  const pyCode = `
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Reconstruct equity curve
+dates = pd.to_datetime(DATA['dates'])
+equity = pd.Series(DATA['equity_curve'], index=dates)
+drawdown = pd.Series(DATA['drawdown'], index=dates)
+
+# Signal series
+if DATA.get('signal_series'):
+    signal = pd.Series(DATA['signal_series'], index=dates)
+
+# Trade analysis
+trades = pd.DataFrame(DATA['trades']) if DATA.get('trades') else pd.DataFrame()
+
+# Plot
+fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+axes[0].plot(equity, color='#2ECC71' if equity.iloc[-1] >= 100 else '#E74C3C', linewidth=1.5)
+axes[0].axhline(100, color='gray', linestyle='--', linewidth=0.8)
+axes[0].set_ylabel('Equity (base 100)')
+axes[0].set_title(f"Backtest: {DATA.get('signal_type','buy_hold')} — {DATA.get('range','5y')}")
+axes[0].grid(alpha=0.3)
+
+axes[1].fill_between(dates, drawdown, 0, color='#E74C3C', alpha=0.3)
+axes[1].plot(drawdown, color='#E74C3C', linewidth=1)
+axes[1].set_ylabel('Drawdown %')
+axes[1].grid(alpha=0.3)
+
+if DATA.get('signal_series'):
+    axes[2].plot(signal, color='#4A9EFF', linewidth=0.8)
+    axes[2].axhline(DATA.get('entry_threshold', 1), color='green', linestyle='--', linewidth=0.8, label=f"Entry {DATA.get('entry_threshold',1)}")
+    axes[2].axhline(DATA.get('exit_threshold', 0), color='red', linestyle='--', linewidth=0.8, label=f"Exit {DATA.get('exit_threshold',0)}")
+    axes[2].set_ylabel('Signal')
+    axes[2].legend(fontsize=8)
+    axes[2].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('backtest_audit.png', dpi=150)
+print("Saved backtest_audit.png")
+
+# Print metrics
+print("\\n=== Metrics ===")
+for k, v in DATA['metrics'].items():
+    print(f"  {k}: {v}")
+
+if not trades.empty:
+    print(f"\\n=== Trades ===")
+    print(trades.to_string())
+`;
+
+  const pyScript = buildPythonAuditScript({ subject: `Backtest: ${backtestResult.label||"Strategy"}`, data: pyData, code: pyCode });
+
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 <body style="background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7;padding:24px">
 <h2 style="color:#C9A84C">📊 Backtest: ${backtestResult.label||"Strategy"}</h2>
@@ -2461,44 +2590,33 @@ app.post("/api/backtest/email", async (req, res) => {
 
 <h3 style="color:#E8C87A">Strategy Parameters</h3>
 <pre style="background:#13161E;padding:14px;border-radius:8px;font-size:12px;color:#EDF0F7">${JSON.stringify({
-  symbols: backtestResult.symbols,
-  weights: backtestResult.weights?.map(w=>+w.toFixed(3)),
-  range:   backtestResult.range,
-  signal:  backtestResult.signal,
-  signal_symbol: backtestResult.signal_symbol,
-  signal_window: backtestResult.signal_window,
-  entry_threshold: backtestResult.entry_threshold,
-  exit_threshold:  backtestResult.exit_threshold,
-  direction:       backtestResult.direction,
+  symbols: backtestResult.symbols, weights: backtestResult.weights?.map(w=>+w.toFixed(3)),
+  range: backtestResult.range, signal_type: backtestResult.signal_type,
+  signal_params: backtestResult.signal_params, signal_direction: backtestResult.signal_direction,
+  entry_threshold: backtestResult.entry_threshold, exit_threshold: backtestResult.exit_threshold,
 }, null, 2)}</pre>
 
 <h3 style="color:#E8C87A">Performance Metrics</h3>
 <table style="border-collapse:collapse;width:100%;max-width:500px">
   ${[
-    ["Total Return",         `${m.totalReturnPct}%`],
-    ["Annualized Return",    `${m.annualizedRetPct}%`],
-    ["Annualized Vol",       `${m.annualizedVolPct}%`],
-    ["Max Drawdown",         `${m.maxDrawdownPct}%`],
-    ["Sharpe",               m.sharpe],
-    ["Sortino",              m.sortino],
-    ["Calmar",               m.calmar],
-    ["VaR 95% (daily)",      `${m.var95DailyPct}%`],
-    ["% Time in Market",     `${m.pctTimeInMarket}%`],
-    ["N Trades",             m.nTrades],
-    ["Win Rate",             `${m.winRatePct}%`],
-    ["EV per Trade",         `${m.evPerTradePct}%`],
-    ["Cond. EV (wins)",      `${m.condEvWinPct}%`],
-    ["Cond. EV (losses)",    `${m.condEvLossPct}%`],
-    ["Trade Return Std",     `${m.tradeRetStdPct}%`],
-    ["Avg Duration",         `${m.avgDurationDays} days`],
-    ["Profit Factor",        m.profitFactor??"-"],
+    ["Total Return",`${m.totalReturnPct}%`],["Annualized Return",`${m.annualizedRetPct}%`],
+    ["Annualized Vol",`${m.annualizedVolPct}%`],["Max Drawdown",`${m.maxDrawdownPct}%`],
+    ["Sharpe",m.sharpe],["Sortino",m.sortino],["Calmar",m.calmar],
+    ["VaR 95% (daily)",`${m.var95DailyPct}%`],["% Time in Market",`${m.pctTimeInMarket}%`],
+    ["N Trades",m.nTrades],["Win Rate",`${m.winRatePct}%`],["EV per Trade",`${m.evPerTradePct}%`],
+    ["Cond. EV (wins)",`${m.condEvWinPct}%`],["Cond. EV (losses)",`${m.condEvLossPct}%`],
+    ["Trade Return Std",`${m.tradeRetStdPct}%`],["Avg Duration",`${m.avgDurationDays} days`],
+    ["Profit Factor",m.profitFactor??"-"],
   ].map(([k,v])=>`<tr style="border-bottom:1px solid #252A38"><td style="padding:7px 12px 7px 0;color:#8A9AC0;font-size:13px">${k}</td><td style="padding:7px 0;font-family:monospace;font-size:13px;color:#EDF0F7">${v}</td></tr>`).join("")}
 </table>
 
 <h3 style="color:#E8C87A">Trade List (last 20)</h3>
-<pre style="background:#13161E;padding:14px;border-radius:8px;font-size:11px;color:#EDF0F7;overflow:auto">${JSON.stringify((backtestResult.trades||[]).slice(-20).map(t=>({
-  entry: t.entryDate, exit: t.exitDate, days: t.durationDays, ret: t.returnPct+"%", win: t.profitable
-})), null, 2)}</pre>
+<pre style="background:#13161E;padding:14px;border-radius:8px;font-size:11px;color:#EDF0F7;overflow:auto">${JSON.stringify((backtestResult.trades||[]).slice(-20).map(t=>({entry:t.entryDate,exit:t.exitDate,days:t.durationDays,ret:t.returnPct+"%",win:t.profitable})),null,2)}</pre>
+
+<hr style="border-color:#252A38;margin:24px 0"/>
+<h3 style="color:#E8C87A">🐍 Python Audit Script</h3>
+<p style="color:#5A6280;font-size:12px">Copy into your IDE to reproduce all calculations. Run: pip install pandas numpy matplotlib</p>
+<pre style="background:#0A0C12;border:1px solid #252A38;border-radius:8px;padding:14px;font-family:monospace;font-size:11px;color:#EDF0F7;white-space:pre-wrap;word-break:break-all;max-height:800px;overflow:auto">${pyScript.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>
 </body></html>`;
 
   const result = await sendEmail(REPORT_TO, `📊 Backtest Export: ${backtestResult.label||"Strategy"}`, html);

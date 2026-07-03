@@ -696,7 +696,10 @@ async function fetchSymbolNews(symbol, limit = 5) {
 // ─── Email ────────────────────────────────────────────────────────
 async function sendEmail(to, subject, html) {
   console.log(`📧 Sending email to: ${to} from: onboarding@resend.dev`);
-  if (!RESEND_KEY) { console.log("📧 No RESEND_API_KEY — skipped:", subject); return { ok: false }; }
+  if (!RESEND_KEY) {
+    console.log("📧 No RESEND_API_KEY — skipped:", subject);
+    throw new Error("Email not sent: RESEND_API_KEY not configured in Railway environment variables.");
+  }
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json" },
@@ -2178,16 +2181,13 @@ BACKTEST RULES — follow strictly:
 - Signals available: zscore (z-score of rolling returns), var (rolling historical VaR breach), level (price vs rolling mean), crossasset_corr (rolling correlation vs signal_symbol), buy_hold.
 - After results return, present key metrics in a table and mention the email export button.
 
-EMAIL RULE — follow strictly:
-- Whenever the user asks you to "email me", "send me an email", "send a recap by email", or anything similar, call send_email IMMEDIATELY with the requested content. Never say "I can't send emails" — you have the send_email tool. Never ask for confirmation on subject/body — just write a clean subject and a comprehensive markdown body and send it.
-- If your email requires data (e.g. VIX levels, SPX prices, option premiums), you MUST fetch that data via compute_analytics, run_backtest, get_macro_snapshot, or web_search BEFORE calling send_email. Do NOT send an email with data you haven't verified.
+EMAIL RULE:
+- When asked to email anything: fetch any needed data, then call send_email — all in the same response. Do not stop between fetching and sending.
+- send_email will actually send it. You do not need to confirm. Just call the tool.
 
-CRITICAL DATA HONESTY RULES — VIOLATION IS UNACCEPTABLE:
-- NEVER make up, estimate, or fabricate market data (prices, VIX levels, historical returns, option premiums, yields, etc.). Every market data point MUST come from an actual tool call in this conversation.
-- If you need SPX or VIX historical data, call compute_analytics with symbol="^GSPC" or "^VIX". If you need current prices, call get_macro_snapshot. If you need something not available via tools, use web_search.
-- HOWEVER: well-established mathematical models (Black-Scholes, binomial trees, Kelly criterion, Sharpe ratio, correlation formulas, etc.) are formulas — you MAY use them to COMPUTE derived values (e.g. implied volatility, option fair value, optimal position size), AS LONG AS all the INPUT DATA to those formulas came from real tool calls. The formula itself is not fabrication — only making up the inputs is.
-- Example: fetching real VIX and SPX via tools, then computing Black-Scholes option price from those real inputs = ALLOWED. Inventing a VIX level and running Black-Scholes = FORBIDDEN.
-- Do NOT say "I have real verified data" unless you literally just retrieved it in this conversation via a tool call.
+DATA RULE:
+- Never invent prices, returns, VIX levels or any market numbers. Fetch them via tools first.
+- Well-known formulas (Black-Scholes, Kelly, etc.) are fine to use on real fetched data.
 `;
 
 async function runAgent(prompt, history = []) {
@@ -2196,25 +2196,49 @@ async function runAgent(prompt, history = []) {
     .map(m => ({ role: m.role, content: m.content }));
 
   const messages = [...cleanHistory, { role: "user", content: prompt }];
-  let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 8000, system: SYSTEM, tools: TOOLS, messages });
-  let loop = [...messages], i = 0;
-  let backtestData = null;
+  let response = await anthropic.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 4000,  // keep tight so Claude is forced to conclude
+    system: SYSTEM,
+    tools: TOOLS,
+    messages,
+  });
 
-  while (i++ < 15 && response.stop_reason === "tool_use") {
+  let loop = [...messages];
+  let backtestData = null;
+  let toolCallCount = 0;
+  const MAX_TOOL_CALLS = 8; // hard cap — prevents infinite loops
+
+  while (response.stop_reason === "tool_use" && toolCallCount < MAX_TOOL_CALLS) {
     loop.push({ role: "assistant", content: response.content });
     const toolBlocks = response.content.filter(b => b.type === "tool_use");
+
     const toolResults = await Promise.all(toolBlocks.map(async b => {
       let result;
-      try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
+      try {
+        result = await executeTool(b.name, b.input);
+      } catch (e) {
+        result = { error: e.message };
+      }
       if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
+      toolCallCount++;
+      console.log(`🔧 Tool ${b.name} called (${toolCallCount}/${MAX_TOOL_CALLS})`);
       return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
     }));
+
     loop.push({ role: "user", content: toolResults });
+
     try {
-      response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 8000, system: SYSTEM, tools: TOOLS, messages: loop });
+      response = await anthropic.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 4000,
+        system: SYSTEM,
+        tools: TOOLS,
+        messages: loop,
+      });
     } catch (e) {
       console.error("API error:", e.message);
-      return `Error: ${e.message}`;
+      return `Error processing request: ${e.message}`;
     }
   }
 

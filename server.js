@@ -2187,76 +2187,35 @@ CRITICAL DATA HONESTY RULES — VIOLATION IS UNACCEPTABLE:
 - If you need SPX or VIX historical data, call compute_analytics with symbol="^GSPC" or "^VIX". If you need current prices, call get_macro_snapshot. If you need something not available via tools, use web_search.
 - HOWEVER: well-established mathematical models (Black-Scholes, binomial trees, Kelly criterion, Sharpe ratio, correlation formulas, etc.) are formulas — you MAY use them to COMPUTE derived values (e.g. implied volatility, option fair value, optimal position size), AS LONG AS all the INPUT DATA to those formulas came from real tool calls. The formula itself is not fabrication — only making up the inputs is.
 - Example: fetching real VIX and SPX via tools, then computing Black-Scholes option price from those real inputs = ALLOWED. Inventing a VIX level and running Black-Scholes = FORBIDDEN.
-- Do NOT say "I have real verified data" unless you literally just retrieved it in this conversation via a tool call. Do NOT bluff or role-play having data.
-
-NO-BLUFF RULE — CRITICAL:
-- Never end your turn with a phrase like "Let me now compute", "Let me send the email", "Let me do X", "I'll now run Y". These are bluffs — if you're going to do it, CALL THE TOOL in the same turn. If you say "Let me compute X" without a tool_use block, you have failed.
-- If your last message ends with an intention to do something (compute / send / analyse), the very next thing must be a tool call, not more text.
+- Do NOT say "I have real verified data" unless you literally just retrieved it in this conversation via a tool call.
 `;
 
 async function runAgent(prompt, history = []) {
-  // Only pass text-only messages in history to avoid malformed tool_use/tool_result pairs
   const cleanHistory = history
     .filter(m => m.role && typeof m.content === "string" && m.content.trim())
     .map(m => ({ role: m.role, content: m.content }));
 
   const messages = [...cleanHistory, { role: "user", content: prompt }];
-  let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages });
+  let response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 8000, system: SYSTEM, tools: TOOLS, messages });
   let loop = [...messages], i = 0;
   let backtestData = null;
 
-  const BLUFF_PATTERNS = [
-    /let me (?:now )?(?:compute|send|run|calculate|analy[sz]e|fetch|check|do|redo)/i,
-    /i(?:'ll| will) (?:now )?(?:compute|send|run|calculate|analy[sz]e|fetch|check|do)/i,
-    /sending (?:the )?email (?:now|immediately)/i,
-    /(?:i have|now i have|i now have) (?:the )?real (?:verified )?data/i,
-  ];
-
-  while (i++ < 10) {
-    if (response.stop_reason === "tool_use") {
-      const assistantContent = response.content;
-      loop.push({ role: "assistant", content: assistantContent });
-
-      // ALWAYS produce a tool_result for EVERY tool_use block — no exceptions
-      const toolBlocks = assistantContent.filter(b => b.type === "tool_use");
-      const toolResults = await Promise.all(toolBlocks.map(async b => {
-        let result;
-        try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
-        if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
-        return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
-      }));
-
-      // Push tool results as user message immediately after assistant tool_use
-      loop.push({ role: "user", content: toolResults });
-
-      try {
-        response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
-      } catch (e) {
-        console.error("API error in tool loop:", e.message);
-        return `Error: ${e.message}`;
-      }
-      continue;
+  while (i++ < 15 && response.stop_reason === "tool_use") {
+    loop.push({ role: "assistant", content: response.content });
+    const toolBlocks = response.content.filter(b => b.type === "tool_use");
+    const toolResults = await Promise.all(toolBlocks.map(async b => {
+      let result;
+      try { result = await executeTool(b.name, b.input); } catch (e) { result = { error: e.message }; }
+      if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
+      return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
+    }));
+    loop.push({ role: "user", content: toolResults });
+    try {
+      response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 8000, system: SYSTEM, tools: TOOLS, messages: loop });
+    } catch (e) {
+      console.error("API error:", e.message);
+      return `Error: ${e.message}`;
     }
-
-    // Bluff detection — only on end_turn (no pending tool_use blocks)
-    if (response.stop_reason === "end_turn") {
-      const text = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
-      const isBluff = BLUFF_PATTERNS.some(p => p.test(text));
-      if (isBluff) {
-        console.log(`⚠️  Bluff detected, forcing action`);
-        loop.push({ role: "assistant", content: response.content });
-        loop.push({ role: "user", content: [{ type: "text", text: "You described an action but didn't call a tool. Call the required tool NOW — send_email, run_backtest, compute_analytics, or web_search. No more prose." }] });
-        try {
-          response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
-        } catch (e) {
-          console.error("API error in bluff loop:", e.message);
-          break;
-        }
-        continue;
-      }
-    }
-
-    break;
   }
 
   const reply = response.content.filter(b => b.type === "text").map(b => b.text).join("\n");

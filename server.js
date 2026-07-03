@@ -2204,21 +2204,18 @@ Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateStri
 
 BACKTEST RULES — follow strictly:
 - Call run_backtest immediately when asked. ALWAYS use range=5y unless specified. For "my portfolio" use all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
-- After run_backtest returns, you MUST read data from the result fields. NEVER invent, estimate, or fabricate any dates, signal values, or trade returns:
-  * triggerDates[] — the REAL entry/exit dates with actual signal values. ONLY use these when describing when trades triggered.
-  * trades[] — REAL trade list with real returnPct per trade. ONLY use these.
-  * signalStats — real signal min/max/mean. ONLY use these.
-  * metrics — all performance numbers. ONLY use these.
-- If a date is not in triggerDates[], it did NOT trigger. Do not add dates that are not there.
-- Quote exact date and signal value from triggerDates[] when describing trigger events.
 
-EMAIL RULE:
-- When asked to email: fetch needed data first, then call send_email in the same response.
-- send_email sends it immediately. Do not ask for confirmation. Just call it.
+COMPUTATION PHASE — zero interpretation, zero fabrication:
+- Every single number you present (dates, z-scores, returns, prices, trade counts) MUST come verbatim from the tool result fields. No rounding beyond what the tool returned. No interpolation. No estimation.
+- triggerDates[] = the ONLY valid source for entry/exit dates and signal values. If a date is not in this array, it does not exist.
+- trades[] = the ONLY valid source for trade-level returns and durations.
+- metrics = the ONLY valid source for Sharpe, drawdown, returns, vol etc.
+- signalStats = the ONLY valid source for signal min/max/mean.
+- If you need to present a table of trigger dates, copy them EXACTLY from triggerDates[]. Do not add, remove or modify any entry.
 
-DATA RULE:
-- Never invent market data. Fetch via tools first.
-- Analytical formulas (Black-Scholes, Kelly, Sharpe etc.) are allowed on real fetched data.
+INTERPRETATION PHASE — after presenting the raw numbers:
+- Once you have presented the real computed data, you may freely interpret, compare strategies, discuss implications, and give recommendations. This is encouraged.
+- But interpretation must never introduce new numbers. If you say "the strategy outperformed", base it on the metrics you already presented from the tool.
 `;
 
 async function runAgent(prompt, history = []) {

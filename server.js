@@ -1338,53 +1338,6 @@ async function convertReturnsToEUR(series, currency, range = "1y") {
 // ═══════════════════════════════════════════════════════════════════
 
 // Fetch price array for a symbol aligned to a date array
-async function fetchAlignedPrices(sym, allDates, range) {
-  try {
-    const raw = await fetchYahooCloses(yfSymbol(sym), range);
-    const byDate = new Map(raw.bars.map(b=>[b.date, b.close]));
-    // Forward-fill
-    let last = null;
-    return allDates.map(d => { if (byDate.has(d)) last=byDate.get(d); return last??0; });
-  } catch(e) { return new Array(allDates.length).fill(0); }
-}
-
-async function fetchAlignedReturns(sym, allDates, range) {
-  try {
-    const s = await fetchYahooReturnSeries(yfSymbol(sym), range, true);
-    const byDate = new Map(s.map(r=>[r.date, r.ret]));
-    let started=false;
-    return allDates.map(d => {
-      if (byDate.has(d)) { started=true; return byDate.get(d); }
-      return started ? 0 : 0;
-    });
-  } catch(e) { return new Array(allDates.length).fill(0); }
-}
-
-
-// ═══════════════════════════════════════════════════════════════════
-// BACKTEST ENGINE v3 — composable signal primitives
-// ═══════════════════════════════════════════════════════════════════
-
-
-
-
-// ═══════════════════════════════════════════════════════════════════
-// BACKTEST ENGINE — all computation server-side, zero Claude numbers
-// ═══════════════════════════════════════════════════════════════════
-
-// ── Signal primitives ─────────────────────────────────────────────
-const SIG = {
-  zscore:    (arr, w) => arr.map((v,i) => { if(i<w) return 0; const s=arr.slice(i-w,i); const mu=s.reduce((a,b)=>a+b,0)/w; const sd=Math.sqrt(s.reduce((a,b)=>a+(b-mu)**2,0)/w)||1e-9; return (v-mu)/sd; }),
-  momentum:  (px, w)  => px.map((v,i) => i<w ? 0 : (v-px[i-w])/px[i-w]),
-  rsi:       (px, w=14) => { const o=new Array(px.length).fill(50); for(let i=w;i<px.length;i++){ const ch=px.slice(i-w+1,i+1).map((p,j,a)=>j===0?0:p-a[j-1]); const ag=ch.map(c=>c>0?c:0).reduce((a,b)=>a+b,0)/w; const al=ch.map(c=>c<0?-c:0).reduce((a,b)=>a+b,0)/w; o[i]=al===0?100:100-100/(1+ag/al); } return o; },
-  bb_pct:    (px, w=20, n=2) => px.map((v,i) => { if(i<w) return 0.5; const s=px.slice(i-w,i); const mu=s.reduce((a,b)=>a+b,0)/w; const sd=Math.sqrt(s.reduce((a,b)=>a+(b-mu)**2,0)/w)||1e-9; return (v-(mu-n*sd))/(2*n*sd); }),
-  corr:      (a, b, w) => a.map((_,i) => { if(i<w) return 0; const as=a.slice(i-w,i),bs=b.slice(i-w,i); const ma=as.reduce((x,y)=>x+y,0)/w,mb=bs.reduce((x,y)=>x+y,0)/w; const cov=as.reduce((s,x,j)=>s+(x-ma)*(bs[j]-mb),0)/w; const sA=Math.sqrt(as.reduce((s,x)=>s+(x-ma)**2,0)/w)||1e-9; const sB=Math.sqrt(bs.reduce((s,x)=>s+(x-mb)**2,0)/w)||1e-9; return cov/(sA*sB); }),
-  vol_ratio: (r, s=10, l=60) => r.map((_,i) => { if(i<l) return 1; const sR=r.slice(i-s,i),lR=r.slice(i-l,i); const sdS=Math.sqrt(sR.reduce((a,b)=>a+b*b,0)/s),sdL=Math.sqrt(lR.reduce((a,b)=>a+b*b,0)/l); return sdL===0?1:sdS/sdL; }),
-  drawdown:  (px, w) => px.map((v,i) => { const s=px.slice(Math.max(0,i-(w||i+1)),i+1); return (v-Math.max(...s))/Math.max(...s); }),
-  var_breach:(r, w=60, p=0.05) => r.map((v,i) => { if(i<w) return 0; const sl=[...r.slice(i-w,i)].sort((a,b)=>a-b); return v<sl[Math.floor(w*p)]?-1:0; }),
-  macd:      (px, s=12, l=26) => { const ema=(a,k)=>{const o=[...a];const f=2/(k+1);for(let i=1;i<a.length;i++)o[i]=a[i]*f+o[i-1]*(1-f);return o;}; const es=ema(px,s),el=ema(px,l); const raw=px.map((_,i)=>es[i]-el[i]); return SIG.zscore(raw,l); },
-};
-
 async function fetchAlignedPrices(sym, dates, range) {
   try {
     const raw = await fetchYahooCloses(yfSymbol(sym), range);

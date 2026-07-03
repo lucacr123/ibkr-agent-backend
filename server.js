@@ -1475,252 +1475,212 @@ async function fetchAlignedReturns(sym, allDates, range) {
 // ═══════════════════════════════════════════════════════════════════
 // BACKTEST ENGINE v3 — composable signal primitives
 // ═══════════════════════════════════════════════════════════════════
+
+
+
+
+// ═══════════════════════════════════════════════════════════════════
+// BACKTEST ENGINE — all computation server-side, zero Claude numbers
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Signal primitives ─────────────────────────────────────────────
+const SIG = {
+  zscore:    (arr, w) => arr.map((v,i) => { if(i<w) return 0; const s=arr.slice(i-w,i); const mu=s.reduce((a,b)=>a+b,0)/w; const sd=Math.sqrt(s.reduce((a,b)=>a+(b-mu)**2,0)/w)||1e-9; return (v-mu)/sd; }),
+  momentum:  (px, w)  => px.map((v,i) => i<w ? 0 : (v-px[i-w])/px[i-w]),
+  rsi:       (px, w=14) => { const o=new Array(px.length).fill(50); for(let i=w;i<px.length;i++){ const ch=px.slice(i-w+1,i+1).map((p,j,a)=>j===0?0:p-a[j-1]); const ag=ch.map(c=>c>0?c:0).reduce((a,b)=>a+b,0)/w; const al=ch.map(c=>c<0?-c:0).reduce((a,b)=>a+b,0)/w; o[i]=al===0?100:100-100/(1+ag/al); } return o; },
+  bb_pct:    (px, w=20, n=2) => px.map((v,i) => { if(i<w) return 0.5; const s=px.slice(i-w,i); const mu=s.reduce((a,b)=>a+b,0)/w; const sd=Math.sqrt(s.reduce((a,b)=>a+(b-mu)**2,0)/w)||1e-9; return (v-(mu-n*sd))/(2*n*sd); }),
+  corr:      (a, b, w) => a.map((_,i) => { if(i<w) return 0; const as=a.slice(i-w,i),bs=b.slice(i-w,i); const ma=as.reduce((x,y)=>x+y,0)/w,mb=bs.reduce((x,y)=>x+y,0)/w; const cov=as.reduce((s,x,j)=>s+(x-ma)*(bs[j]-mb),0)/w; const sA=Math.sqrt(as.reduce((s,x)=>s+(x-ma)**2,0)/w)||1e-9; const sB=Math.sqrt(bs.reduce((s,x)=>s+(x-mb)**2,0)/w)||1e-9; return cov/(sA*sB); }),
+  vol_ratio: (r, s=10, l=60) => r.map((_,i) => { if(i<l) return 1; const sR=r.slice(i-s,i),lR=r.slice(i-l,i); const sdS=Math.sqrt(sR.reduce((a,b)=>a+b*b,0)/s),sdL=Math.sqrt(lR.reduce((a,b)=>a+b*b,0)/l); return sdL===0?1:sdS/sdL; }),
+  drawdown:  (px, w) => px.map((v,i) => { const s=px.slice(Math.max(0,i-(w||i+1)),i+1); return (v-Math.max(...s))/Math.max(...s); }),
+  var_breach:(r, w=60, p=0.05) => r.map((v,i) => { if(i<w) return 0; const sl=[...r.slice(i-w,i)].sort((a,b)=>a-b); return v<sl[Math.floor(w*p)]?-1:0; }),
+  macd:      (px, s=12, l=26) => { const ema=(a,k)=>{const o=[...a];const f=2/(k+1);for(let i=1;i<a.length;i++)o[i]=a[i]*f+o[i-1]*(1-f);return o;}; const es=ema(px,s),el=ema(px,l); const raw=px.map((_,i)=>es[i]-el[i]); return SIG.zscore(raw,l); },
+};
+
+async function fetchAlignedPrices(sym, dates, range) {
+  try {
+    const raw = await fetchYahooCloses(yfSymbol(sym), range);
+    const byDate = new Map(raw.bars.map(b=>[b.date, b.close]));
+    let last = null;
+    return dates.map(d => { if(byDate.has(d)) last=byDate.get(d); return last??0; });
+  } catch(e) { return new Array(dates.length).fill(0); }
+}
+
+async function fetchAlignedReturns(sym, dates, range, convertToEUR=true) {
+  try {
+    const s = await fetchYahooReturnSeries(yfSymbol(sym), range, convertToEUR);
+    const byDate = new Map(s.map(r=>[r.date, r.ret]));
+    let started=false;
+    return dates.map(d => { if(byDate.has(d)) started=true; return started?(byDate.get(d)??0):0; });
+  } catch(e) { return new Array(dates.length).fill(0); }
+}
+
 async function runBacktest(input) {
   const {
-    symbols, weights, range = "5y",
-    // ── Entry signal ──
-    signal_type = "buy_hold",
-    signal_params = {},
-    signal_direction = "momentum",
-    entry_threshold = 1.0,
-    // ── Exit signal (independent from entry) ──
-    // If exit_signal_type is null, exit uses entry signal with exit_threshold (default behaviour)
-    // If provided, exit is triggered by a completely separate signal
-    exit_signal_type = null,       // null | primitive name | "hold" | "time_stop" | "trailing_stop" | "target"
-    exit_signal_params = {},
-    exit_signal_direction = null,  // if null, inherits opposite of entry
-    exit_threshold  = 0.0,
-    hold_days       = null,        // exit after N days regardless of signal
-    trailing_stop_pct = null,      // exit if drawdown from peak-since-entry exceeds this %
-    take_profit_pct = null,        // exit if trade return exceeds this %
-    stop_loss_pct   = null,        // exit if trade return below this %
-    // ── Regime filter ──
-    regime_signal_type = null,
-    regime_signal_params = {},
-    regime_threshold = 0.0,
-    label = "Backtest",
+    symbols, weights, range="5y",
+    signal_type="buy_hold",
+    signal_params={},
+    signal_direction="momentum",
+    entry_threshold=1.0,
+    exit_signal_type=null,
+    exit_signal_params={},
+    exit_signal_direction=null,
+    exit_threshold=0.0,
+    hold_days=null,
+    trailing_stop_pct=null,
+    take_profit_pct=null,
+    stop_loss_pct=null,
+    regime_signal_type=null,
+    regime_signal_params={},
+    regime_threshold=0.0,
+    label="Backtest",
   } = input;
 
-  if (!symbols?.length) return { error: "symbols required" };
+  if (!symbols?.length) return { error:"symbols required" };
 
-  // ── Fetch portfolio returns ────────────────────────────────────
+  // ── Fetch portfolio returns (EUR-converted) ────────────────────
   const seriesArr = await Promise.all(symbols.map(async sym => {
-    try {
-      const s = await fetchYahooReturnSeries(yfSymbol(sym), range, true);
-      return { sym, series: s };
-    } catch(e) { return { sym, series: [] }; }
+    try { return { sym, series: await fetchYahooReturnSeries(yfSymbol(sym), range, true) }; }
+    catch(e) { return { sym, series:[] }; }
   }));
 
   const allDates = [...new Set(seriesArr.flatMap(x=>x.series.map(r=>r.date)))].sort();
-  if (allDates.length < 60) return { error: `Not enough data (${allDates.length} days)` };
+  if (allDates.length < 60) return { error:`Insufficient data: ${allDates.length} days` };
 
   const n = symbols.length;
-  const w = (weights?.length===n)
-    ? weights.map(v=>v/weights.reduce((a,b)=>a+b,0))
-    : symbols.map(()=>1/n);
+  const w = (weights?.length===n) ? weights.map(v=>v/weights.reduce((a,b)=>a+b,0)) : symbols.map(()=>1/n);
 
-  // Portfolio daily returns
-  const retMatrix = seriesArr.map(({series})=>{
+  const retMatrix = seriesArr.map(({series}) => {
     const byDate = new Map(series.map(r=>[r.date,r.ret]));
-    let started = false;
-    return allDates.map(d=>{ if(byDate.has(d))started=true; return started?(byDate.get(d)??0):0; });
+    let started=false;
+    return allDates.map(d => { if(byDate.has(d)) started=true; return started?(byDate.get(d)??0):0; });
   });
-  const portRets = allDates.map((_,t)=>retMatrix.reduce((s,row,i)=>s+w[i]*row[t],0));
+  const portRets = allDates.map((_,t) => retMatrix.reduce((s,row,i)=>s+w[i]*row[t],0));
 
-  // ── Compute primary signal ─────────────────────────────────────
-  let signalArr = new Array(allDates.length).fill(1); // default: buy_hold
-
-  if (signal_type !== "buy_hold") {
-    const sp = signal_params;
-    const sigSym  = sp.symbol  || symbols[0];
-    const sigSym2 = sp.symbol2 || null;
-    const win     = sp.window  || 30;
-    const win2    = sp.window2 || 60;
-
-    // Fetch signal asset data
-    const sigPrices = await fetchAlignedPrices(sigSym, allDates, range);
-    const sigRets   = await fetchAlignedReturns(sigSym, allDates, range);
-    let sig2Prices  = sigSym2 ? await fetchAlignedPrices(sigSym2, allDates, range) : null;
-
-    switch(signal_type) {
-      case "zscore":      signalArr = SIG.zscore(sigRets, win); break;
-      case "momentum":    signalArr = SIG.momentum(sigPrices, win); break;
-      case "rsi":         signalArr = SIG.rsi(sigPrices, win); break;
-      case "bb_pct":      signalArr = SIG.bb_pct(sigPrices, win, sp.nstd||2).map(v=>v-0.5); break; // centre at 0
-      case "corr":
-        const corSym = sp.symbol2||"^GSPC";
-        const corRets = await fetchAlignedReturns(corSym, allDates, range);
-        signalArr = SIG.corr(sigRets, corRets, win); break;
-      case "vol_ratio":   signalArr = SIG.vol_ratio(sigRets, win, win2).map(v=>v-1); break; // centre at 0
-      case "drawdown":    signalArr = SIG.drawdown(sigPrices, win).map(v=>v*10); break; // scale for threshold
-      case "var_breach":  signalArr = SIG.var_breach(sigRets, win, sp.pct||0.05); break;
-      case "spread":      if(sig2Prices) signalArr = SIG.zscore(SIG.spread(sigPrices,sig2Prices),win); break;
-      case "zscore_spread": if(sig2Prices) signalArr = SIG.zscore_spread(sigPrices,sig2Prices,win); break;
-      case "macd":        signalArr = SIG.macd(sigPrices, win, win2); break;
-      case "vol_zscore":  signalArr = SIG.zscore(sigRets.map(r=>r*r), win); break; // z-score of variance
-      case "port_zscore": signalArr = SIG.zscore(portRets, win); break; // z-score of portfolio's own returns
-      case "port_momentum":signalArr = SIG.momentum(portRets.reduce((a,r,i)=>{a.push((a[a.length-1]||100)*(1+r));return a;},[100]).slice(1), win); break;
-      default: signalArr = SIG.zscore(sigRets, win);
-    }
-
-    // Optional regime filter
-    if (regime_signal_type) {
-      const rsp = regime_signal_params;
-      const rSym = rsp.symbol || sigSym;
-      const rPrices = await fetchAlignedPrices(rSym, allDates, range);
-      const rRets   = await fetchAlignedReturns(rSym, allDates, range);
-      let regimeArr;
-      switch(regime_signal_type) {
-        case "zscore":   regimeArr = SIG.zscore(rRets, rsp.window||60); break;
-        case "vol_ratio":regimeArr = SIG.vol_ratio(rRets, rsp.window||10, rsp.window2||60).map(v=>1-v); break; // invert: low vol = good regime
-        case "momentum": regimeArr = SIG.momentum(rPrices, rsp.window||60); break;
-        case "rsi":      regimeArr = SIG.rsi(rPrices, rsp.window||14).map(v=>(v-50)/50); break;
-        default:         regimeArr = SIG.zscore(rRets, rsp.window||60);
-      }
-      signalArr = SIG.regime_filter(signalArr, regimeArr, regime_threshold);
+  // ── Compute signal ─────────────────────────────────────────────
+  async function computeSignal(sType, sParams, dates) {
+    if (sType==="buy_hold") return new Array(dates.length).fill(1);
+    const sp = sParams||{};
+    const sym = sp.symbol || symbols[0];
+    const win = sp.window||30, win2 = sp.window2||60;
+    const prices = await fetchAlignedPrices(sym, dates, range);
+    const rets   = await fetchAlignedReturns(sym, dates, range, false); // keep USD for factors
+    let sym2Prices = sp.symbol2 ? await fetchAlignedPrices(sp.symbol2, dates, range) : null;
+    let sym2Rets   = sp.symbol2 ? await fetchAlignedReturns(sp.symbol2, dates, range, false) : null;
+    switch(sType) {
+      case "zscore":       return SIG.zscore(rets, win);
+      case "momentum":     return SIG.momentum(prices, win);
+      case "rsi":          return SIG.rsi(prices, win);
+      case "bb_pct":       return SIG.bb_pct(prices, win, sp.nstd||2).map(v=>v-0.5);
+      case "corr":         return sym2Rets ? SIG.corr(rets, sym2Rets, win) : SIG.zscore(rets,win);
+      case "vol_ratio":    return SIG.vol_ratio(rets, win, win2).map(v=>v-1);
+      case "drawdown":     return SIG.drawdown(prices, win).map(v=>v*10);
+      case "var_breach":   return SIG.var_breach(rets, win, sp.pct||0.05);
+      case "macd":         return SIG.macd(prices, win, win2);
+      case "vol_zscore":   return SIG.zscore(rets.map(r=>r*r), win);
+      case "port_zscore":  return SIG.zscore(portRets, win);
+      case "spread":       return sym2Prices ? SIG.zscore(prices.map((v,i)=>sym2Prices[i]===0?0:(v-sym2Prices[i])/sym2Prices[i]),win) : SIG.zscore(rets,win);
+      default:             return SIG.zscore(rets, win);
     }
   }
 
-  // ── Compute optional independent EXIT signal ───────────────────
-  // If exit_signal_type provided, computes a separate signal series that triggers exit
-  let exitSignalArr = null;
-  if (exit_signal_type && exit_signal_type !== "hold" && exit_signal_type !== "buy_hold") {
-    const esp = exit_signal_params;
-    const eSym  = esp.symbol  || signal_params.symbol || symbols[0];
-    const eSym2 = esp.symbol2 || null;
-    const eWin  = esp.window  || 30;
-    const eWin2 = esp.window2 || 60;
-    const ePrices = await fetchAlignedPrices(eSym, allDates, range);
-    const eRets   = await fetchAlignedReturns(eSym, allDates, range);
-    const eP2     = eSym2 ? await fetchAlignedPrices(eSym2, allDates, range) : null;
-    switch(exit_signal_type) {
-      case "zscore":         exitSignalArr = SIG.zscore(eRets, eWin); break;
-      case "momentum":       exitSignalArr = SIG.momentum(ePrices, eWin); break;
-      case "rsi":            exitSignalArr = SIG.rsi(ePrices, eWin); break;
-      case "bb_pct":         exitSignalArr = SIG.bb_pct(ePrices, eWin, esp.nstd||2).map(v=>v-0.5); break;
-      case "corr": {
-        const cSym = esp.symbol2 || "^GSPC";
-        const cRets = await fetchAlignedReturns(cSym, allDates, range);
-        exitSignalArr = SIG.corr(eRets, cRets, eWin); break;
-      }
-      case "vol_ratio":      exitSignalArr = SIG.vol_ratio(eRets, eWin, eWin2).map(v=>v-1); break;
-      case "drawdown":       exitSignalArr = SIG.drawdown(ePrices, eWin).map(v=>v*10); break;
-      case "var_breach":     exitSignalArr = SIG.var_breach(eRets, eWin, esp.pct||0.05); break;
-      case "spread":         if(eP2) exitSignalArr = SIG.zscore(SIG.spread(ePrices,eP2),eWin); break;
-      case "zscore_spread":  if(eP2) exitSignalArr = SIG.zscore_spread(ePrices,eP2,eWin); break;
-      case "macd":           exitSignalArr = SIG.macd(ePrices, eWin, eWin2); break;
-      case "vol_zscore":     exitSignalArr = SIG.zscore(eRets.map(r=>r*r), eWin); break;
-      case "port_zscore":    exitSignalArr = SIG.zscore(portRets, eWin); break;
-      default:               exitSignalArr = SIG.zscore(eRets, eWin);
-    }
+  const signalArr   = await computeSignal(signal_type, signal_params, allDates);
+  const exitSigArr  = exit_signal_type ? await computeSignal(exit_signal_type, exit_signal_params, allDates) : null;
+  let regimeArr     = null;
+  if (regime_signal_type) {
+    regimeArr = await computeSignal(regime_signal_type, regime_signal_params, allDates);
   }
 
   // ── Generate positions ─────────────────────────────────────────
-  let pos = 0;
-  let entryIdx = -1;
-  let peakSinceEntry = 0;
+  let pos=0, entryIdx=-1, peakSinceEntry=0;
   const positions = allDates.map((d,i) => {
-    if (signal_type === "buy_hold") return 1;
+    if (signal_type==="buy_hold") return 1;
+    // Regime gate
+    if (regimeArr && regimeArr[i] < regime_threshold) { if(pos===1) pos=0; return pos; }
     const sig = signalArr[i]??0;
-
-    if (pos === 0) {
-      // ── ENTRY LOGIC ──
-      let enter = false;
-      if (signal_direction==="momentum"       && sig >  entry_threshold) enter = true;
-      if (signal_direction==="mean_reversion" && sig < -entry_threshold) enter = true;
-      if (enter) {
-        pos = 1;
-        entryIdx = i;
-        peakSinceEntry = 0;
-      }
+    if (pos===0) {
+      if (signal_direction==="momentum"       && sig >  entry_threshold) { pos=1; entryIdx=i; peakSinceEntry=0; }
+      if (signal_direction==="mean_reversion" && sig < -entry_threshold) { pos=1; entryIdx=i; peakSinceEntry=0; }
     } else {
-      // ── EXIT LOGIC ──
-      // 1. Exit if independent exit signal fires
-      if (exit_signal_type === "hold") {
-        // "hold" means don't exit on signal — only exit on time_stop / trailing_stop / take_profit / stop_loss
-      } else if (exitSignalArr) {
-        // Use independent exit signal (default direction = opposite of entry unless overridden)
-        const eSig = exitSignalArr[i] ?? 0;
-        const eDir = exit_signal_direction
-          || (signal_direction === "momentum" ? "mean_reversion" : "momentum");
-        if (eDir === "momentum"       && eSig >  exit_threshold) pos = 0;
-        if (eDir === "mean_reversion" && eSig < -exit_threshold) pos = 0;
+      // Primary exit: separate exit signal or entry signal reversal
+      if (exitSigArr) {
+        const eSig = exitSigArr[i]??0;
+        const eDir = exit_signal_direction||(signal_direction==="momentum"?"mean_reversion":"momentum");
+        if (eDir==="momentum"       && eSig >  exit_threshold) pos=0;
+        if (eDir==="mean_reversion" && eSig < -exit_threshold) pos=0;
       } else {
-        // Default: use entry signal reverting to exit_threshold
-        if (signal_direction==="momentum"       && sig <= exit_threshold) pos = 0;
-        if (signal_direction==="mean_reversion" && sig >= exit_threshold) pos = 0;
+        if (signal_direction==="momentum"       && sig <= exit_threshold) pos=0;
+        if (signal_direction==="mean_reversion" && sig >= exit_threshold) pos=0;
       }
-
-      // 2. Time-based stop
-      if (pos === 1 && hold_days && entryIdx >= 0 && (i - entryIdx) >= hold_days) pos = 0;
-
-      // 3. Compute trade return since entry (using cumulative portRet)
-      if (pos === 1 && entryIdx >= 0) {
-        const tradeRet = portRets.slice(entryIdx+1, i+1).reduce((a,r)=>a*(1+r),1) - 1;
-        if (tradeRet > peakSinceEntry) peakSinceEntry = tradeRet;
-
-        // 4. Take profit
-        if (take_profit_pct != null && tradeRet >= take_profit_pct/100) pos = 0;
-
-        // 5. Stop loss
-        if (stop_loss_pct != null && tradeRet <= stop_loss_pct/100) pos = 0;
-
-        // 6. Trailing stop (drawdown from peak-since-entry exceeds threshold)
-        if (trailing_stop_pct != null) {
-          const trailDD = (tradeRet - peakSinceEntry) / (1 + peakSinceEntry);
-          if (trailDD <= -trailing_stop_pct/100) pos = 0;
-        }
+      // Overlay stops
+      if (pos===1 && entryIdx>=0) {
+        const tradeRet = portRets.slice(entryIdx+1,i+1).reduce((a,r)=>a*(1+r),1)-1;
+        if (tradeRet>peakSinceEntry) peakSinceEntry=tradeRet;
+        if (hold_days           && (i-entryIdx)>=hold_days)                    pos=0;
+        if (take_profit_pct!=null && tradeRet>=take_profit_pct/100)            pos=0;
+        if (stop_loss_pct!=null   && tradeRet<=stop_loss_pct/100)              pos=0;
+        if (trailing_stop_pct!=null) { const dd=(tradeRet-peakSinceEntry)/(1+peakSinceEntry); if(dd<=-trailing_stop_pct/100) pos=0; }
       }
-
-      if (pos === 0) { entryIdx = -1; peakSinceEntry = 0; }
+      if (pos===0) { entryIdx=-1; peakSinceEntry=0; }
     }
     return pos;
   });
 
-  // ── Trade log ─────────────────────────────────────────────────
-  const trades = [];
-  let tEntry = null, tRets = [];
-  positions.forEach((p,i) => {
-    const prev = i>0?positions[i-1]:0;
-    if (p===1&&prev===0) { tEntry=allDates[i]; tRets=[]; }
-    if (p===1) tRets.push(portRets[i]);
-    if (p===0&&prev===1&&tEntry) {
-      const r = tRets.reduce((a,b)=>a*(1+b),1)-1;
+  // ── Trades ────────────────────────────────────────────────────
+  const trades=[];
+  let tEntry=null, tRets=[];
+  positions.forEach((p,i)=>{
+    const prev=i>0?positions[i-1]:0;
+    if(p===1&&prev===0){tEntry=allDates[i];tRets=[];}
+    if(p===1) tRets.push(portRets[i]);
+    if(p===0&&prev===1&&tEntry){
+      const r=tRets.reduce((a,b)=>a*(1+b),1)-1;
       trades.push({entryDate:tEntry,exitDate:allDates[i],durationDays:tRets.length,returnPct:+(r*100).toFixed(3),profitable:r>0});
-      tEntry=null; tRets=[];
+      tEntry=null;tRets=[];
     }
   });
-  if (tEntry) {
-    const r = tRets.reduce((a,b)=>a*(1+b),1)-1;
-    trades.push({entryDate:tEntry,exitDate:allDates[allDates.length-1],durationDays:tRets.length,returnPct:+(r*100).toFixed(3),profitable:r>0,open:true});
-  }
+  if(tEntry){const r=tRets.reduce((a,b)=>a*(1+b),1)-1;trades.push({entryDate:tEntry,exitDate:allDates[allDates.length-1],durationDays:tRets.length,returnPct:+(r*100).toFixed(3),profitable:r>0,open:true});}
 
-  // ── Equity curve ──────────────────────────────────────────────
-  let eq=100, peak=100, maxDD=0;
-  const equityCurve=[], drawdownCurve=[], dailyRets=[];
+  // ── Equity curve + drawdown ────────────────────────────────────
+  let eq=100,peak=100,maxDD=0;
+  const equityCurve=[],drawdownCurve=[],dailyRets=[];
   allDates.forEach((d,i)=>{
-    const ret = positions[i]*portRets[i];
+    const ret=positions[i]*portRets[i];
     eq*=(1+ret);
-    if(eq>peak)peak=eq;
+    if(eq>peak) peak=eq;
     const dd=(eq-peak)/peak*100;
-    if(dd<maxDD)maxDD=dd;
+    if(dd<maxDD) maxDD=dd;
     equityCurve.push({date:d,value:+eq.toFixed(4)});
     drawdownCurve.push({date:d,value:+dd.toFixed(4)});
     dailyRets.push(ret);
   });
 
+  // ── Trigger dates (server-computed, authoritative) ─────────────
+  const triggerDates = allDates.map((d,i)=>{
+    const prev=i>0?positions[i-1]:0;
+    if(positions[i]===1&&prev===0) return {date:d,type:"ENTRY",signal:+(signalArr[i]??0).toFixed(4)};
+    if(positions[i]===0&&prev===1) return {date:d,type:"EXIT", signal:+(signalArr[i]??0).toFixed(4)};
+    return null;
+  }).filter(Boolean);
+
+  // All dates where signal was in entry zone
+  const signalBreachDates = allDates.map((d,i)=>{
+    const sig=signalArr[i]??0;
+    const inZone = signal_direction==="momentum"?sig>entry_threshold:sig<-entry_threshold;
+    if(!inZone) return null;
+    return {date:d, signal:+(sig).toFixed(4)};
+  }).filter(Boolean);
+
   // ── Metrics ───────────────────────────────────────────────────
-  const nT=trades.length, prof=trades.filter(t=>t.profitable), loss=trades.filter(t=>!t.profitable);
-  const EV = nT?trades.reduce((a,t)=>a+t.returnPct,0)/nT:0;
-  const winR= nT?prof.length/nT:0;
-  const avgW= prof.length?prof.reduce((a,t)=>a+t.returnPct,0)/prof.length:0;
-  const avgL= loss.length?loss.reduce((a,t)=>a+t.returnPct,0)/loss.length:0;
+  const nT=trades.length,prof=trades.filter(t=>t.profitable),loss=trades.filter(t=>!t.profitable);
+  const EV=nT?trades.reduce((a,t)=>a+t.returnPct,0)/nT:0;
+  const avgW=prof.length?prof.reduce((a,t)=>a+t.returnPct,0)/prof.length:0;
+  const avgL=loss.length?loss.reduce((a,t)=>a+t.returnPct,0)/loss.length:0;
   const retStd=nT?Math.sqrt(trades.reduce((a,t)=>a+(t.returnPct-EV)**2,0)/nT):0;
   const avgDur=nT?trades.reduce((a,t)=>a+t.durationDays,0)/nT:0;
-  const totalRet=(eq/100-1)*100, nYears=allDates.length/252;
+  const totalRet=(eq/100-1)*100,nYears=allDates.length/252;
   const annRet=((eq/100)**(1/nYears)-1)*100;
-  const meanR=dailyRets.reduce((a,b)=>a+b,0)/dailyRets.length;
-  const annVol=Math.sqrt(dailyRets.reduce((a,b)=>a+(b-meanR)**2,0)/dailyRets.length)*Math.sqrt(252)*100;
+  const mu=dailyRets.reduce((a,b)=>a+b,0)/dailyRets.length;
+  const annVol=Math.sqrt(dailyRets.reduce((a,b)=>a+(b-mu)**2,0)/dailyRets.length)*Math.sqrt(252)*100;
   const RF=RISK_FREE_RATE_PCT/100;
   const sharpe=annVol===0?0:+((annRet/100-RF)/(annVol/100)).toFixed(3);
   const negR=dailyRets.filter(r=>r<0);
@@ -1731,98 +1691,39 @@ async function runBacktest(input) {
   const var95=+(sorted[Math.floor(sorted.length*0.05)]*100).toFixed(3);
   const pctInMkt=+(positions.filter(p=>p===1).length/positions.length*100).toFixed(1);
 
-  // ── Extract actual trigger dates from signal + position arrays ───
-  // These are the REAL dates — Claude must use ONLY these, never invent dates
-  const triggerDates = allDates
-    .map((d, i) => {
-      const prevPos = i > 0 ? positions[i-1] : 0;
-      const curPos  = positions[i];
-      const sig     = signalArr[i] ?? 0;
-      if (curPos === 1 && prevPos === 0) return { date: d, type: "ENTRY", signal: +sig.toFixed(4) };
-      if (curPos === 0 && prevPos === 1) return { date: d, type: "EXIT",  signal: +sig.toFixed(4) };
-      return null;
-    })
-    .filter(Boolean);
-
-  // Signal stats: min, max, mean, dates where signal crossed thresholds
-  const sigAboveEntry = allDates.filter((d,i) =>
-    signal_direction === "momentum"
-      ? signalArr[i] > entry_threshold
-      : signalArr[i] < -entry_threshold
-  );
-
   return {
-    label, symbols, weights:w, range,
-    signal_type, signal_params, signal_direction,
-    entry_threshold, exit_threshold,
-    exit_signal_type, exit_signal_params, exit_signal_direction,
-    hold_days, trailing_stop_pct, take_profit_pct, stop_loss_pct,
-    regime_signal_type, regime_signal_params, regime_threshold,
+    label,symbols,weights:w,range,
+    signal_type,signal_params,signal_direction,entry_threshold,
+    exit_signal_type,exit_threshold,
+    hold_days,trailing_stop_pct,take_profit_pct,stop_loss_pct,
+    regime_signal_type,regime_threshold,
     dates:allDates,
-    equityCurve, drawdownCurve,
+    equityCurve,drawdownCurve,
     signalSeries:signalArr.map(v=>+v.toFixed(4)),
-    exitSignalSeries: exitSignalArr ? exitSignalArr.map(v=>+v.toFixed(4)) : null,
-    triggerDates,          // REAL entry/exit dates with actual signal values
-    datesAboveThreshold: sigAboveEntry,  // all dates where signal was in entry zone
-    signalStats: {
-      min: +Math.min(...signalArr).toFixed(4),
-      max: +Math.max(...signalArr).toFixed(4),
-      mean: +(signalArr.reduce((a,b)=>a+b,0)/signalArr.length).toFixed(4),
-      nAboveEntry: sigAboveEntry.length,
+    exitSignalSeries:exitSigArr?exitSigArr.map(v=>+v.toFixed(4)):null,
+    triggerDates,
+    signalBreachDates,
+    signalStats:{
+      min:+Math.min(...signalArr).toFixed(4),
+      max:+Math.max(...signalArr).toFixed(4),
+      mean:+(signalArr.reduce((a,b)=>a+b,0)/signalArr.length).toFixed(4),
+      nBreaches:signalBreachDates.length,
     },
     trades:trades.slice(0,500),
     metrics:{
-      totalReturnPct:+totalRet.toFixed(2), annualizedRetPct:+annRet.toFixed(2),
-      annualizedVolPct:+annVol.toFixed(2), maxDrawdownPct:+maxDD.toFixed(2),
-      sharpe, sortino, calmar, var95DailyPct:var95,
-      nDays:allDates.length, nYears:+nYears.toFixed(1), pctTimeInMarket:pctInMkt,
-      nTrades:nT, nProfitable:prof.length, nLosing:loss.length,
-      winRatePct:+(winR*100).toFixed(1),
-      evPerTradePct:+EV.toFixed(3), condEvWinPct:+avgW.toFixed(3), condEvLossPct:+avgL.toFixed(3),
-      tradeRetStdPct:+retStd.toFixed(3), avgDurationDays:+avgDur.toFixed(1),
+      totalReturnPct:+totalRet.toFixed(2),annualizedRetPct:+annRet.toFixed(2),
+      annualizedVolPct:+annVol.toFixed(2),maxDrawdownPct:+maxDD.toFixed(2),
+      sharpe,sortino,calmar,var95DailyPct:var95,
+      nDays:allDates.length,nYears:+nYears.toFixed(1),pctTimeInMarket:pctInMkt,
+      nTrades:nT,nProfitable:prof.length,nLosing:loss.length,
+      winRatePct:+(prof.length/Math.max(nT,1)*100).toFixed(1),
+      evPerTradePct:+EV.toFixed(3),condEvWinPct:+avgW.toFixed(3),condEvLossPct:+avgL.toFixed(3),
+      tradeRetStdPct:+retStd.toFixed(3),avgDurationDays:+avgDur.toFixed(1),
       profitFactor:avgL===0?null:+Math.abs(avgW/avgL).toFixed(2),
     },
   };
 }
 
-
-
-// ── Python audit script generator ────────────────────────────────
-function buildPythonAuditScript({ subject, data, code, body }) {
-  const ts = new Date().toISOString();
-  const dataStr = data ? JSON.stringify(data, null, 2) : "{}";
-  const codeSection = code || "# Add your analysis code here using the DATA variable above";
-  return `#!/usr/bin/env python3
-"""
-IBKR Agent — Audit Script
-Generated: ${ts}
-Subject: ${(subject||"").replace(/[\`]/g,"'")}
-
-This script reproduces the analysis sent by IBKR Agent.
-All input data was fetched from Yahoo Finance / IBKR Flex at generation time.
-Dependencies: pip install numpy pandas matplotlib scipy yfinance
-"""
-
-import numpy as np
-import pandas as pd
-import json
-from datetime import datetime
-
-# ── Raw data fetched at generation time ───────────────────────────
-DATA = json.loads("""
-${dataStr}
-""")
-
-# ── Reproduce computations ────────────────────────────────────────
-${codeSection}
-
-# ── Email content (for reference) ─────────────────────────────────
-ANALYSIS_SUMMARY = """
-${(body||"").replace(/"/g,"'")}
-"""
-print("Analysis summary:", ANALYSIS_SUMMARY[:500])
-`;
-}
 
 // ── Send push notification ────────────────────────────────────────
 async function sendPush(title, body, icon = "📊") {
@@ -2145,33 +2046,29 @@ const TOOLS = [
   },
   {
     name: "run_backtest",
-    description: "Run a signal-based backtest. ALWAYS call immediately when asked — never ask for confirmation. ALWAYS use range=5y unless user specifies. For 'my portfolio' use all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L. IMPORTANT: entry and exit can use INDEPENDENT signals. Set exit_signal_type='hold' to only exit via stops (time/trailing/take_profit/stop_loss). Set exit_signal_type to any primitive to use a different signal for exit than entry.",
+    description: "Run a signal-based portfolio backtest. Server computes everything — Claude must NOT reproduce any numbers from the result in text. After calling this, say 'Backtest complete — results rendered below.' then give qualitative interpretation ONLY. ALWAYS use range=5y. Signals: buy_hold | zscore | momentum | rsi | bb_pct | corr | vol_ratio | drawdown | var_breach | macd | vol_zscore | port_zscore | spread.",
     input_schema: {
       type: "object",
       properties: {
-        symbols:              { type: "array", items: { type: "string" }, description: "Yahoo Finance symbols for the portfolio to trade." },
-        weights:              { type: "array", items: { type: "number" }, description: "Weights summing to 1. Omit for equal weight." },
-        range:                { type: "string", description: "ALWAYS 5y unless user says otherwise. Options: 1y 2y 5y 10y max." },
-        label:                { type: "string", description: "Human-readable strategy name." },
-
-        signal_type:          { type: "string", description: "Entry signal primitive: buy_hold | zscore | momentum | rsi | bb_pct | corr | vol_ratio | drawdown | var_breach | spread | zscore_spread | macd | vol_zscore | port_zscore | port_momentum" },
-        signal_params:        { type: "object", description: "Entry signal params: { symbol, symbol2, window (default 30), window2 (default 60), nstd (default 2), pct (default 0.05) }" },
-        signal_direction:     { type: "string", description: "Entry direction: momentum (enter when signal > threshold) or mean_reversion (enter when signal < -threshold). Default momentum." },
-        entry_threshold:      { type: "number", description: "Threshold to enter. Default 1.0 for z-score based, 70 for RSI, 0.3 for bb_pct." },
-
-        exit_signal_type:     { type: "string", description: "Optional INDEPENDENT exit signal. Options: null (use entry signal reverting to exit_threshold) | 'hold' (never exit on signal, only stops) | any primitive name (use different signal to exit). E.g. entry on zscore, exit on RSI overbought." },
-        exit_signal_params:   { type: "object", description: "Exit signal params (same structure as signal_params)." },
-        exit_signal_direction:{ type: "string", description: "Exit direction: momentum or mean_reversion. If null, uses opposite of entry_direction." },
-        exit_threshold:       { type: "number", description: "Exit signal threshold. Default 0." },
-
-        hold_days:            { type: "number", description: "Optional: exit after N days regardless of signal." },
-        trailing_stop_pct:    { type: "number", description: "Optional: exit if drawdown from peak-since-entry exceeds this % (e.g. 5 = 5%)." },
-        take_profit_pct:      { type: "number", description: "Optional: exit if trade return reaches this % (e.g. 10 = 10%)." },
-        stop_loss_pct:        { type: "number", description: "Optional: exit if trade return falls to this % (e.g. -5 = -5%). Should be negative." },
-
-        regime_signal_type:   { type: "string", description: "Optional regime filter — same options as signal_type. E.g. only trade when vol_ratio low or ^GSPC momentum positive." },
-        regime_signal_params: { type: "object", description: "Regime signal params." },
-        regime_threshold:     { type: "number", description: "Regime must be above this to allow trading. Default 0." }
+        symbols:              { type: "array",  items:{type:"string"}, description: "Yahoo symbols. Portfolio: CSPX.L CNDX.L CSSX5E.SW IEEM.L VUAG.L VWRL.L NQSE.DE VFEM.L" },
+        weights:              { type: "array",  items:{type:"number"}, description: "Weights summing to 1. Omit for equal weight." },
+        range:                { type: "string", description: "ALWAYS 5y unless specified. Options: 1y 2y 5y 10y max." },
+        label:                { type: "string", description: "Strategy name." },
+        signal_type:          { type: "string", description: "buy_hold | zscore | momentum | rsi | bb_pct | corr | vol_ratio | drawdown | var_breach | macd | vol_zscore | port_zscore | spread" },
+        signal_params:        { type: "object", description: "{ symbol, symbol2, window (default 30), window2 (default 60), nstd, pct }" },
+        signal_direction:     { type: "string", description: "momentum or mean_reversion" },
+        entry_threshold:      { type: "number", description: "Entry threshold. Default 1.0." },
+        exit_signal_type:     { type: "string", description: "Optional separate exit signal." },
+        exit_signal_params:   { type: "object" },
+        exit_signal_direction:{ type: "string" },
+        exit_threshold:       { type: "number", description: "Exit threshold. Default 0." },
+        hold_days:            { type: "number", description: "Time stop in days." },
+        trailing_stop_pct:    { type: "number", description: "Trailing stop %." },
+        take_profit_pct:      { type: "number", description: "Take profit %." },
+        stop_loss_pct:        { type: "number", description: "Stop loss % (negative)." },
+        regime_signal_type:   { type: "string", description: "Regime filter signal type." },
+        regime_signal_params: { type: "object" },
+        regime_threshold:     { type: "number", description: "Regime threshold. Default 0." }
       },
       required: ["symbols"]
     }
@@ -2202,21 +2099,19 @@ Always use combined portfolio percentages, not per-account NAV%. Format matrices
 1Y return = time-weighted return over last 365 days (label as "1Y Return", not YTD).
 Format: EUR=€, GBP=£, USD=$, 2 decimal places. Today: ${new Date().toDateString()}.
 
-BACKTEST RULES — follow strictly:
-- Call run_backtest immediately when asked. ALWAYS use range=5y unless specified. For "my portfolio" use all 8 symbols: CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L.
+BACKTEST RULES:
+- Call run_backtest immediately when asked. ALWAYS use range=5y unless specified. For "my portfolio" use: CSPX.L CNDX.L CSSX5E.SW IEEM.L VUAG.L VWRL.L NQSE.DE VFEM.L.
+- After the tool returns, write exactly: "Backtest complete — results rendered below." Then give qualitative commentary only.
+- NEVER write dates, z-scores, trade returns, signal values or any numbers from the result in your text. The UI renders all computed data directly. Zero numerical output in text after a backtest.
 
-COMPUTATION PHASE — zero interpretation, zero fabrication:
-- Every single number you present (dates, z-scores, returns, prices, trade counts) MUST come verbatim from the tool result fields. No rounding beyond what the tool returned. No interpolation. No estimation.
-- triggerDates[] = the ONLY valid source for entry/exit dates and signal values. If a date is not in this array, it does not exist.
-- trades[] = the ONLY valid source for trade-level returns and durations.
-- metrics = the ONLY valid source for Sharpe, drawdown, returns, vol etc.
-- signalStats = the ONLY valid source for signal min/max/mean.
-- If you need to present a table of trigger dates, copy them EXACTLY from triggerDates[]. Do not add, remove or modify any entry.
+EMAIL RULE:
+- When asked to email anything: call the tools needed to get the data, then call send_email in the same response. Do it immediately without asking for confirmation.
 
-INTERPRETATION PHASE — after presenting the raw numbers:
-- Once you have presented the real computed data, you may freely interpret, compare strategies, discuss implications, and give recommendations. This is encouraged.
-- But interpretation must never introduce new numbers. If you say "the strategy outperformed", base it on the metrics you already presented from the tool.
+DATA RULE:
+- Never invent market data. Always fetch via tools first.
+- Mathematical models (Black-Scholes, Kelly, etc.) are fine to apply to real fetched data.
 `;
+
 
 async function runAgent(prompt, history = []) {
   const cleanHistory = history
@@ -2233,9 +2128,9 @@ async function runAgent(prompt, history = []) {
   });
 
   let loop = [...messages];
-  let backtestData = null;
   let toolCallCount = 0;
-  const MAX_TOOL_CALLS = 8; // hard cap — prevents infinite loops
+  let backtestData = null;
+  const MAX_TOOL_CALLS = 8;
 
   while (response.stop_reason === "tool_use" && toolCallCount < MAX_TOOL_CALLS) {
     loop.push({ role: "assistant", content: response.content });
@@ -2243,30 +2138,20 @@ async function runAgent(prompt, history = []) {
 
     const toolResults = await Promise.all(toolBlocks.map(async b => {
       let result;
-      try {
-        result = await executeTool(b.name, b.input);
-      } catch (e) {
-        result = { error: e.message };
-      }
+      try { result = await executeTool(b.name, b.input); } catch(e) { result = { error: e.message }; }
       if (b.name === "run_backtest" && result?.equityCurve) backtestData = result;
       toolCallCount++;
-      console.log(`🔧 Tool ${b.name} called (${toolCallCount}/${MAX_TOOL_CALLS})`);
+      console.log(`🔧 Tool ${b.name} (${toolCallCount}/${MAX_TOOL_CALLS})`);
       return { type: "tool_result", tool_use_id: b.id, content: JSON.stringify(result) };
     }));
 
     loop.push({ role: "user", content: toolResults });
 
     try {
-      response = await anthropic.messages.create({
-        model: "claude-sonnet-4-6",
-        max_tokens: 4000,
-        system: SYSTEM,
-        tools: TOOLS,
-        messages: loop,
-      });
-    } catch (e) {
+      response = await anthropic.messages.create({ model: "claude-sonnet-4-6", max_tokens: 4000, system: SYSTEM, tools: TOOLS, messages: loop });
+    } catch(e) {
       console.error("API error:", e.message);
-      return `Error processing request: ${e.message}`;
+      return `Error: ${e.message}`;
     }
   }
 
@@ -2285,7 +2170,7 @@ app.post("/api/chat", async (req, res) => {
     } else {
       res.json({ reply: result });
     }
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/api/account", async (req, res) => {
@@ -2531,128 +2416,71 @@ app.get("/api/debug/fx/:symbol", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
 });
 
-// ── Backtest API endpoints ────────────────────────────────────────
-// Direct backtest (called from chat tool)
-app.post("/api/backtest", async (req, res) => {
-  try { res.json(await runBacktest(req.body)); }
-  catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Email backtest results (strategy spec + key metrics) to user
+// Backtest email export
 app.post("/api/backtest/email", async (req, res) => {
-  const { backtestResult } = req.body;
-  if (!backtestResult) return res.status(400).json({ error: "backtestResult required" });
-  const m = backtestResult.metrics || {};
+  const { backtestResult: bt } = req.body;
+  if (!bt) return res.status(400).json({ error: "backtestResult required" });
+  const m = bt.metrics||{};
+  const pyScript = `#!/usr/bin/env python3
+"""Backtest Audit Script — ${bt.label||"Strategy"}
+Generated by IBKR Agent. pip install pandas numpy matplotlib
+"""
+import pandas as pd, numpy as np, json, matplotlib.pyplot as plt
 
-  // Build Python audit script
-  const pyData = {
-    symbols:       backtestResult.symbols,
-    weights:       backtestResult.weights,
-    range:         backtestResult.range,
-    signal_type:   backtestResult.signal_type,
-    signal_params: backtestResult.signal_params,
-    entry_threshold: backtestResult.entry_threshold,
-    exit_threshold:  backtestResult.exit_threshold,
-    signal_direction: backtestResult.signal_direction,
-    dates:         backtestResult.dates,
-    equity_curve:  backtestResult.equityCurve?.map(p=>p.value),
-    drawdown:      backtestResult.drawdownCurve?.map(p=>p.value),
-    signal_series: backtestResult.signalSeries,
-    trades:        backtestResult.trades,
-    metrics:       m,
-  };
-  const pyCode = `
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
+DATA = json.loads("""${JSON.stringify({
+  label: bt.label, symbols: bt.symbols, weights: bt.weights, range: bt.range,
+  signal_type: bt.signal_type, signal_params: bt.signal_params,
+  signal_direction: bt.signal_direction, entry_threshold: bt.entry_threshold,
+  dates: bt.dates, equity_curve: bt.equityCurve?.map(p=>p.value),
+  drawdown: bt.drawdownCurve?.map(p=>p.value), signal_series: bt.signalSeries,
+  trigger_dates: bt.triggerDates, trades: bt.trades, metrics: m,
+})}""")
 
-# Reconstruct equity curve
 dates = pd.to_datetime(DATA['dates'])
 equity = pd.Series(DATA['equity_curve'], index=dates)
 drawdown = pd.Series(DATA['drawdown'], index=dates)
+signal = pd.Series(DATA['signal_series'], index=dates)
 
-# Signal series
-if DATA.get('signal_series'):
-    signal = pd.Series(DATA['signal_series'], index=dates)
+fig, axes = plt.subplots(3, 1, figsize=(14,10), sharex=True)
+equity.plot(ax=axes[0], color='#2ECC71' if equity.iloc[-1]>=100 else '#E74C3C', title=DATA['label'])
+axes[0].axhline(100, color='gray', linestyle='--', linewidth=0.8); axes[0].set_ylabel('Equity (base 100)')
+drawdown.plot(ax=axes[1], color='#E74C3C'); axes[1].fill_between(dates, drawdown, 0, color='#E74C3C', alpha=0.2); axes[1].set_ylabel('Drawdown %')
+signal.plot(ax=axes[2], color='#4A9EFF'); axes[2].axhline(DATA['entry_threshold'], color='green', linestyle='--'); axes[2].axhline(0, color='gray', linestyle='-', linewidth=0.5); axes[2].set_ylabel('Signal')
+plt.tight_layout(); plt.savefig('backtest_audit.png', dpi=150); plt.show()
 
-# Trade analysis
-trades = pd.DataFrame(DATA['trades']) if DATA.get('trades') else pd.DataFrame()
-
-# Plot
-fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-axes[0].plot(equity, color='#2ECC71' if equity.iloc[-1] >= 100 else '#E74C3C', linewidth=1.5)
-axes[0].axhline(100, color='gray', linestyle='--', linewidth=0.8)
-axes[0].set_ylabel('Equity (base 100)')
-axes[0].set_title(f"Backtest: {DATA.get('signal_type','buy_hold')} — {DATA.get('range','5y')}")
-axes[0].grid(alpha=0.3)
-
-axes[1].fill_between(dates, drawdown, 0, color='#E74C3C', alpha=0.3)
-axes[1].plot(drawdown, color='#E74C3C', linewidth=1)
-axes[1].set_ylabel('Drawdown %')
-axes[1].grid(alpha=0.3)
-
-if DATA.get('signal_series'):
-    axes[2].plot(signal, color='#4A9EFF', linewidth=0.8)
-    axes[2].axhline(DATA.get('entry_threshold', 1), color='green', linestyle='--', linewidth=0.8, label=f"Entry {DATA.get('entry_threshold',1)}")
-    axes[2].axhline(DATA.get('exit_threshold', 0), color='red', linestyle='--', linewidth=0.8, label=f"Exit {DATA.get('exit_threshold',0)}")
-    axes[2].set_ylabel('Signal')
-    axes[2].legend(fontsize=8)
-    axes[2].grid(alpha=0.3)
-
-plt.tight_layout()
-plt.savefig('backtest_audit.png', dpi=150)
-print("Saved backtest_audit.png")
-
-# Print metrics
-print("\\n=== Metrics ===")
-for k, v in DATA['metrics'].items():
-    print(f"  {k}: {v}")
-
-if not trades.empty:
-    print(f"\\n=== Trades ===")
-    print(trades.to_string())
+print("\n=== METRICS ===")
+for k,v in DATA['metrics'].items(): print(f"  {k}: {v}")
+print("\n=== TRIGGER DATES ===")
+for t in DATA['trigger_dates']: print(f"  {t['date']}  {t['type']:5s}  signal={t['signal']:.4f}")
+print("\n=== TRADES ===")
+print(pd.DataFrame(DATA['trades']).to_string())
 `;
-
-  const pyScript = buildPythonAuditScript({ subject: `Backtest: ${backtestResult.label||"Strategy"}`, data: pyData, code: pyCode });
-
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
-<body style="background:#0D0F14;font-family:Inter,Arial,sans-serif;color:#EDF0F7;padding:24px">
-<h2 style="color:#C9A84C">📊 Backtest: ${backtestResult.label||"Strategy"}</h2>
-<p style="color:#5A6280">Exported from IBKR Agent · ${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>
-
-<h3 style="color:#E8C87A">Strategy Parameters</h3>
-<pre style="background:#13161E;padding:14px;border-radius:8px;font-size:12px;color:#EDF0F7">${JSON.stringify({
-  symbols: backtestResult.symbols, weights: backtestResult.weights?.map(w=>+w.toFixed(3)),
-  range: backtestResult.range, signal_type: backtestResult.signal_type,
-  signal_params: backtestResult.signal_params, signal_direction: backtestResult.signal_direction,
-  entry_threshold: backtestResult.entry_threshold, exit_threshold: backtestResult.exit_threshold,
-}, null, 2)}</pre>
-
-<h3 style="color:#E8C87A">Performance Metrics</h3>
-<table style="border-collapse:collapse;width:100%;max-width:500px">
-  ${[
-    ["Total Return",`${m.totalReturnPct}%`],["Annualized Return",`${m.annualizedRetPct}%`],
-    ["Annualized Vol",`${m.annualizedVolPct}%`],["Max Drawdown",`${m.maxDrawdownPct}%`],
-    ["Sharpe",m.sharpe],["Sortino",m.sortino],["Calmar",m.calmar],
-    ["VaR 95% (daily)",`${m.var95DailyPct}%`],["% Time in Market",`${m.pctTimeInMarket}%`],
-    ["N Trades",m.nTrades],["Win Rate",`${m.winRatePct}%`],["EV per Trade",`${m.evPerTradePct}%`],
-    ["Cond. EV (wins)",`${m.condEvWinPct}%`],["Cond. EV (losses)",`${m.condEvLossPct}%`],
-    ["Trade Return Std",`${m.tradeRetStdPct}%`],["Avg Duration",`${m.avgDurationDays} days`],
-    ["Profit Factor",m.profitFactor??"-"],
-  ].map(([k,v])=>`<tr style="border-bottom:1px solid #252A38"><td style="padding:7px 12px 7px 0;color:#8A9AC0;font-size:13px">${k}</td><td style="padding:7px 0;font-family:monospace;font-size:13px;color:#EDF0F7">${v}</td></tr>`).join("")}
+<body style="background:#0D0F14;font-family:Inter,sans-serif;color:#EDF0F7;padding:24px">
+<h2 style="color:#C9A84C">📊 ${bt.label||"Backtest"}</h2>
+<p style="color:#5A6280">${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>
+<h3 style="color:#E8C87A">Strategy</h3>
+<pre style="background:#13161E;padding:12px;border-radius:8px;font-size:12px">${JSON.stringify({symbols:bt.symbols,range:bt.range,signal_type:bt.signal_type,signal_params:bt.signal_params,signal_direction:bt.signal_direction,entry_threshold:bt.entry_threshold},null,2)}</pre>
+<h3 style="color:#E8C87A">Metrics</h3>
+<table style="border-collapse:collapse;width:100%;max-width:480px">
+${Object.entries(m).map(([k,v])=>`<tr style="border-bottom:1px solid #252A38"><td style="padding:6px 10px 6px 0;color:#8A9AC0;font-size:13px">${k}</td><td style="padding:6px 0;font-family:monospace;font-size:13px;color:#EDF0F7">${v}</td></tr>`).join("")}
 </table>
-
-<h3 style="color:#E8C87A">Trade List (last 20)</h3>
-<pre style="background:#13161E;padding:14px;border-radius:8px;font-size:11px;color:#EDF0F7;overflow:auto">${JSON.stringify((backtestResult.trades||[]).slice(-20).map(t=>({entry:t.entryDate,exit:t.exitDate,days:t.durationDays,ret:t.returnPct+"%",win:t.profitable})),null,2)}</pre>
-
+<h3 style="color:#E8C87A">Trigger Dates</h3>
+<table style="border-collapse:collapse;font-size:12px;font-family:monospace">
+<tr><th style="padding:4px 10px 4px 0;color:#5A6280">Date</th><th style="padding:4px 10px;color:#5A6280">Type</th><th style="padding:4px 10px;color:#5A6280">Signal</th></tr>
+${(bt.triggerDates||[]).map(t=>`<tr><td style="padding:3px 10px 3px 0">${t.date}</td><td style="padding:3px 10px;color:${t.type==="ENTRY"?"#2ECC71":"#E74C3C"}">${t.type}</td><td style="padding:3px 10px">${t.signal?.toFixed(4)}</td></tr>`).join("")}
+</table>
+<h3 style="color:#E8C87A">All Signal Breach Dates</h3>
+<table style="border-collapse:collapse;font-size:12px;font-family:monospace">
+<tr><th style="padding:4px 10px 4px 0;color:#5A6280">Date</th><th style="padding:4px 10px;color:#5A6280">Signal</th></tr>
+${(bt.signalBreachDates||[]).map(t=>`<tr><td style="padding:3px 10px 3px 0">${t.date}</td><td style="padding:3px 10px;color:#E74C3C">${t.signal?.toFixed(4)}</td></tr>`).join("")}
+</table>
 <hr style="border-color:#252A38;margin:24px 0"/>
 <h3 style="color:#E8C87A">🐍 Python Audit Script</h3>
-<p style="color:#5A6280;font-size:12px">Copy into your IDE to reproduce all calculations. Run: pip install pandas numpy matplotlib</p>
-<pre style="background:#0A0C12;border:1px solid #252A38;border-radius:8px;padding:14px;font-family:monospace;font-size:11px;color:#EDF0F7;white-space:pre-wrap;word-break:break-all;max-height:800px;overflow:auto">${pyScript.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre>
+<pre style="background:#0A0C12;border:1px solid #252A38;border-radius:8px;padding:14px;font-family:monospace;font-size:11px;white-space:pre-wrap;max-height:800px;overflow:auto">${pyScript.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</pre>
 </body></html>`;
-
-  const result = await sendEmail(REPORT_TO, `📊 Backtest Export: ${backtestResult.label||"Strategy"}`, html);
-  res.json(result);
+  try { res.json(await sendEmail(REPORT_TO, `📊 Backtest: ${bt.label||"Strategy"}`, html)); }
+  catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));

@@ -1320,7 +1320,7 @@ async function computeRegimeModel(portfolioRetMap) {
     let peak=1, cum=1, sumDD=0, ddN=0;
     rets.forEach(r => { cum*=(1+r); if(cum>peak)peak=cum; const dd=(cum-peak)/peak; if(dd<0){sumDD+=dd;ddN++;} });
     return { count:rets.length, annualizedRetPct:+annRet.toFixed(2), annualizedVolPct:+annVol.toFixed(2),
-      dailyVolPct:+(s*100).toFixed(3), sharpe:annVol===0?null:+(annRet/annVol).toFixed(3),
+      dailyVolPct:+(s*100).toFixed(3), sharpe:annVol===0?null:+((annRet-RISK_FREE_RATE_PCT)/annVol).toFixed(3),
       var95Pct:var95!==null?+(var95*100).toFixed(2):null, cvar95Pct:cvar95!==null?+(cvar95*100).toFixed(2):null,
       avgDrawdownPct:ddN?+(sumDD/ddN*100).toFixed(2):0, maxDrawdownPct:+maxDDFromReturns(rets).toFixed(2) };
   }
@@ -1862,7 +1862,12 @@ async function executeTool(name, input) {
         totalReturn:         +((closes[closes.length - 1] / closes[0] - 1) * 100).toFixed(2),
         annualizedVol:       +(std(r) * Math.sqrt(252) * 100).toFixed(2),
         meanDailyReturn:     +(mean(r) * 100).toFixed(4),
-        sharpe:              std(r)===0 ? 0 : +(((mean(r)-RISK_FREE_RATE_DAILY)/std(r))*Math.sqrt(252)).toFixed(3),
+        // Geometric annualised return (correct for Sharpe — consistent with MVO and portfolio metrics)
+        sharpe: (() => {
+          const annVol = std(r) * Math.sqrt(252);
+          const annRet = r.length ? Math.pow(r.reduce((a,b)=>a*(1+b),1), 252/r.length) - 1 : 0;
+          return annVol===0 ? 0 : +((annRet - RISK_FREE_RATE_PCT/100) / annVol).toFixed(3);
+        })(),
         sortino:             +sortino(r).toFixed(4),
         maxDrawdown:         +maxDD(closes).toFixed(2),
         var95:               (() => { const v = histVaR(r, 0.95); return v === null ? null : +(v * 100).toFixed(2); })(),

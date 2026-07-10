@@ -588,6 +588,80 @@ async function computePortfolioMetrics(positions, totalNLV) {
     // Fama-French 3-factor regression on weighted portfolio returns
     const famaFrench = await computeFamaFrenchRegression(pr, trimmedDates);
 
+    // Mean-Variance Optimisation — find max Sharpe portfolio
+    // Uses the same covariance matrix already computed above
+    const mvo = (() => {
+      try {
+        const nAssets = items.length;
+        const syms    = items.map(x => x.symbol);
+        const annRets = items.map(x => {
+          const r = x.returns.filter(Number.isFinite);
+          return r.length ? (Math.pow(r.reduce((a,b)=>a*(1+b),1), 252/r.length)-1) : 0;
+        });
+        const RF = RISK_FREE_RATE_PCT / 100;
+
+        // Random-portfolio Monte Carlo: 50k portfolios, find max Sharpe + min Vol frontier
+        const N_SIM = 50000;
+        let maxSharpe = -Infinity, maxSharpeW = null;
+        let minVol    = Infinity,  minVolW    = null;
+        const frontier = []; // store subset for efficient frontier chart
+
+        for (let s = 0; s < N_SIM; s++) {
+          // Random Dirichlet weights
+          const raw = Array.from({length:nAssets}, ()=>-Math.log(Math.random()+1e-10));
+          const sum = raw.reduce((a,b)=>a+b,0);
+          const w   = raw.map(v=>v/sum);
+
+          // Portfolio return
+          const pRet = annRets.reduce((a,r,i)=>a+w[i]*r, 0);
+
+          // Portfolio variance w'Σw
+          const pVar = weights.reduce((rowSum, _, i) => rowSum + weights.reduce((colSum, _, j) =>
+            colSum + w[i]*w[j]*cov[i][j], 0), 0);
+          const pVol = Math.sqrt(Math.max(pVar,0)) * Math.sqrt(252);
+
+          const sharpeP = pVol===0 ? 0 : (pRet - RF) / pVol;
+
+          if (sharpeP > maxSharpe) { maxSharpe = sharpeP; maxSharpeW = w; }
+          if (pVol < minVol)       { minVol    = pVol;    minVolW    = w; }
+
+          // Keep a sample for frontier chart (every 50th)
+          if (s % 50 === 0) frontier.push({ vol: +(pVol*100).toFixed(3), ret: +(pRet*100).toFixed(3), sharpe: +sharpeP.toFixed(3) });
+        }
+
+        const fmtW = (w) => syms.map((sym,i)=>({ symbol:sym, weightPct: +(w[i]*100).toFixed(1) }));
+
+        // Current portfolio stats for comparison
+        const curRet  = annRets.reduce((a,r,i)=>a+weights[i]*r,0);
+        const curVar  = weights.reduce((rs,_,i)=>rs+weights.reduce((cs,_,j)=>cs+weights[i]*weights[j]*cov[i][j],0),0);
+        const curVol  = Math.sqrt(Math.max(curVar,0))*Math.sqrt(252);
+        const curSharpe = curVol===0?0:(curRet-RF)/curVol;
+
+        return {
+          currentPortfolio: {
+            weights: fmtW(weights),
+            annRetPct:  +(curRet*100).toFixed(2),
+            annVolPct:  +(curVol*100).toFixed(2),
+            sharpe:     +curSharpe.toFixed(3),
+          },
+          maxSharpePortfolio: {
+            weights:    fmtW(maxSharpeW),
+            annRetPct:  +(annRets.reduce((a,r,i)=>a+maxSharpeW[i]*r,0)*100).toFixed(2),
+            annVolPct:  +(Math.sqrt(Math.max(weights.reduce((rs,_,i)=>rs+weights.reduce((cs,_,j)=>cs+maxSharpeW[i]*maxSharpeW[j]*cov[i][j],0),0),0))*Math.sqrt(252)*100).toFixed(2),
+            sharpe:     +maxSharpe.toFixed(3),
+          },
+          minVolPortfolio: {
+            weights:    fmtW(minVolW),
+            annRetPct:  +(annRets.reduce((a,r,i)=>a+minVolW[i]*r,0)*100).toFixed(2),
+            annVolPct:  +(minVol*100).toFixed(2),
+            sharpe:     +(minVol===0?0:(annRets.reduce((a,r,i)=>a+minVolW[i]*r,0)-RF)/minVol).toFixed(3),
+          },
+          frontier: frontier.sort((a,b)=>a.vol-b.vol),
+          method: "Monte Carlo 50,000 random portfolios (Dirichlet weights), 1Y EUR-converted daily returns, SOFR risk-free rate",
+        };
+      } catch(e) { console.error("MVO error:", e.message); return null; }
+    })();
+
     return {
       period: "1y",
       days: pr.length,
@@ -619,6 +693,7 @@ async function computePortfolioMetrics(positions, totalNLV) {
       method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix (EUR-converted, forward-filled across single-exchange holidays for ~252 trading days); Sharpe = annualized return / covariance-based annualized volatility",
       pca,
       famaFrench,
+      mvo,
     };
   } catch { return null; }
 }

@@ -594,70 +594,105 @@ async function computePortfolioMetrics(positions, totalNLV) {
       try {
         const nAssets = items.length;
         const syms    = items.map(x => x.symbol);
-        const annRets = items.map(x => {
-          const r = x.returns.filter(Number.isFinite);
-          return r.length ? (Math.pow(r.reduce((a,b)=>a*(1+b),1), 252/r.length)-1) : 0;
-        });
-        const RF = RISK_FREE_RATE_PCT / 100;
+        const RF      = RISK_FREE_RATE_PCT / 100;
 
-        // Random-portfolio Monte Carlo: 50k portfolios, find max Sharpe + min Vol frontier
+        // Per-asset stats — filter out holiday zeros before computing vol
+        const assetStats = items.map((x, i) => {
+          const r = x.returns.filter(v => Number.isFinite(v) && v !== 0); // exclude holiday zeros
+          if (!r.length) return { symbol:x.symbol, annRetPct:0, annVolPct:0, sharpe:0 };
+          const annRet  = Math.pow(r.reduce((a,b)=>a*(1+b),1), 252/r.length) - 1;
+          const mu      = r.reduce((a,b)=>a+b,0) / r.length;
+          const annVol  = Math.sqrt(r.reduce((a,b)=>a+(b-mu)**2,0)/r.length) * Math.sqrt(252);
+          const sharpe  = annVol===0 ? 0 : (annRet - RF) / annVol;
+          return {
+            symbol:     x.symbol,
+            annRetPct:  +(annRet*100).toFixed(2),
+            annVolPct:  +(annVol*100).toFixed(2),
+            sharpe:     +sharpe.toFixed(3),
+          };
+        });
+
+        // Annualised returns per asset (geometric, holiday-zeros excluded)
+        const annRets = assetStats.map(a => a.annRetPct / 100);
+
+        // w'Σw helper — correct, uses only w (no confusion with weights array)
+        const portVar = (w) => {
+          let v = 0;
+          for (let i=0; i<nAssets; i++)
+            for (let j=0; j<nAssets; j++)
+              v += w[i] * w[j] * cov[i][j];
+          return v;
+        };
+        const portVol = (w) => Math.sqrt(Math.max(portVar(w), 0)) * Math.sqrt(252);
+        const portRet = (w) => annRets.reduce((s,r,i) => s + w[i]*r, 0);
+
+        // Monte Carlo: 50k random Dirichlet portfolios
         const N_SIM = 50000;
         let maxSharpe = -Infinity, maxSharpeW = null;
-        let minVol    = Infinity,  minVolW    = null;
-        const frontier = []; // store subset for efficient frontier chart
+        let minVol    =  Infinity, minVolW    = null;
+        const allSims = [];
 
-        for (let s = 0; s < N_SIM; s++) {
-          // Random Dirichlet weights
-          const raw = Array.from({length:nAssets}, ()=>-Math.log(Math.random()+1e-10));
-          const sum = raw.reduce((a,b)=>a+b,0);
-          const w   = raw.map(v=>v/sum);
-
-          // Portfolio return
-          const pRet = annRets.reduce((a,r,i)=>a+w[i]*r, 0);
-
-          // Portfolio variance w'Σw
-          const pVar = weights.reduce((rowSum, _, i) => rowSum + weights.reduce((colSum, _, j) =>
-            colSum + w[i]*w[j]*cov[i][j], 0), 0);
-          const pVol = Math.sqrt(Math.max(pVar,0)) * Math.sqrt(252);
-
-          const sharpeP = pVol===0 ? 0 : (pRet - RF) / pVol;
-
-          if (sharpeP > maxSharpe) { maxSharpe = sharpeP; maxSharpeW = w; }
-          if (pVol < minVol)       { minVol    = pVol;    minVolW    = w; }
-
-          // Keep a sample for frontier chart (every 50th)
-          if (s % 50 === 0) frontier.push({ vol: +(pVol*100).toFixed(3), ret: +(pRet*100).toFixed(3), sharpe: +sharpeP.toFixed(3) });
+        for (let s=0; s<N_SIM; s++) {
+          const raw = Array.from({length:nAssets}, () => -Math.log(Math.random()+1e-10));
+          const sum = raw.reduce((a,b)=>a+b, 0);
+          const w   = raw.map(v => v/sum);
+          const pRet = portRet(w);
+          const pVol = portVol(w);
+          const pSharpe = pVol===0 ? 0 : (pRet-RF)/pVol;
+          if (pSharpe > maxSharpe) { maxSharpe = pSharpe; maxSharpeW = [...w]; }
+          if (pVol    < minVol)    { minVol    = pVol;    minVolW    = [...w]; }
+          if (s % 40 === 0) allSims.push({ vol:+(pVol*100).toFixed(3), ret:+(pRet*100).toFixed(3), sharpe:+pSharpe.toFixed(3) });
         }
 
-        const fmtW = (w) => syms.map((sym,i)=>({ symbol:sym, weightPct: +(w[i]*100).toFixed(1) }));
+        // Efficient frontier line: for each vol bucket, keep the max-return portfolio
+        const sortedSims = [...allSims].sort((a,b)=>a.vol-b.vol);
+        const volBuckets = new Map();
+        sortedSims.forEach(p => {
+          const bucket = Math.round(p.vol * 2) / 2; // 0.5% buckets
+          if (!volBuckets.has(bucket) || volBuckets.get(bucket).ret < p.ret) {
+            volBuckets.set(bucket, p);
+          }
+        });
+        const frontier = [...volBuckets.values()].sort((a,b)=>a.vol-b.vol);
 
-        // Current portfolio stats for comparison
-        const curRet  = annRets.reduce((a,r,i)=>a+weights[i]*r,0);
-        const curVar  = weights.reduce((rs,_,i)=>rs+weights.reduce((cs,_,j)=>cs+weights[i]*weights[j]*cov[i][j],0),0);
-        const curVol  = Math.sqrt(Math.max(curVar,0))*Math.sqrt(252);
-        const curSharpe = curVol===0?0:(curRet-RF)/curVol;
+        const fmtW = (w) => syms.map((sym,i) => ({ symbol:sym, weightPct:+(w[i]*100).toFixed(1) }));
+
+        // Current portfolio stats
+        const curRet = portRet(weights);
+        const curVol = portVol(weights);
+        const curSharpe = curVol===0 ? 0 : (curRet-RF)/curVol;
+
+        // Max Sharpe vol (correctly computed with maxSharpeW)
+        const msVol = portVol(maxSharpeW);
+        const msRet = portRet(maxSharpeW);
+
+        // Min Vol vol
+        const mvVol = portVol(minVolW);
+        const mvRet = portRet(minVolW);
 
         return {
+          assetStats,
           currentPortfolio: {
-            weights: fmtW(weights),
-            annRetPct:  +(curRet*100).toFixed(2),
-            annVolPct:  +(curVol*100).toFixed(2),
-            sharpe:     +curSharpe.toFixed(3),
+            weights:   fmtW(weights),
+            annRetPct: +(curRet*100).toFixed(2),
+            annVolPct: +(curVol*100).toFixed(2),
+            sharpe:    +curSharpe.toFixed(3),
           },
           maxSharpePortfolio: {
-            weights:    fmtW(maxSharpeW),
-            annRetPct:  +(annRets.reduce((a,r,i)=>a+maxSharpeW[i]*r,0)*100).toFixed(2),
-            annVolPct:  +(Math.sqrt(Math.max(weights.reduce((rs,_,i)=>rs+weights.reduce((cs,_,j)=>cs+maxSharpeW[i]*maxSharpeW[j]*cov[i][j],0),0),0))*Math.sqrt(252)*100).toFixed(2),
-            sharpe:     +maxSharpe.toFixed(3),
+            weights:   fmtW(maxSharpeW),
+            annRetPct: +(msRet*100).toFixed(2),
+            annVolPct: +(msVol*100).toFixed(2),
+            sharpe:    +maxSharpe.toFixed(3),
           },
           minVolPortfolio: {
-            weights:    fmtW(minVolW),
-            annRetPct:  +(annRets.reduce((a,r,i)=>a+minVolW[i]*r,0)*100).toFixed(2),
-            annVolPct:  +(minVol*100).toFixed(2),
-            sharpe:     +(minVol===0?0:(annRets.reduce((a,r,i)=>a+minVolW[i]*r,0)-RF)/minVol).toFixed(3),
+            weights:   fmtW(minVolW),
+            annRetPct: +(mvRet*100).toFixed(2),
+            annVolPct: +(mvVol*100).toFixed(2),
+            sharpe:    +(mvVol===0?0:(mvRet-RF)/mvVol).toFixed(3),
           },
-          frontier: frontier.sort((a,b)=>a.vol-b.vol),
-          method: "Monte Carlo 50,000 random portfolios (Dirichlet weights), 1Y EUR-converted daily returns, SOFR risk-free rate",
+          scatterPoints: allSims,  // all simulated portfolios for scatter
+          frontier,                // efficient frontier line (max-ret per vol bucket)
+          method: "Monte Carlo 50,000 random portfolios (Dirichlet weights), 1Y EUR-converted daily returns excluding holiday zeros, SOFR risk-free rate. Per-asset vol excludes zero-return days (exchange holidays).",
         };
       } catch(e) { console.error("MVO error:", e.message); return null; }
     })();

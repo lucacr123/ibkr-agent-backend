@@ -2461,7 +2461,11 @@ async function runPythonBacktest(script, timeoutMs = 120000) {
     const timer = setTimeout(() => { p.kill(); res({ ok:false, error:"Timeout after 120s", stdout, stderr }); }, timeoutMs);
     p.on("close", code => {
       clearTimeout(timer);
-      if (code !== 0) return res({ ok:false, error:`Exit ${code}`, stdout, stderr });
+      if (code !== 0) {
+        console.error("🐍 Python stderr:", stderr.slice(-1000));
+        console.error("🐍 Python stdout:", stdout.slice(-500));
+        return res({ ok:false, error:`Exit ${code}`, stdout, stderr });
+      }
       try {
         const result = existsSync(tmpOut) ? JSON.parse(readFileSync(tmpOut,"utf8")) : {};
         const chartB64 = existsSync(tmpChart) ? readFileSync(tmpChart).toString("base64") : null;
@@ -2545,6 +2549,7 @@ plt.close()`;
     if (!script || script.length < 100) return res.status(500).json({ error: "Claude failed to generate script" });
     // Log first 300 chars for debugging
     console.log("📝 Backtest script preview:", script.slice(0,300));
+    console.log("📝 Backtest script end:", script.slice(-300));
 
     // Step 2: Run the script
     const bt = await runPythonBacktest(script);

@@ -2423,12 +2423,27 @@ async function ensurePip() {
     const p = spawn("pip3", ["install", "--quiet", "--break-system-packages",
       "yfinance", "pandas", "numpy", "matplotlib", "scipy"], { stdio:"pipe" });
     p.on("close", () => { pipReady = true; res(); });
-    p.on("error", () => res()); // ignore if pip not found
+    p.on("error", () => res());
   });
+}
+
+// Detect python binary
+async function getPython() {
+  for (const bin of ["python3","python"]) {
+    const ok = await new Promise(res => {
+      const p = spawn(bin, ["--version"], {stdio:"pipe"});
+      p.on("close", c => res(c===0));
+      p.on("error", () => res(false));
+    });
+    if (ok) return bin;
+  }
+  return null;
 }
 
 async function runPythonBacktest(script, timeoutMs = 120000) {
   await ensurePip();
+  const pyBin = await getPython();
+  if (!pyBin) return { ok:false, error:"Python not found on server. Add nixpacks.toml with python3 to Railway." };
   const tmpScript = "/tmp/bt_script.py";
   const tmpOut    = "/tmp/bt_output.json";
   const tmpChart  = "/tmp/bt_chart.png";
@@ -2437,7 +2452,7 @@ async function runPythonBacktest(script, timeoutMs = 120000) {
   writeFileSync(tmpScript, injected);
   return new Promise((res) => {
     let stdout = "", stderr = "";
-    const p = spawn("python3", [tmpScript], { stdio: "pipe" });
+    const p = spawn(pyBin, [tmpScript], { stdio: "pipe" });
     p.stdout.on("data", d => stdout += d.toString());
     p.stderr.on("data", d => stderr += d.toString());
     const timer = setTimeout(() => { p.kill(); res({ ok:false, error:"Timeout after 120s", stdout, stderr }); }, timeoutMs);

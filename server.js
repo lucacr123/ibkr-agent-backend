@@ -2416,7 +2416,6 @@ import { spawn } from "child_process";
 import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 
 // Ensure pip packages are installed on first run
-let pipReady = false;
 let pipReady = true; // installed at build time via virtualenv
 async function ensurePip() { /* no-op: packages installed at build time */ }
 

@@ -216,10 +216,24 @@ async function buildPortfolio(force = false) {
   const totalYtdGainEUR = +accounts.reduce((s, a) => s + (a.ytdGainEUR || 0), 0).toFixed(2);
   const portfolioMetrics = await computePortfolioMetrics(combinedPositions, totalNLV);
 
-
+  // Per-account metrics1Y
+  const acctMetrics = {};
+  for (const acct of accounts) {
+    try {
+      const acctPositions = acct.positions.map(p => ({
+        symbol:          p.symbol,
+        yahooSymbol:     yfSymbol(p.symbol),
+        positionValueEUR: p.positionValueEUR,
+      }));
+      const acctNLV = acct.netLiquidationEUR;
+      if (acctPositions.length > 0 && acctNLV > 0) {
+        acctMetrics[acct.accountId] = await computePortfolioMetrics(acctPositions, acctNLV);
+      }
+    } catch(e) { console.error(`Per-account metrics failed for ${acct.accountId}:`, e.message); }
+  }
 
   return {
-    accounts,
+    accounts: accounts.map(a => ({ ...a, metrics1Y: acctMetrics[a.accountId] || null })),
     combined: {
       totalNetLiquidation:   +totalNLV.toFixed(2),
       totalCash:             +accounts.reduce((s, a) => s + a.cashEUR, 0).toFixed(2),
@@ -719,6 +733,15 @@ async function computePortfolioMetrics(positions, totalNLV) {
       trackingErrorVsSPXPct: trackingError === null ? null : +(trackingError * 100).toFixed(2),
       skewness: +skewness(pr).toFixed(3),
       kurtosis: +kurtosis(pr).toFixed(3),
+      // 30-day rolling z-score of portfolio daily returns (most recent value)
+      zScore30d: (() => {
+        if (pr.length < 30) return null;
+        const win = pr.slice(-30);
+        const mu  = win.reduce((a,b)=>a+b,0) / 30;
+        const sd  = Math.sqrt(win.reduce((a,b)=>a+(b-mu)**2,0)/30) || 1e-9;
+        const last = pr[pr.length-1];
+        return +((last - mu) / sd).toFixed(3);
+      })(),
       dates: trimmedDates,
       portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),

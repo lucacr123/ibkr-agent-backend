@@ -1270,11 +1270,11 @@ function standardize(series) {
   return{scaled:series.map(s=>s.map((v,d)=>Number.isFinite(v)?(v-stats[d].mu)/stats[d].sigma:0)),stats};
 }
 async function computeRegimeModel(portfolioRetMap) {
-  // Features: VIX + MOVE + DXST.DE 30d ann. vol — full-sample fit
+  // Features: VIX + MOVE + (optional) DXST.DE 30d ann. vol
   const [vixData, moveData, dxstData] = await Promise.all([
     fetchYahooCloses("^VIX",   "5y"),
     fetchYahooCloses("^MOVE",  "5y"),
-    fetchYahooCloses("DXST.DE","5y"),
+    fetchYahooCloses("DXST.DE","5y").catch(() => ({ bars: [] })),
   ]);
 
   const vixMap  = new Map(vixData.bars.map(b => [b.date, b.close]));
@@ -1292,10 +1292,18 @@ async function computeRegimeModel(portfolioRetMap) {
     dxstVolMap.set(dxstBars[i].date, v);
   }
 
-  const allDates = [...vixMap.keys()].filter(d => moveMap.has(d) && dxstVolMap.has(d)).sort();
-  if (allDates.length < 252) throw new Error("Need at least 1Y of data");
+  const useDxst = dxstVolMap.size > 100;
 
-  const rawFeatures = allDates.map(d => [vixMap.get(d), moveMap.get(d), dxstVolMap.get(d)]);
+  // Intersect available dates — DXST optional
+  const allDates = [...vixMap.keys()]
+    .filter(d => moveMap.has(d) && (useDxst ? dxstVolMap.has(d) : true))
+    .sort();
+  if (allDates.length < 252) throw new Error(`Need at least 1Y of data (got ${allDates.length} days). VIX: ${vixMap.size}, MOVE: ${moveMap.size}`);
+
+  const rawFeatures = allDates.map(d => useDxst
+    ? [vixMap.get(d), moveMap.get(d), dxstVolMap.get(d)]
+    : [vixMap.get(d), moveMap.get(d)]
+  );
   const { scaled } = standardize(rawFeatures);
 
   const model = fitHMM(scaled, 2, 100);
@@ -1334,7 +1342,7 @@ async function computeRegimeModel(portfolioRetMap) {
   const stressProbFull = allDates.map((d,i)=>({date:d,prob:stressProbs[i],regime:regimes[i]}))
     .filter(x=>x.date>=cutoffStr);
 
-  const featureNames = ["VIX","MOVE","DXST_ann_vol(iTraxx)"];
+  const featureNames = useDxst ? ["VIX","MOVE","DXST_ann_vol(iTraxx)"] : ["VIX","MOVE"];
   const stateMeans = [0,1].map(r=>{
     const obj={};
     featureNames.forEach((f,d)=>{
@@ -1355,7 +1363,7 @@ async function computeRegimeModel(portfolioRetMap) {
     currentDxstVol:rawFeatures[lastI]?.[2]??null,
     normalDays:normalRets.length, stressDays:stressRets.length, featureDays:allDates.length,
     stateMeans,
-    method:"Full-sample 2-state HMM (VIX + MOVE + DXST vol, diag cov, prior=5, 100 EM iters) on 5Y — chart & stats: last 1Y",
+    method:`Full-sample 2-state HMM (${useDxst?"VIX + MOVE + DXST vol":"VIX + MOVE"}, diag cov, prior=5, 100 EM iters) on 5Y — chart & stats: last 1Y`,
   };
 }
 

@@ -2511,39 +2511,37 @@ app.post("/api/backtest/run", async (req, res) => {
     const holdings = portfolio?.combined?.positions?.map(p=>p.symbol).join(", ") || "your holdings";
     const yahooSyms = portfolio?.combined?.positions?.map(p=>`${p.symbol}→${p.yahooSymbol||p.symbol}`).join(", ") || "";
 
-    const scriptPrompt = `You are writing a Python backtest script. The user wants: "${instruction}"
+    const scriptPrompt = `You are writing a Python backtest script to run on a server with yfinance, pandas, numpy, matplotlib installed.
 
+User request: "${instruction}"
 Portfolio holdings: ${holdings}
 Yahoo Finance symbols: ${yahooSyms}
 
-Write a COMPLETE, RUNNABLE Python script that:
-1. Uses yfinance to fetch real price data
-2. Implements the exact strategy described
-3. Computes: total return, annualised return, Sharpe ratio, max drawdown, win rate, number of trades
-4. Generates a matplotlib chart (equity curve) and saves to CHART_PNG variable (already defined)
-5. Saves metrics dict and trades list to OUTPUT_JSON variable (already defined) using json.dump
-6. Prints "DONE" at the end
+CRITICAL RULES:
+- Output ONLY raw Python code. No markdown, no backticks, no explanation, no comments before the code.
+- Do NOT define OUTPUT_JSON or CHART_PNG variables — they are already injected at the top.
+- The script MUST end by writing results to OUTPUT_JSON and saving chart to CHART_PNG.
+- Use matplotlib.use("Agg") before importing pyplot (no display available).
+- Keep it simple and robust — prefer yfinance download() over Ticker().history().
 
-The OUTPUT_JSON must contain:
-- "metrics": dict of metric_name → value
-- "trades": list of {entry_date, exit_date, pnl_pct}
-- "label": strategy name string
-
-Use this exact pattern at the end:
-import json, matplotlib
+Required output format at end of script:
+import json
+result = {"metrics": {"total_return_pct": float, "sharpe": float, "max_drawdown_pct": float, "ann_return_pct": float, "win_rate_pct": float, "n_trades": int}, "trades": [{"entry_date": str, "exit_date": str, "pnl_pct": float}], "label": "strategy name"}
+with open(OUTPUT_JSON, "w") as f: json.dump(result, f)
+import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-# ... your chart code ...
+# plot equity curve here
 plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor="#0D0F14")
-with open(OUTPUT_JSON, "w") as f:
-    json.dump({"metrics": metrics, "trades": trades, "label": label}, f)
-print("DONE")
-
-Return ONLY the Python code, no markdown fences, no explanation.`;
+plt.close()`;
 
     const scriptResult = await runAgent(scriptPrompt);
-    const script = typeof scriptResult === "string" ? scriptResult : scriptResult?.reply || "";
+    let script = typeof scriptResult === "string" ? scriptResult : scriptResult?.reply || "";
+    // Strip markdown fences if Claude added them
+    script = script.replace(/^```python\n?/i,"").replace(/^```\n?/,"").replace(/\n?```$/,"").trim();
     if (!script || script.length < 100) return res.status(500).json({ error: "Claude failed to generate script" });
+    // Log first 300 chars for debugging
+    console.log("📝 Backtest script preview:", script.slice(0,300));
 
     // Step 2: Run the script
     const bt = await runPythonBacktest(script);

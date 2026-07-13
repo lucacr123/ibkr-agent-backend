@@ -1842,8 +1842,7 @@ const SYSTEM = `You are a sharp, knowledgeable finance AI — part portfolio man
 
 Data is read-only via IBKR Flex. All combined figures in EUR.
 
-Portfolio holdings: CSNDX, CSPX, CSSX5E, IEEM, IUSE, NQSE, SPCX, VUAG, VWRL, VFEM.
-Yahoo Finance symbols: CSPX→CSPX.L, CSNDX→CNDX.L, CSSX5E→CSSX5E.SW, IEEM→IEEM.L, IUSE→IUSE.L, NQSE→NQSE.DE, SPCX→SPCX.L, VUAG→VUAG.L, VWRL→VWRL.L, VFEM→VFEM.L.
+Portfolio holdings are fetched live from IBKR — always call get_portfolio or get_portfolio_analytics to get current positions and Yahoo symbols before referencing specific tickers.
 
 PERSONALITY & STYLE:
 - Be direct, intelligent, and conversational — not robotic or overly structured. Talk like a smart analyst, not a template.
@@ -1943,8 +1942,25 @@ app.get("/api/account", async (req, res) => {
 // ALERT MONITORS — 15-min and daily checks with push notifications
 // ═══════════════════════════════════════════════════════════════════
 
-const HOLDINGS_YF = ["CSPX.L","CNDX.L","CSSX5E.SW","IEEM.L","VUAG.L","VWRL.L","NQSE.DE","VFEM.L"];
-const MAG7 = ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA"];
+// Dynamic holdings — derived from live IBKR portfolio at runtime
+async function getLiveHoldingsYF() {
+  try {
+    const p = await buildPortfolio();
+    return [...new Set(p.combined.positions.map(pos => yfSymbol(pos.symbol)).filter(Boolean))];
+  } catch { return []; }
+}
+
+// Large-cap earnings watchlist — fetched dynamically from S&P500 top holdings
+// Fallback list covers most frequent movers
+const MAG7_FALLBACK = ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA","ORCL","NFLX","AMD","INTC","BRKB","JPM","V","JNJ"];
+async function getLargeCapWatchlist() {
+  try {
+    // Fetch S&P500 top 15 holdings via SPY
+    const r = await fetch("https://query1.finance.yahoo.com/v10/finance/quoteSummary/SPY?modules=topHoldings").then(r=>r.json()).catch(()=>null);
+    const holdings = r?.quoteSummary?.result?.[0]?.topHoldings?.holdings?.map(h=>h.symbol).filter(Boolean) || [];
+    return holdings.length >= 5 ? holdings.slice(0,20) : MAG7_FALLBACK;
+  } catch { return MAG7_FALLBACK; }
+}
 const MACRO_KEYWORDS = ["CPI","PCE","NFP","FOMC","Fed minutes","Fed decision","GDP","PPI","retail sales","ISM","PMI","unemployment","payrolls","ECB","BOE","BOJ"];
 const ALERT_WINDOW = 20; // rolling window for z-score
 
@@ -1965,7 +1981,9 @@ function rollingZScore(rets, window=ALERT_WINDOW) {
 async function checkZScoreAlerts() {
   try {
     // Fetch all holdings returns (2mo for enough history)
-    const results = await Promise.all(HOLDINGS_YF.map(async sym => {
+    const holdingsYF = await getLiveHoldingsYF();
+    if (!holdingsYF.length) { console.log("No holdings found, skipping z-score check"); return; }
+    const results = await Promise.all(holdingsYF.map(async sym => {
       try {
         const raw = await fetchYahooCloses(sym, "2mo");
         const closes = raw.bars.map(b=>b.close);
@@ -2060,7 +2078,8 @@ async function checkEarningsAlerts() {
   try {
     const today = new Date().toISOString().slice(0,10);
     // Search for each Mag7 ticker earnings today
-    for (const sym of MAG7) {
+    const watchlist = await getLargeCapWatchlist();
+    for (const sym of watchlist) {
       try {
         const results = await fetch(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${sym}?modules=calendarEvents`)
           .then(r=>r.json()).catch(()=>null);
@@ -2108,7 +2127,9 @@ async function checkMacroAlerts() {
 const lastNewsAlerts = new Map(); // headline -> timestamp
 async function checkNewsAlerts() {
   try {
-    const result = await runAgent(`Scan the latest financial news from the last 30 minutes. Rate importance 1-10 for a European ETF investor holding CSPX/S&P500, CNDX/Nasdaq, CSSX5E/EuroStoxx50, IEEM/EM, VUAG/global. Only report events scoring 8+ that you have NOT already reported. Respond in this exact format for each alert: ALERT|<score>|<headline>|<one sentence why it matters>. If nothing scores 8+, respond: NONE`);
+    const liveHoldings = await getLiveHoldingsYF();
+    const holdingsDesc = liveHoldings.join(", ") || "global ETFs";
+    const result = await runAgent(`Scan the latest financial news from the last 30 minutes. Rate importance 1-10 for a European ETF investor with these holdings: ${holdingsDesc}. Consider macro events, central bank news, geopolitical events, and sector moves that affect these ETFs. Only report events scoring 8+. Respond in this exact format for each alert: ALERT|<score>|<headline>|<one sentence why it matters>. If nothing scores 8+, respond: NONE`);
     const text = typeof result === "string" ? result : result?.reply || "";
     if (text.trim() === "NONE" || !text.includes("ALERT|")) return;
     
@@ -2156,28 +2177,28 @@ const TASKS = [
     label: "Morning Brief",
     icon: "🌅",
     cron: "30 7 * * 1-5",   // 07:30 UTC weekdays (~08:30 London BST)
-    prompt: "Summarise the pre-market state: overnight moves in ^GSPC, ^IXIC, ^STOXX50E, ^N225, ^HSI. Note any major macro events, top market news, and 1-2 key risks to watch today. Keep it under 200 words. End with 'FULL REPORT ATTACHED' if morning report email was sent."
+    prompt: "First call get_portfolio to get my current holdings. Then summarise the pre-market state: overnight moves in major indices (US, Europe, Asia). Note any major macro events today, top market news, and 1-2 key risks relevant to my specific holdings. Keep under 200 words."
   },
   {
     id: "midday",
     label: "Midday Check",
     icon: "🕛",
     cron: "0 11 * * 1-5",   // 11:00 UTC weekdays (~12:00 London BST)
-    prompt: "Give a concise midday market update: how are US futures / European markets doing vs open? Note any breaking news that could affect my portfolio (CSPX, CNDX, IEEM, VUAG, VWRL, NQSE, VFEM, CSSX5E). Keep under 150 words."
+    prompt: "First call get_portfolio to get my current holdings. Then give a concise midday market update: how are US futures / European markets doing vs open? Note any breaking news that could affect my specific holdings. Keep under 150 words."
   },
   {
     id: "eod",
     label: "End of Day",
     icon: "🌆",
     cron: "0 16 * * 1-5",   // 16:00 UTC weekdays (~17:00 London BST, close of European markets)
-    prompt: "Summarise today's close: what moved in US and European markets, best/worst sectors, notable news from the day. Then check my portfolio holdings (CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L) and highlight the biggest daily movers. Keep under 200 words."
+    prompt: "First call get_portfolio to get my current holdings and their Yahoo symbols. Then summarise today's close: what moved in US and European markets, best/worst sectors, notable news. Highlight the biggest daily movers among my actual holdings. Keep under 200 words."
   },
   {
     id: "weekly",
     label: "Weekly Review",
     icon: "📅",
     cron: "30 15 * * 5",    // 15:30 UTC Friday (~16:30 London)
-    prompt: "Weekly review: how did my portfolio perform this week? Note the biggest movers among CSPX.L, CNDX.L, CSSX5E.SW, IEEM.L, VUAG.L, VWRL.L, NQSE.DE, VFEM.L, look at week-over-week PnL, and flag anything to watch next week. Keep under 250 words."
+    prompt: "First call get_portfolio to get my current holdings. Then do a weekly review: how did my portfolio perform this week? Note the biggest movers among my actual holdings, week-over-week PnL, and flag anything to watch next week. Keep under 250 words."
   },
 ];
 

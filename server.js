@@ -2455,7 +2455,21 @@ async function runPythonBacktest(script, timeoutMs = 120000) {
   writeFileSync(tmpScript, injected);
   return new Promise((res) => {
     let stdout = "", stderr = "";
-    const p = spawn(pyBin, [tmpScript], { stdio: "pipe" });
+    // Find libstdc++ in nix store and set LD_LIBRARY_PATH
+    const nixGccLib = await new Promise(res => {
+      const p = spawn("find", ["/nix/store", "-name", "libstdc++.so.6", "-maxdepth", "6"], {stdio:"pipe"});
+      let out = "";
+      p.stdout?.on("data", d => out += d.toString());
+      p.on("close", () => {
+        const paths = out.trim().split("\n").filter(Boolean).map(f => f.split("/").slice(0,-1).join("/"));
+        res([...new Set(paths)].join(":"));
+      });
+      p.on("error", () => res(""));
+    });
+    const spawnEnv = { ...process.env };
+    if (nixGccLib) spawnEnv.LD_LIBRARY_PATH = nixGccLib + (spawnEnv.LD_LIBRARY_PATH ? ":"+spawnEnv.LD_LIBRARY_PATH : "");
+    console.log("🔧 LD_LIBRARY_PATH:", spawnEnv.LD_LIBRARY_PATH?.slice(0,100));
+    const p = spawn(pyBin, [tmpScript], { stdio: "pipe", env: spawnEnv });
     p.stdout.on("data", d => stdout += d.toString());
     p.stderr.on("data", d => stderr += d.toString());
     const timer = setTimeout(() => { p.kill(); res({ ok:false, error:"Timeout after 120s", stdout, stderr }); }, timeoutMs);

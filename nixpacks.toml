@@ -1,8 +1,14 @@
 [phases.setup]
-nixPkgs = ["nodejs_18", "python312", "python312Packages.pip", "python312Packages.numpy", "python312Packages.pandas", "python312Packages.matplotlib", "python312Packages.scipy", "stdenv.cc.cc.lib"]
+nixPkgs = ["nodejs_18", "python312", "python312Packages.pip", "gcc-unwrapped"]
 
 [phases.install]
-cmds = ["npm ci", "pip3 install --quiet --break-system-packages yfinance"]
+cmds = [
+  "npm ci",
+  "pip3 install --quiet --break-system-packages numpy pandas matplotlib scipy yfinance"
+]
+
+[variables]
+LD_LIBRARY_PATH = "/nix/store/*gcc*/lib:/nix/store/*stdenv*/lib:$LD_LIBRARY_PATH"
 
 [start]
 cmd = "node server.js"

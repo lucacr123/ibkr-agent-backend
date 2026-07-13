@@ -5,12 +5,15 @@ nixPkgs = [
   "python312Packages.numpy",
   "python312Packages.pandas",
   "python312Packages.matplotlib",
-  "python312Packages.scipy",
-  "python312Packages.pip"
+  "python312Packages.scipy"
 ]
 
 [phases.install]
-cmds = ["npm ci", "python3 -m pip install --quiet --break-system-packages yfinance"]
+cmds = [
+  "npm ci",
+  "python3 -m ensurepip --upgrade",
+  "python3 -m pip install --quiet yfinance"
+]
 
 [start]
 cmd = "node server.js"

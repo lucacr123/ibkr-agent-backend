@@ -1938,6 +1938,216 @@ app.get("/api/account", async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+// ALERT MONITORS — 15-min and daily checks with push notifications
+// ═══════════════════════════════════════════════════════════════════
+
+const HOLDINGS_YF = ["CSPX.L","CNDX.L","CSSX5E.SW","IEEM.L","VUAG.L","VWRL.L","NQSE.DE","VFEM.L"];
+const MAG7 = ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA"];
+const MACRO_KEYWORDS = ["CPI","PCE","NFP","FOMC","Fed minutes","Fed decision","GDP","PPI","retail sales","ISM","PMI","unemployment","payrolls","ECB","BOE","BOJ"];
+const ALERT_WINDOW = 20; // rolling window for z-score
+
+// Track sent alerts to avoid duplicates (in-memory, resets on restart)
+const sentAlerts = new Set();
+function alertKey(type, symbol, level) { return `${type}:${symbol}:${level}:${new Date().toISOString().slice(0,13)}`; } // hourly dedup
+
+// ── Compute rolling z-score of last N returns ─────────────────────
+function rollingZScore(rets, window=ALERT_WINDOW) {
+  if (rets.length < window) return null;
+  const slice = rets.slice(-window);
+  const mu = slice.reduce((a,b)=>a+b,0)/window;
+  const sd = Math.sqrt(slice.reduce((a,b)=>a+(b-mu)**2,0)/window)||1e-9;
+  return (rets[rets.length-1] - mu) / sd;
+}
+
+// ── 15-min: Z-score + VaR alerts for holdings and portfolio ───────
+async function checkZScoreAlerts() {
+  try {
+    // Fetch all holdings returns (2mo for enough history)
+    const results = await Promise.all(HOLDINGS_YF.map(async sym => {
+      try {
+        const raw = await fetchYahooCloses(sym, "2mo");
+        const closes = raw.bars.map(b=>b.close);
+        const rets = closes.slice(1).map((v,i)=>(v-closes[i])/closes[i]);
+        const z = rollingZScore(rets, ALERT_WINDOW);
+        const sorted = [...rets].sort((a,b)=>a-b);
+        const var95 = sorted[Math.floor(sorted.length*0.05)];
+        const lastRet = rets[rets.length-1];
+        return { sym, z, lastRet, var95, price: closes[closes.length-1] };
+      } catch { return null; }
+    }));
+
+    // Portfolio-level: equal-weight combined return
+    const valid = results.filter(Boolean);
+    if (valid.length) {
+      const portLastRet = valid.reduce((s,r)=>s+r.lastRet,0)/valid.length;
+      const portRets = [portLastRet]; // simplified — just latest for alert
+      // We don't recompute full history here, use individual signals as proxy
+    }
+
+    for (const r of valid) {
+      if (r.z === null) continue;
+      const absZ = Math.abs(r.z);
+      const dir = r.z > 0 ? "📈" : "📉";
+      const pct = (r.lastRet*100).toFixed(2);
+
+      // Z-score threshold alerts
+      for (const [lvl, threshold] of [[1,1],[2,2],[3,3]]) {
+        if (absZ >= threshold) {
+          const key = alertKey("zscore", r.sym, lvl);
+          if (!sentAlerts.has(key)) {
+            sentAlerts.add(key);
+            await sendPush(
+              `${dir} ${r.sym} Z-score ±${lvl} breach`,
+              `Z = ${r.z.toFixed(2)} · Today: ${pct}% · Price: ${r.price?.toFixed(2)}`,
+              dir
+            );
+          }
+        }
+      }
+
+      // VaR breach alert
+      if (r.lastRet < r.var95) {
+        const key = alertKey("var", r.sym, "breach");
+        if (!sentAlerts.has(key)) {
+          sentAlerts.add(key);
+          await sendPush(
+            `🚨 ${r.sym} VaR 95% breached`,
+            `Return: ${pct}% vs VaR: ${(r.var95*100).toFixed(2)}% · Z = ${r.z?.toFixed(2)}`,
+            "🚨"
+          );
+        }
+      }
+    }
+
+    // Portfolio-level z-score (equal-weight proxy)
+    try {
+      const portRetsAll = [];
+      const minLen = Math.min(...valid.map(r=>r.lastRet !== undefined ? 1 : 0));
+      if (valid.length >= 4) {
+        // Use stored portfolio returns from last buildPortfolio if available
+        const p = _cache?.portfolio?.combined?.metrics1Y;
+        if (p?.portfolioReturnsPct?.length >= ALERT_WINDOW) {
+          const pRets = p.portfolioReturnsPct.map(v=>v/100);
+          const pZ = rollingZScore(pRets, ALERT_WINDOW);
+          if (pZ !== null) {
+            for (const [lvl, threshold] of [[1,1],[2,2],[3,3]]) {
+              if (Math.abs(pZ) >= threshold) {
+                const key = alertKey("port_zscore", "portfolio", lvl);
+                if (!sentAlerts.has(key)) {
+                  sentAlerts.add(key);
+                  const dir = pZ>0?"📈":"📉";
+                  await sendPush(
+                    `${dir} Portfolio Z-score ±${lvl} breach`,
+                    `Portfolio Z = ${pZ.toFixed(2)}`,
+                    dir
+                  );
+                }
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+
+    console.log(`✅ Z-score alert check done (${valid.length} symbols)`);
+  } catch(e) { console.error("Z-score alert error:", e.message); }
+}
+
+// ── Daily: Earnings alerts for Mag7 ──────────────────────────────
+async function checkEarningsAlerts() {
+  try {
+    const today = new Date().toISOString().slice(0,10);
+    // Search for each Mag7 ticker earnings today
+    for (const sym of MAG7) {
+      try {
+        const results = await fetch(`https://query1.finance.yahoo.com/v10/finance/quoteSummary/${sym}?modules=calendarEvents`)
+          .then(r=>r.json()).catch(()=>null);
+        const earningsDate = results?.quoteSummary?.result?.[0]?.calendarEvents?.earnings?.earningsDate?.[0]?.raw;
+        if (earningsDate) {
+          const d = new Date(earningsDate*1000).toISOString().slice(0,10);
+          if (d === today) {
+            const key = alertKey("earnings", sym, today);
+            if (!sentAlerts.has(key)) {
+              sentAlerts.add(key);
+              await sendPush(
+                `📊 ${sym} reports earnings today`,
+                `${sym} Q earnings due today — expect volatility`,
+                "📊"
+              );
+            }
+          }
+        }
+      } catch {}
+    }
+    console.log("✅ Earnings check done");
+  } catch(e) { console.error("Earnings alert error:", e.message); }
+}
+
+// ── Daily: Macro calendar check ───────────────────────────────────
+async function checkMacroAlerts() {
+  try {
+    // Use web search via Claude to find today's major macro events
+    const today = new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"});
+    const result = await runAgent(`Today is ${today}. Search for today's major scheduled economic events: CPI, PCE, FOMC, Fed minutes, NFP, GDP, ECB, BOE announcements. List only HIGH IMPACT events happening TODAY. Be brief — one line per event. If none, say "No major macro events today".`);
+    const text = typeof result === "string" ? result : result?.reply || "";
+    const hasEvents = !text.toLowerCase().includes("no major") && text.length > 30;
+    if (hasEvents) {
+      const key = alertKey("macro", "calendar", new Date().toISOString().slice(0,10));
+      if (!sentAlerts.has(key)) {
+        sentAlerts.add(key);
+        await sendPush("📅 Macro events today", text.slice(0,140), "📅");
+      }
+    }
+    console.log("✅ Macro calendar check done");
+  } catch(e) { console.error("Macro alert error:", e.message); }
+}
+
+// ── 15-min: News scan for portfolio-relevant events ───────────────
+const lastNewsAlerts = new Map(); // headline -> timestamp
+async function checkNewsAlerts() {
+  try {
+    const result = await runAgent(`Scan the latest financial news from the last 30 minutes. Rate importance 1-10 for a European ETF investor holding CSPX/S&P500, CNDX/Nasdaq, CSSX5E/EuroStoxx50, IEEM/EM, VUAG/global. Only report events scoring 8+ that you have NOT already reported. Respond in this exact format for each alert: ALERT|<score>|<headline>|<one sentence why it matters>. If nothing scores 8+, respond: NONE`);
+    const text = typeof result === "string" ? result : result?.reply || "";
+    if (text.trim() === "NONE" || !text.includes("ALERT|")) return;
+    
+    for (const line of text.split("\n")) {
+      if (!line.startsWith("ALERT|")) continue;
+      const [,score,headline,reason] = line.split("|");
+      if (!headline) continue;
+      // Deduplicate by headline (24h window)
+      const existing = lastNewsAlerts.get(headline);
+      if (existing && Date.now()-existing < 24*60*60*1000) continue;
+      lastNewsAlerts.set(headline, Date.now());
+      await sendPush(
+        `📰 News Alert (${score}/10): ${headline.slice(0,60)}`,
+        reason?.slice(0,130) || headline,
+        "📰"
+      );
+    }
+    // Clean old entries
+    for (const [k,v] of lastNewsAlerts.entries())
+      if (Date.now()-v > 24*60*60*1000) lastNewsAlerts.delete(k);
+    console.log("✅ News alert check done");
+  } catch(e) { console.error("News alert error:", e.message); }
+}
+
+// ── Register all alert crons ──────────────────────────────────────
+// Every 15 min (market hours Mon-Fri 07:00-17:00 UTC)
+cron.schedule("*/15 7-17 * * 1-5", () => {
+  checkZScoreAlerts().catch(e=>console.error("ZScore cron:",e.message));
+  checkNewsAlerts().catch(e=>console.error("News cron:",e.message));
+}, { timezone: "UTC" });
+
+// Daily at 07:00 UTC (before morning brief)
+cron.schedule("0 7 * * 1-5", () => {
+  checkEarningsAlerts().catch(e=>console.error("Earnings cron:",e.message));
+  checkMacroAlerts().catch(e=>console.error("Macro cron:",e.message));
+}, { timezone: "UTC" });
+
+console.log("🔔 Alert monitors registered: Z-score/VaR (15min), Earnings/Macro (daily 07:00), News (15min)");
+
 // SCHEDULED TASKS — morning brief, midday check, end-of-day report
 // ═══════════════════════════════════════════════════════════════════
 const TASKS = [
@@ -1989,7 +2199,7 @@ TASKS.forEach(task => {
       const resultStr = typeof result === "string" ? result : (result?.reply || JSON.stringify(result));
       taskState[task.id] = { ...taskState[task.id], running: false, lastRun: new Date().toISOString(), lastResult: resultStr };
       taskLog[0] = { task: task.label, status: "done", time: taskState[task.id].lastRun, result: resultStr };
-      await sendPush(`${task.icon} ${task.label}`, resultStr.slice(0, 140), task.icon);
+      await sendPush(`${task.icon} ${task.label} ready`, resultStr.slice(0, 140), task.icon);
       if (task.id === "morning") buildAndSendReport(REPORT_TO).catch(e => console.error("Email:", e.message));
     } catch (e) {
       taskState[task.id].running = false;

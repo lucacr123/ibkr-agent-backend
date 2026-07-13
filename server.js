@@ -1352,17 +1352,23 @@ async function computeRegimeModel(portfolioRetMap) {
     return obj;
   });
 
+  // Fetch current values fresh (not from intersection which may lag)
+  let currentVixLive = null, currentMoveLive = null, currentDxstLive = null;
+  try { const r = await fetchYahooCloses("^VIX","5d"); currentVixLive = r.bars?.[r.bars.length-1]?.close ?? null; } catch{}
+  try { const r = await fetchYahooCloses("^MOVE","5d"); currentMoveLive = r.bars?.[r.bars.length-1]?.close ?? null; } catch{}
+  if (useDxst) { try { const r = await fetchYahooCloses("DXST.DE","5d"); currentDxstLive = r.bars?.[r.bars.length-1]?.close ?? null; } catch{} }
+
   const lastI = allDates.length-1;
   return {
     dates:allDates, regimes, stressProbs, stressProbFull, portfolioIndex,
     normalStats:regimeStats(normalRets), stressStats:regimeStats(stressRets),
     normalDist:returnDistribution(normalRets,20), stressDist:returnDistribution(stressRets,20),
     currentRegime:regimes[lastI], currentStressProb:stressProbs[lastI],
-    currentVix:rawFeatures[lastI]?.[0]??null,
-    currentMove:rawFeatures[lastI]?.[1]??null,
-    currentDxstVol:rawFeatures[lastI]?.[2]??null,
+    currentVix:   currentVixLive  ?? rawFeatures[lastI]?.[0] ?? null,
+    currentMove:  currentMoveLive ?? rawFeatures[lastI]?.[1] ?? null,
+    currentDxstVol: useDxst ? (currentDxstLive ?? rawFeatures[lastI]?.[2] ?? null) : null,
     normalDays:normalRets.length, stressDays:stressRets.length, featureDays:allDates.length,
-    stateMeans,
+    stateMeans, useDxst,
     method:`Full-sample 2-state HMM (${useDxst?"VIX + MOVE + DXST vol":"VIX + MOVE"}, diag cov, prior=5, 100 EM iters) on 5Y — chart & stats: last 1Y`,
   };
 }

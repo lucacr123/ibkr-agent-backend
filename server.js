@@ -2544,8 +2544,8 @@ plt.close()`;
 
     const scriptResult = await runAgent(scriptPrompt);
     let script = typeof scriptResult === "string" ? scriptResult : scriptResult?.reply || "";
-    // Strip markdown fences if Claude added them
-    script = script.replace(/^```python\n?/i,"").replace(/^```\n?/,"").replace(/\n?```$/,"").trim();
+    // Strip ALL markdown fences aggressively
+    script = script.replace(/^```[\w]*\n?/gm, "").replace(/^```\s*$/gm, "").trim();
     if (!script || script.length < 100) return res.status(500).json({ error: "Claude failed to generate script" });
     // Log first 300 chars for debugging
     console.log("📝 Backtest script preview:", script.slice(0,300));

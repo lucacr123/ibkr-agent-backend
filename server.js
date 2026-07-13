@@ -2419,10 +2419,9 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 let pipReady = false;
 async function ensurePip() {
   if (pipReady) return;
-  console.log("📦 Installing Python packages...");
+  console.log("📦 Installing yfinance...");
   await new Promise((res) => {
-    const p = spawn("pip3", ["install", "--quiet", "--break-system-packages",
-      "yfinance", "pandas", "numpy", "matplotlib", "scipy"], { stdio:"pipe" });
+    const p = spawn("pip3", ["install", "--quiet", "--break-system-packages", "yfinance"], { stdio:"pipe" });
     p.stdout?.on("data", d => process.stdout.write(d));
     p.stderr?.on("data", d => process.stderr.write(d));
     p.on("close", () => { pipReady = true; console.log("✅ Python packages ready"); res(); });
@@ -2453,22 +2452,8 @@ async function runPythonBacktest(script, timeoutMs = 120000) {
   const injected = `OUTPUT_JSON = "${tmpOut}"\nCHART_PNG = "${tmpChart}"\n` + script;
   writeFileSync(tmpScript, injected);
 
-  // Find libstdc++ in nix store and set LD_LIBRARY_PATH
-  const nixGccLib = await new Promise(res => {
-    const p = spawn("find", ["/nix/store", "-name", "libstdc++.so.6", "-maxdepth", "5"], {stdio:"pipe"});
-    let out = "";
-    p.stdout?.on("data", d => out += d.toString());
-    const t = setTimeout(() => { p.kill(); res(""); }, 5000);
-    p.on("close", () => {
-      clearTimeout(t);
-      const paths = out.trim().split("\n").filter(Boolean).map(f => f.split("/").slice(0,-1).join("/"));
-      res([...new Set(paths)].join(":"));
-    });
-    p.on("error", () => { clearTimeout(t); res(""); });
-  });
+  // Use Nix-installed python which has all C deps bundled
   const spawnEnv = { ...process.env };
-  if (nixGccLib) spawnEnv.LD_LIBRARY_PATH = nixGccLib + (spawnEnv.LD_LIBRARY_PATH ? ":"+spawnEnv.LD_LIBRARY_PATH : "");
-  console.log("🔧 LD_LIBRARY_PATH:", (spawnEnv.LD_LIBRARY_PATH||"none").slice(0,120));
 
   return new Promise((res) => {
     let stdout = "", stderr = "";

@@ -2547,7 +2547,7 @@ Return ONLY the Python code, no markdown fences, no explanation.`;
 
     // Step 2: Run the script
     const bt = await runPythonBacktest(script);
-    if (!bt.ok) return res.status(500).json({ error: bt.error, stderr: bt.stderr, script });
+    if (!bt.ok) return res.status(500).json({ error: bt.error, detail: (bt.stderr||"")+(bt.stdout||"") });
 
     // Step 3: Email results
     const label = bt.result?.label || instruction.slice(0,60);

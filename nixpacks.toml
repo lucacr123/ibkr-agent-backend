@@ -1,12 +1,15 @@
 [phases.setup]
-nixPkgs = ["nodejs_18", "python312"]
+nixPkgs = ["nodejs_18", "python312", "gcc-unwrapped", "zlib"]
 
 [phases.install]
 cmds = [
   "npm ci",
   "python3 -m venv /app/pyenv",
-  "/app/pyenv/bin/pip install --quiet numpy pandas matplotlib scipy yfinance"
+  "/app/pyenv/bin/pip install --quiet 'numpy<2' pandas matplotlib scipy yfinance"
 ]
 
 [start]
 cmd = "node server.js"
+
+[variables]
+LD_LIBRARY_PATH = "/root/.nix-profile/lib"

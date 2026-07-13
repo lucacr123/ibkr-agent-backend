@@ -2532,32 +2532,40 @@ app.post("/api/backtest/run", async (req, res) => {
     // Step 1: Claude writes the Python script
     res.setHeader("Content-Type","application/json");
     const portfolio = await buildPortfolio().catch(()=>null);
+    const DELISTED = ["IUSE.L","SPCX.L"]; // known Yahoo Finance issues
     const holdings = portfolio?.combined?.positions?.map(p=>p.symbol).join(", ") || "your holdings";
-    const yahooSyms = portfolio?.combined?.positions?.map(p=>`${p.symbol}→${p.yahooSymbol||p.symbol}`).join(", ") || "";
+    const yahooSyms = portfolio?.combined?.positions
+      ?.map(p=>{ const ys = p.yahooSymbol||yfSymbol(p.symbol)||p.symbol; return `${p.symbol}→${ys}`; })
+      .filter(s => !DELISTED.some(d => s.includes(d)))
+      .join(", ") || "";
 
     const scriptPrompt = `You are writing a Python backtest script to run on a server with yfinance, pandas, numpy, matplotlib installed.
 
 User request: "${instruction}"
-Portfolio holdings: ${holdings}
-Yahoo Finance symbols: ${yahooSyms}
+Portfolio holdings (IBKR symbols): ${holdings}
+Yahoo Finance symbols to use: ${yahooSyms}
 
 CRITICAL RULES:
-- Output ONLY raw Python code. No markdown, no backticks, no explanation, no comments before the code.
-- Do NOT define OUTPUT_JSON or CHART_PNG variables — they are already injected at the top.
-- The script MUST end by writing results to OUTPUT_JSON and saving chart to CHART_PNG.
-- Use matplotlib.use("Agg") before importing pyplot (no display available).
-- Keep it simple and robust — prefer yfinance download() over Ticker().history().
+- Output ONLY raw Python code. No markdown, no backticks, no explanation.
+- Do NOT define OUTPUT_JSON or CHART_PNG — they are already injected at the top.
+- Use matplotlib.use("Agg") BEFORE any other matplotlib import.
+- ALWAYS handle missing/empty data: after yf.download(), drop columns where all values are NaN, check if dataframe is empty before proceeding.
+- Use try/except around data fetching. If a symbol has no data, skip it with a warning print.
+- Use the exact Yahoo Finance symbols provided above, not IBKR symbols.
+- Keep code simple: prefer yf.download() with group_by="ticker" for multiple symbols.
 
-Required output format at end of script:
-import json
-result = {"metrics": {"total_return_pct": float, "sharpe": float, "max_drawdown_pct": float, "ann_return_pct": float, "win_rate_pct": float, "n_trades": int}, "trades": [{"entry_date": str, "exit_date": str, "pnl_pct": float}], "label": "strategy name"}
-with open(OUTPUT_JSON, "w") as f: json.dump(result, f)
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-# plot equity curve here
-plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor="#0D0F14")
-plt.close()`;
+REQUIRED structure at end of script (use these exact variable names):
+  metrics = {"total_return_pct": float, "ann_return_pct": float, "sharpe": float, "max_drawdown_pct": float, "win_rate_pct": float, "n_trades": int}
+  trades = [{"entry_date": "YYYY-MM-DD", "exit_date": "YYYY-MM-DD", "pnl_pct": float}]  # empty list if buy&hold
+  label = "short strategy name"
+  import json
+  with open(OUTPUT_JSON, "w") as f: json.dump({"metrics": metrics, "trades": trades, "label": label}, f)
+  import matplotlib
+  matplotlib.use("Agg")
+  import matplotlib.pyplot as plt
+  # your chart here
+  plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor="#0D0F14")
+  plt.close()`;
 
     const scriptResult = await runAgent(scriptPrompt);
     let script = typeof scriptResult === "string" ? scriptResult : scriptResult?.reply || "";

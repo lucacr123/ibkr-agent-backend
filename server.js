@@ -32,21 +32,44 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 const parser    = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "" });
 
 // ── Push subscription persistence ─────────────────────────────────
+// Primary: PUSH_SUBS env var (survives redeploys)
+// Secondary: /tmp file (fast read/write during session)
 const PUSH_SUBS_FILE = "/tmp/push-subs.json";
 const pushSubs = new Map();
+
 function loadPushSubs() {
   try {
-    if (fs.existsSync(PUSH_SUBS_FILE)) {
+    // Try env var first (survives deploys)
+    const envSubs = process.env.PUSH_SUBS_JSON;
+    if (envSubs) {
+      const data = JSON.parse(envSubs);
+      Object.entries(data).forEach(([id, sub]) => pushSubs.set(id, sub));
+      console.log(`📱 Loaded ${pushSubs.size} push subscriptions from env`);
+    } else if (fs.existsSync(PUSH_SUBS_FILE)) {
       const data = JSON.parse(fs.readFileSync(PUSH_SUBS_FILE, "utf8"));
       Object.entries(data).forEach(([id, sub]) => pushSubs.set(id, sub));
-      console.log(`📱 Loaded ${pushSubs.size} push subscriptions`);
+      console.log(`📱 Loaded ${pushSubs.size} push subscriptions from /tmp`);
     }
   } catch (e) { console.error("Failed to load push subs:", e.message); }
 }
+
 function savePushSubs() {
-  try { fs.writeFileSync(PUSH_SUBS_FILE, JSON.stringify(Object.fromEntries(pushSubs))); }
-  catch (e) { console.error("Failed to save push subs:", e.message); }
+  const data = JSON.stringify(Object.fromEntries(pushSubs));
+  // Always write to /tmp for fast access
+  try { fs.writeFileSync(PUSH_SUBS_FILE, data); } catch {}
+  // Also update Railway env var if API token available (persists across deploys)
+  const railwayToken = process.env.RAILWAY_API_TOKEN;
+  const serviceId    = process.env.RAILWAY_SERVICE_ID;
+  const envId        = process.env.RAILWAY_ENVIRONMENT_ID;
+  if (railwayToken && serviceId && envId) {
+    fetch("https://backboard.railway.app/graphql/v2", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${railwayToken}` },
+      body: JSON.stringify({ query: `mutation { variableUpsert(input: { serviceId: "${serviceId}", environmentId: "${envId}", name: "PUSH_SUBS_JSON", value: ${JSON.stringify(data)} }) }` })
+    }).catch(() => {});
+  }
 }
+
 loadPushSubs();
 if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
 

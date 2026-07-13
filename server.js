@@ -2444,8 +2444,16 @@ async function runPythonBacktest(script, timeoutMs = 120000) {
 
   // Set LD_LIBRARY_PATH so numpy/matplotlib can find libstdc++
   const spawnEnv = { ...process.env };
-  const nixLib = "/root/.nix-profile/lib";
-  spawnEnv.LD_LIBRARY_PATH = nixLib + (spawnEnv.LD_LIBRARY_PATH ? ":" + spawnEnv.LD_LIBRARY_PATH : "");
+  try {
+    const savedPath = readFileSync("/app/lib_path.txt", "utf8").trim();
+    if (savedPath) {
+      spawnEnv.LD_LIBRARY_PATH = savedPath + (spawnEnv.LD_LIBRARY_PATH ? ":" + spawnEnv.LD_LIBRARY_PATH : "");
+      console.log("🔧 LD_LIBRARY_PATH:", savedPath.slice(0, 80));
+    }
+  } catch(e) {
+    // fallback: try common nix gcc paths
+    spawnEnv.LD_LIBRARY_PATH = "/root/.nix-profile/lib:/nix/var/nix/profiles/default/lib" + (spawnEnv.LD_LIBRARY_PATH ? ":" + spawnEnv.LD_LIBRARY_PATH : "");
+  }
 
   return new Promise((res) => {
     let stdout = "", stderr = "";

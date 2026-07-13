@@ -1862,8 +1862,7 @@ async function runAgent(prompt, history = []) {
     }
   }
 
-  return response.content.filter(b => b.type === "text").map(b => b.text).join("
-");
+  return response.content.filter(b => b.type === "text").map(b => b.text).join("\n");
 }
 
 app.post("/api/chat", async (req, res) => {

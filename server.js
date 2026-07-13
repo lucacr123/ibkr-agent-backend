@@ -2542,8 +2542,13 @@ REQUIRED structure at end of script (use these exact variable names):
   plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor="#0D0F14")
   plt.close()`;
 
-    const scriptResult = await runAgent(scriptPrompt);
-    let script = typeof scriptResult === "string" ? scriptResult : scriptResult?.reply || "";
+    // Call API directly with higher token limit for script generation
+    const scriptResponse = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 8000,
+      messages: [{ role: "user", content: scriptPrompt }],
+    });
+    let script = scriptResponse.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
     // Strip ALL markdown fences aggressively
     script = script.replace(/^```[\w]*\n?/gm, "").replace(/^```\s*$/gm, "").trim();
     if (!script || script.length < 100) return res.status(500).json({ error: "Claude failed to generate script" });

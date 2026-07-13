@@ -2407,6 +2407,145 @@ app.get("/api/debug/fx/:symbol", async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message, stack: e.stack }); }
 });
 
+
+// ═══════════════════════════════════════════════════════════════════
+// PYTHON BACKTEST ENGINE
+// Claude writes the script → server runs it → emails results + code
+// ═══════════════════════════════════════════════════════════════════
+import { spawn } from "child_process";
+import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
+
+// Ensure pip packages are installed on first run
+let pipReady = false;
+async function ensurePip() {
+  if (pipReady) return;
+  await new Promise((res) => {
+    const p = spawn("pip3", ["install", "--quiet", "--break-system-packages",
+      "yfinance", "pandas", "numpy", "matplotlib", "scipy"], { stdio:"pipe" });
+    p.on("close", () => { pipReady = true; res(); });
+    p.on("error", () => res()); // ignore if pip not found
+  });
+}
+
+async function runPythonBacktest(script, timeoutMs = 120000) {
+  await ensurePip();
+  const tmpScript = "/tmp/bt_script.py";
+  const tmpOut    = "/tmp/bt_output.json";
+  const tmpChart  = "/tmp/bt_chart.png";
+  // Inject output paths into script
+  const injected = `OUTPUT_JSON = "${tmpOut}"\nCHART_PNG = "${tmpChart}"\n` + script;
+  writeFileSync(tmpScript, injected);
+  return new Promise((res) => {
+    let stdout = "", stderr = "";
+    const p = spawn("python3", [tmpScript], { stdio: "pipe" });
+    p.stdout.on("data", d => stdout += d.toString());
+    p.stderr.on("data", d => stderr += d.toString());
+    const timer = setTimeout(() => { p.kill(); res({ ok:false, error:"Timeout after 120s", stdout, stderr }); }, timeoutMs);
+    p.on("close", code => {
+      clearTimeout(timer);
+      if (code !== 0) return res({ ok:false, error:`Exit ${code}`, stdout, stderr });
+      try {
+        const result = existsSync(tmpOut) ? JSON.parse(readFileSync(tmpOut,"utf8")) : {};
+        const chartB64 = existsSync(tmpChart) ? readFileSync(tmpChart).toString("base64") : null;
+        res({ ok:true, result, chartB64, stdout, stderr, script });
+      } catch(e) { res({ ok:false, error:e.message, stdout, stderr }); }
+    });
+    p.on("error", e => { clearTimeout(timer); res({ ok:false, error:e.message }); });
+  });
+}
+
+function buildBacktestEmail(label, result, chartB64, script) {
+  const m = result?.metrics || {};
+  const trades = result?.trades || [];
+  const metricsHtml = Object.entries(m).map(([k,v])=>`
+    <tr><td style="padding:5px 10px 5px 0;color:#8A9AC0;font-size:13px">${k}</td>
+        <td style="padding:5px 0;font-family:monospace;font-size:13px;color:#EDF0F7">${typeof v==="number"?v.toFixed(4):v}</td></tr>`).join("");
+  const tradesHtml = trades.slice(0,50).map((t,i)=>`
+    <tr style="border-bottom:1px solid #252A38">
+      <td style="padding:4px 8px;font-family:monospace;font-size:11px;color:#8A9AC0">${i+1}</td>
+      <td style="padding:4px 8px;font-family:monospace;font-size:11px">${t.entry_date||"—"}</td>
+      <td style="padding:4px 8px;font-family:monospace;font-size:11px">${t.exit_date||"—"}</td>
+      <td style="padding:4px 8px;font-family:monospace;font-size:11px;color:${(t.pnl_pct||0)>=0?"#2ECC71":"#E74C3C"}">${(t.pnl_pct||0).toFixed(2)}%</td>
+    </tr>`).join("");
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
+<body style="background:#0D0F14;font-family:Inter,sans-serif;color:#EDF0F7;padding:24px;max-width:700px">
+<h2 style="color:#C9A84C">📊 Backtest: ${label}</h2>
+<p style="color:#5A6280">${new Date().toLocaleDateString("en-GB",{day:"numeric",month:"long",year:"numeric"})}</p>
+${chartB64?`<img src="data:image/png;base64,${chartB64}" style="width:100%;border-radius:12px;margin:16px 0"/>`: ""}
+<h3 style="color:#E8C87A;margin-top:20px">Metrics</h3>
+<table style="border-collapse:collapse">${metricsHtml}</table>
+${trades.length?`<h3 style="color:#E8C87A;margin-top:20px">Trades (first 50)</h3>
+<table style="border-collapse:collapse;font-size:11px;font-family:monospace;width:100%">
+<tr style="border-bottom:1px solid #252A38">
+  <th style="padding:5px 8px;color:#5A6280">#</th><th style="padding:5px 8px;color:#5A6280">Entry</th>
+  <th style="padding:5px 8px;color:#5A6280">Exit</th><th style="padding:5px 8px;color:#5A6280">P&L</th>
+</tr>${tradesHtml}</table>`:""}
+<h3 style="color:#E8C87A;margin-top:24px">🐍 Python Script</h3>
+<pre style="background:#0A0C12;border:1px solid #252A38;border-radius:8px;padding:14px;font-family:monospace;font-size:11px;white-space:pre-wrap;overflow:auto">${script.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")}</pre>
+</body></html>`;
+}
+
+// API endpoint — called from frontend
+app.post("/api/backtest/run", async (req, res) => {
+  const { instruction } = req.body;
+  if (!instruction) return res.status(400).json({ error: "instruction required" });
+  try {
+    // Step 1: Claude writes the Python script
+    res.setHeader("Content-Type","application/json");
+    const portfolio = await buildPortfolio().catch(()=>null);
+    const holdings = portfolio?.combined?.positions?.map(p=>p.symbol).join(", ") || "your holdings";
+    const yahooSyms = portfolio?.combined?.positions?.map(p=>`${p.symbol}→${p.yahooSymbol||p.symbol}`).join(", ") || "";
+
+    const scriptPrompt = `You are writing a Python backtest script. The user wants: "${instruction}"
+
+Portfolio holdings: ${holdings}
+Yahoo Finance symbols: ${yahooSyms}
+
+Write a COMPLETE, RUNNABLE Python script that:
+1. Uses yfinance to fetch real price data
+2. Implements the exact strategy described
+3. Computes: total return, annualised return, Sharpe ratio, max drawdown, win rate, number of trades
+4. Generates a matplotlib chart (equity curve) and saves to CHART_PNG variable (already defined)
+5. Saves metrics dict and trades list to OUTPUT_JSON variable (already defined) using json.dump
+6. Prints "DONE" at the end
+
+The OUTPUT_JSON must contain:
+- "metrics": dict of metric_name → value
+- "trades": list of {entry_date, exit_date, pnl_pct}
+- "label": strategy name string
+
+Use this exact pattern at the end:
+import json, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+# ... your chart code ...
+plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor="#0D0F14")
+with open(OUTPUT_JSON, "w") as f:
+    json.dump({"metrics": metrics, "trades": trades, "label": label}, f)
+print("DONE")
+
+Return ONLY the Python code, no markdown fences, no explanation.`;
+
+    const scriptResult = await runAgent(scriptPrompt);
+    const script = typeof scriptResult === "string" ? scriptResult : scriptResult?.reply || "";
+    if (!script || script.length < 100) return res.status(500).json({ error: "Claude failed to generate script" });
+
+    // Step 2: Run the script
+    const bt = await runPythonBacktest(script);
+    if (!bt.ok) return res.status(500).json({ error: bt.error, stderr: bt.stderr, script });
+
+    // Step 3: Email results
+    const label = bt.result?.label || instruction.slice(0,60);
+    const html = buildBacktestEmail(label, bt.result, bt.chartB64, script);
+    await sendEmail(REPORT_TO, `📊 Backtest: ${label}`, html);
+
+    // Step 4: Push notification
+    await sendPush("📊 Backtest complete", `Results emailed: ${label}`, "📊");
+
+    res.json({ ok:true, label, metrics: bt.result?.metrics, trades: bt.result?.trades?.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
 
 const PORT = process.env.PORT || 3001;

@@ -221,9 +221,9 @@ async function buildPortfolio(force = false) {
   for (const acct of accounts) {
     try {
       const acctPositions = acct.positions.map(p => ({
-        symbol:          p.symbol,
-        yahooSymbol:     yfSymbol(p.symbol),
-        positionValueEUR: p.positionValueEUR,
+        symbol:         p.symbol,
+        yahooSymbol:    yfSymbol(p.symbol),
+        totalValueEUR:  p.positionValueEUR,  // computePortfolioMetrics uses totalValueEUR for weights
       }));
       const acctNLV = acct.netLiquidationEUR;
       if (acctPositions.length > 0 && acctNLV > 0) {

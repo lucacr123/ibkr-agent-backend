@@ -2419,11 +2419,14 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 let pipReady = false;
 async function ensurePip() {
   if (pipReady) return;
+  console.log("📦 Installing Python packages...");
   await new Promise((res) => {
     const p = spawn("pip3", ["install", "--quiet", "--break-system-packages",
       "yfinance", "pandas", "numpy", "matplotlib", "scipy"], { stdio:"pipe" });
-    p.on("close", () => { pipReady = true; res(); });
-    p.on("error", () => res());
+    p.stdout?.on("data", d => process.stdout.write(d));
+    p.stderr?.on("data", d => process.stderr.write(d));
+    p.on("close", () => { pipReady = true; console.log("✅ Python packages ready"); res(); });
+    p.on("error", (e) => { console.error("pip error:", e.message); res(); });
   });
 }
 
@@ -2562,4 +2565,7 @@ plt.close()`;
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`🚀 IBKR Agent on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 IBKR Agent on port ${PORT}`);
+  ensurePip().catch(e => console.error("pip startup error:", e.message));
+});

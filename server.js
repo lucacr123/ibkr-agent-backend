@@ -2450,25 +2450,28 @@ async function runPythonBacktest(script, timeoutMs = 120000) {
   const tmpScript = "/tmp/bt_script.py";
   const tmpOut    = "/tmp/bt_output.json";
   const tmpChart  = "/tmp/bt_chart.png";
-  // Inject output paths into script
   const injected = `OUTPUT_JSON = "${tmpOut}"\nCHART_PNG = "${tmpChart}"\n` + script;
   writeFileSync(tmpScript, injected);
+
+  // Find libstdc++ in nix store and set LD_LIBRARY_PATH
+  const nixGccLib = await new Promise(res => {
+    const p = spawn("find", ["/nix/store", "-name", "libstdc++.so.6", "-maxdepth", "5"], {stdio:"pipe"});
+    let out = "";
+    p.stdout?.on("data", d => out += d.toString());
+    const t = setTimeout(() => { p.kill(); res(""); }, 5000);
+    p.on("close", () => {
+      clearTimeout(t);
+      const paths = out.trim().split("\n").filter(Boolean).map(f => f.split("/").slice(0,-1).join("/"));
+      res([...new Set(paths)].join(":"));
+    });
+    p.on("error", () => { clearTimeout(t); res(""); });
+  });
+  const spawnEnv = { ...process.env };
+  if (nixGccLib) spawnEnv.LD_LIBRARY_PATH = nixGccLib + (spawnEnv.LD_LIBRARY_PATH ? ":"+spawnEnv.LD_LIBRARY_PATH : "");
+  console.log("🔧 LD_LIBRARY_PATH:", (spawnEnv.LD_LIBRARY_PATH||"none").slice(0,120));
+
   return new Promise((res) => {
     let stdout = "", stderr = "";
-    // Find libstdc++ in nix store and set LD_LIBRARY_PATH
-    const nixGccLib = await new Promise(res => {
-      const p = spawn("find", ["/nix/store", "-name", "libstdc++.so.6", "-maxdepth", "6"], {stdio:"pipe"});
-      let out = "";
-      p.stdout?.on("data", d => out += d.toString());
-      p.on("close", () => {
-        const paths = out.trim().split("\n").filter(Boolean).map(f => f.split("/").slice(0,-1).join("/"));
-        res([...new Set(paths)].join(":"));
-      });
-      p.on("error", () => res(""));
-    });
-    const spawnEnv = { ...process.env };
-    if (nixGccLib) spawnEnv.LD_LIBRARY_PATH = nixGccLib + (spawnEnv.LD_LIBRARY_PATH ? ":"+spawnEnv.LD_LIBRARY_PATH : "");
-    console.log("🔧 LD_LIBRARY_PATH:", spawnEnv.LD_LIBRARY_PATH?.slice(0,100));
     const p = spawn(pyBin, [tmpScript], { stdio: "pipe", env: spawnEnv });
     p.stdout.on("data", d => stdout += d.toString());
     p.stderr.on("data", d => stderr += d.toString());

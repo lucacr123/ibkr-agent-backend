@@ -2417,21 +2417,12 @@ import { writeFileSync, readFileSync, existsSync, mkdirSync } from "fs";
 
 // Ensure pip packages are installed on first run
 let pipReady = false;
-async function ensurePip() {
-  if (pipReady) return;
-  console.log("📦 Installing yfinance...");
-  await new Promise((res) => {
-    const p = spawn("pip3", ["install", "--quiet", "--break-system-packages", "yfinance"], { stdio:"pipe" });
-    p.stdout?.on("data", d => process.stdout.write(d));
-    p.stderr?.on("data", d => process.stderr.write(d));
-    p.on("close", () => { pipReady = true; console.log("✅ Python packages ready"); res(); });
-    p.on("error", (e) => { console.error("pip error:", e.message); res(); });
-  });
-}
+let pipReady = true; // installed at build time via virtualenv
+async function ensurePip() { /* no-op: packages installed at build time */ }
 
-// Detect python binary
+// Detect python binary — prefer virtualenv which has yfinance
 async function getPython() {
-  for (const bin of ["python3","python"]) {
+  for (const bin of ["/app/pyenv/bin/python3", "python3", "python"]) {
     const ok = await new Promise(res => {
       const p = spawn(bin, ["--version"], {stdio:"pipe"});
       p.on("close", c => res(c===0));
@@ -2582,5 +2573,4 @@ app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISO
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`🚀 IBKR Agent on port ${PORT}`);
-  ensurePip().catch(e => console.error("pip startup error:", e.message));
 });

@@ -2442,8 +2442,10 @@ async function runPythonBacktest(script, timeoutMs = 120000) {
   const injected = `OUTPUT_JSON = "${tmpOut}"\nCHART_PNG = "${tmpChart}"\n` + script;
   writeFileSync(tmpScript, injected);
 
-  // Use Nix-installed python which has all C deps bundled
+  // Set LD_LIBRARY_PATH so numpy/matplotlib can find libstdc++
   const spawnEnv = { ...process.env };
+  const nixLib = "/root/.nix-profile/lib";
+  spawnEnv.LD_LIBRARY_PATH = nixLib + (spawnEnv.LD_LIBRARY_PATH ? ":" + spawnEnv.LD_LIBRARY_PATH : "");
 
   return new Promise((res) => {
     let stdout = "", stderr = "";

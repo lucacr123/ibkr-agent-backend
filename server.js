@@ -769,7 +769,15 @@ async function computePortfolioMetrics(positions, totalNLV) {
       portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
       drawdownSeries: (() => { let peak=-Infinity; return cumulativeFromReturns(pr).map(v=>{ if(v>peak)peak=v; return +((v-peak)/peak*100).toFixed(3); }); })(),
-      weights: items.map((x, i) => ({ symbol: x.symbol, yahooSymbol: x.yahooSymbol, weightPct: +(weights[i] * 100).toFixed(2) })),
+      weights: items.map((x, i) => {
+        // Marginal Risk Contribution = w_i * (Σw)_i / portfolio_vol
+        // (Σw)_i = sum_j w_j * cov[i][j]
+        const covRow = cov[i].reduce((s, c, j) => s + weights[j] * c, 0);
+        const mrc = weights[i] * covRow; // variance contribution
+        const portVolDaily = Math.sqrt(Math.max(weights.reduce((rs,_,ii)=>rs+weights.reduce((cs,_,jj)=>cs+weights[ii]*weights[jj]*cov[ii][jj],0),0),0));
+        const riskContribPct = portVolDaily > 0 ? +(mrc / portVolDaily * Math.sqrt(252) * 100).toFixed(2) : 0;
+        return { symbol:x.symbol, yahooSymbol:x.yahooSymbol, weightPct:+(weights[i]*100).toFixed(2), riskContribPct };
+      }),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
       method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix (EUR-converted, forward-filled across single-exchange holidays for ~252 trading days); Sharpe = annualized return / covariance-based annualized volatility",
@@ -1871,6 +1879,13 @@ PORTFOLIO WORKFLOW: call get_portfolio_analytics for portfolio overview. Include
 DATA RULE: Never invent market data. Fetch via tools. Mathematical models (Black-Scholes, Kelly, Sharpe) are fine on real fetched inputs.
 Format: EUR=€, GBP=£, USD=$. Today: ${new Date().toDateString()}.
 
+MACRO DATA: For economic indicators (CPI, PCE, NFP, consumer confidence, inflation expectations, PMI, GDP, retail sales, Fed funds rate, yield curves, JOLTS etc.):
+- Use web_search to find the latest prints and historical series (FRED, BLS, Eurostat, ONS, ECB are reliable sources)
+- Fetch the raw numbers, compute metrics yourself (MoM, YoY, surprise vs consensus, trend, z-score vs history)
+- You can analyse any public economic data — don't say "I don't have access", just search and compute
+- For historical series: search for the data, build the table, compute what's asked (rolling average, deviation from trend, correlation with equity returns etc.)
+- Fred.stlouisfed.org, bls.gov, ons.gov.uk, ecb.europa.eu all have public data you can search and reference
+
 CONVERSATION STYLE:
 - Be natural and conversational — like a sharp analyst friend, not a robot generating reports.
 - Use tables and structured data when helpful, but wrap them with real commentary and insight.
@@ -2524,31 +2539,62 @@ app.post("/api/backtest/run", async (req, res) => {
       .filter(s => !DELISTED.some(d => s.includes(d)))
       .join(", ") || "";
 
-    const scriptPrompt = `You are writing a Python backtest script to run on a server with yfinance, pandas, numpy, matplotlib installed.
+    const scriptPrompt = `You are writing a Python script for financial analysis/backtesting to run on a server with yfinance, pandas, numpy, matplotlib, scipy installed.
 
 User request: "${instruction}"
 Portfolio holdings (IBKR symbols): ${holdings}
 Yahoo Finance symbols to use: ${yahooSyms}
 
+CAPABILITIES — you can write any of these based on what the user asks:
+1. SIGNAL BACKTEST: traditional entry/exit strategy on price data
+2. MONTE CARLO SIMULATION: stochastic process simulation (GBM, Heston, jump-diffusion)
+3. MACRO/ECONOMIC ANALYSIS: fetch economic data, compute metrics, visualise
+4. STATISTICAL ANALYSIS: correlations, regressions, distributions
+5. PORTFOLIO OPTIMISATION: weights, efficient frontier, risk decomposition
+6. ANY COMBINATION of the above
+
+INTERPRETATION RULES:
+- If user asks for "Monte Carlo" or "simulation": use stochastic processes (GBM with drift + sigma, or Heston for stochastic vol, or Merton jump-diffusion for jumps)
+- If user mentions "paths": run N=1000 simulated paths, show fan chart with percentile bands (5th, 25th, 50th, 75th, 95th)
+- If user mentions "stochastic volatility": use Heston model (mean-reverting variance process)
+- If user mentions "jumps": use Merton jump-diffusion (compound Poisson jumps)
+- If user asks about economic data (CPI, inflation, GDP etc.): fetch from FRED or web, compute requested metrics
+- If strategy is vaguely described: make reasonable assumptions, state them clearly in the label
+- For backtests: always compute: total return, ann return, Sharpe, max drawdown, win rate, n trades
+
+MONTE CARLO TEMPLATE (use when simulation is requested):
+- Calibrate parameters (mu, sigma) from historical yfinance data
+- For Heston: also calibrate kappa, theta, xi, rho from historical vol
+- Run 1000 paths over requested horizon
+- Plot fan chart: median in bright color, shaded bands for percentiles
+- Compute: expected return, vol of terminal distribution, VaR 95%, CVaR 95%, probability of loss, probability of >X% gain
+
 CRITICAL RULES:
 - Output ONLY raw Python code. No markdown, no backticks, no explanation.
 - Do NOT define OUTPUT_JSON or CHART_PNG — they are already injected at the top.
-- Use matplotlib.use("Agg") BEFORE any other matplotlib import.
-- ALWAYS handle missing/empty data: after yf.download(), drop columns where all values are NaN, check if dataframe is empty before proceeding.
-- Use try/except around data fetching. If a symbol has no data, skip it with a warning print.
-- Use the exact Yahoo Finance symbols provided above, not IBKR symbols.
-- Keep code simple: prefer yf.download() with group_by="ticker" for multiple symbols.
+- Use matplotlib.use("Agg") as the VERY FIRST matplotlib call.
+- ALWAYS handle missing/empty data gracefully with try/except.
+- Use exact Yahoo Finance symbols provided, not IBKR symbols.
+
+REQUIRED at end of script:
+  metrics = {"key": value, ...}  # dict of all computed metrics
+  trades = [{"entry_date": str, "exit_date": str, "pnl_pct": float}]  # empty list if not a trade backtest
+  label = "descriptive strategy name"
+  import json
+  with open(OUTPUT_JSON, "w") as f: json.dump({"metrics": metrics, "trades": trades, "label": label}, f)
+  plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor="#0D0F14")
+  plt.close()
 
 REQUIRED structure at end of script (use these exact variable names):
-  metrics = {"total_return_pct": float, "ann_return_pct": float, "sharpe": float, "max_drawdown_pct": float, "win_rate_pct": float, "n_trades": int}
-  trades = [{"entry_date": "YYYY-MM-DD", "exit_date": "YYYY-MM-DD", "pnl_pct": float}]  # empty list if buy&hold
-  label = "short strategy name"
+  metrics = {"key": value}  # all relevant computed metrics as a flat dict
+  trades = []  # list of {entry_date, exit_date, pnl_pct} if applicable, else empty list
+  label = "descriptive strategy name"
   import json
   with open(OUTPUT_JSON, "w") as f: json.dump({"metrics": metrics, "trades": trades, "label": label}, f)
   import matplotlib
   matplotlib.use("Agg")
   import matplotlib.pyplot as plt
-  # your chart here
+  # chart code here
   plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor="#0D0F14")
   plt.close()`;
 

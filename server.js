@@ -77,7 +77,7 @@ if (VAPID_PUBLIC && VAPID_PRIVATE) webpush.setVapidDetails(VAPID_EMAIL, VAPID_PU
 const toArr = v => Array.isArray(v) ? v : v ? [v] : [];
 const n     = v => parseFloat(v || 0);
 const fmt   = v => n(v).toFixed(2);
-const YAHOO_SYMBOLS = { CSPX:"CSPX.L", CSNDX:"CNDX.L", CSSX5E:"CSSX5E.SW", IEEM:"IEEM.L", IUSE:"IUSE.L", NQSE:"NQSE.DE", SPCX:"SPCX.L", VUAG:"VUAG.L", VWRL:"VWRL.L", VFEM:"VFEM.L" };
+const YAHOO_SYMBOLS = { CSPX:"CSPX.L", CSNDX:"CNDX.L", CNDX:"CNDX.L", CSSX5E:"CSSX5E.SW", IEEM:"IEEM.L", IUSE:"IUSE.L", NQSE:"NQSE.DE", SPCX:"SPCX.L", VUAG:"VUAG.L", VWRL:"VWRL.L", VFEM:"VFEM.L" };
 const yfSymbol = s => YAHOO_SYMBOLS[(s || "").toUpperCase()] || s;
 
 // ─── Flex Web Service ─────────────────────────────────────────────
@@ -769,15 +769,20 @@ async function computePortfolioMetrics(positions, totalNLV) {
       portfolioReturnsPct: pr.map(v => +(v * 100).toFixed(4)),
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
       drawdownSeries: (() => { let peak=-Infinity; return cumulativeFromReturns(pr).map(v=>{ if(v>peak)peak=v; return +((v-peak)/peak*100).toFixed(3); }); })(),
-      weights: items.map((x, i) => {
-        // Marginal Risk Contribution = w_i * (Σw)_i / portfolio_vol
-        // (Σw)_i = sum_j w_j * cov[i][j]
-        const covRow = cov[i].reduce((s, c, j) => s + weights[j] * c, 0);
-        const mrc = weights[i] * covRow; // variance contribution
-        const portVolDaily = Math.sqrt(Math.max(weights.reduce((rs,_,ii)=>rs+weights.reduce((cs,_,jj)=>cs+weights[ii]*weights[jj]*cov[ii][jj],0),0),0));
-        const riskContribPct = portVolDaily > 0 ? +(mrc / portVolDaily * Math.sqrt(252) * 100).toFixed(2) : 0;
-        return { symbol:x.symbol, yahooSymbol:x.yahooSymbol, weightPct:+(weights[i]*100).toFixed(2), riskContribPct };
-      }),
+      weights: (() => {
+        // Marginal Risk Contribution (MRC) = w_i * (Cov·w)_i / σ_p
+        // This gives the annualised vol contribution of each asset in % terms
+        // Sum of all MRC_i = portfolio annualised vol
+        const covW = weights.map((_, i) => cov[i].reduce((s, c, j) => s + weights[j] * c, 0)); // Cov·w vector
+        const portVar = weights.reduce((s, w, i) => s + w * covW[i], 0);
+        const portVolAnn = Math.sqrt(Math.max(portVar, 0)) * Math.sqrt(252);
+        return items.map((x, i) => {
+          const mrcAnn = portVolAnn > 0 ? weights[i] * covW[i] * Math.sqrt(252) / portVolAnn * portVolAnn : 0;
+          // riskContribPct = percentage points of annualised portfolio vol from this asset
+          const riskContribPct = portVolAnn > 0 ? +(weights[i] * covW[i] * Math.sqrt(252) / portVolAnn * 100).toFixed(2) : 0;
+          return { symbol:x.symbol, yahooSymbol:x.yahooSymbol, weightPct:+(weights[i]*100).toFixed(2), riskContribPct };
+        });
+      })(),
       correlationMatrix: corr,
       covarianceMethod: "1Y daily Yahoo returns, date-aligned; annual vol = sqrt(w'Σw) × sqrt(252)",
       method: "current portfolio weights × 1Y Yahoo daily-return correlation/covariance matrix (EUR-converted, forward-filled across single-exchange holidays for ~252 trading days); Sharpe = annualized return / covariance-based annualized volatility",
@@ -1879,12 +1884,11 @@ PORTFOLIO WORKFLOW: call get_portfolio_analytics for portfolio overview. Include
 DATA RULE: Never invent market data. Fetch via tools. Mathematical models (Black-Scholes, Kelly, Sharpe) are fine on real fetched inputs.
 Format: EUR=€, GBP=£, USD=$. Today: ${new Date().toDateString()}.
 
-MACRO DATA: For economic indicators (CPI, PCE, NFP, consumer confidence, inflation expectations, PMI, GDP, retail sales, Fed funds rate, yield curves, JOLTS etc.):
-- Use web_search to find the latest prints and historical series (FRED, BLS, Eurostat, ONS, ECB are reliable sources)
-- Fetch the raw numbers, compute metrics yourself (MoM, YoY, surprise vs consensus, trend, z-score vs history)
-- You can analyse any public economic data — don't say "I don't have access", just search and compute
-- For historical series: search for the data, build the table, compute what's asked (rolling average, deviation from trend, correlation with equity returns etc.)
-- Fred.stlouisfed.org, bls.gov, ons.gov.uk, ecb.europa.eu all have public data you can search and reference
+MACRO DATA: For any economic indicator (CPI, PCE, NFP, consumer confidence, inflation expectations, PMI, GDP, ISM, JOLTS, retail sales, yield curve, Fed funds rate etc.):
+- Just use web_search. Search for whatever the user asks, find the numbers, compute what's requested.
+- Never say you cannot access this data. If you can search the web, you can find it.
+- After finding data, do the maths: MoM, YoY, trend, surprise vs consensus, z-score, correlation — whatever is useful.
+- Build a clean table or summary from what you find. State the source and date.
 
 CONVERSATION STYLE:
 - Be natural and conversational — like a sharp analyst friend, not a robot generating reports.
@@ -2574,7 +2578,8 @@ CRITICAL RULES:
 - Do NOT define OUTPUT_JSON or CHART_PNG — they are already injected at the top.
 - Use matplotlib.use("Agg") as the VERY FIRST matplotlib call.
 - ALWAYS handle missing/empty data gracefully with try/except.
-- Use exact Yahoo Finance symbols provided, not IBKR symbols.
+- Use EXACT Yahoo Finance symbols provided (e.g. CNDX.L not CNDX, CSPX.L not CSPX). Never use bare IBKR symbols in yf.download().
+- If a symbol fails to download (empty dataframe), try adding ".L" suffix or check the provided mapping.
 
 REQUIRED at end of script:
   metrics = {"key": value, ...}  # dict of all computed metrics

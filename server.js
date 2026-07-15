@@ -1761,7 +1761,24 @@ async function executeTool(name, input) {
       return fetchMarketNews(input || {});
 
     case "web_search": {
-      const results = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${encodeURIComponent(input.query)}&count=5`, { headers: { "Accept": "application/json", "Accept-Encoding": "gzip", "X-Subscription-Token": process.env.BRAVE_API_KEY||"" }}).then(r=>r.json()).catch(()=>({})); return { results: (results.web?.results||[]).map(r=>({ title:r.title, url:r.url, description:r.description })) };
+      const q = encodeURIComponent(input.query);
+      // Try Brave first if API key available, fall back to DuckDuckGo
+      const braveKey = process.env.BRAVE_API_KEY;
+      if (braveKey) {
+        const r = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${q}&count=5`, {
+          headers: { "Accept":"application/json","Accept-Encoding":"gzip","X-Subscription-Token":braveKey }
+        }).then(r=>r.json()).catch(()=>({}));
+        return { results: (r.web?.results||[]).map(r=>({ title:r.title, url:r.url, description:r.description })) };
+      }
+      // DuckDuckGo instant answer (no API key needed)
+      const ddg = await fetch(`https://api.duckduckgo.com/?q=${q}&format=json&no_redirect=1&no_html=1&skip_disambig=1`)
+        .then(r=>r.json()).catch(()=>({}));
+      const results = [];
+      if (ddg.AbstractText) results.push({ title: ddg.Heading, url: ddg.AbstractURL, description: ddg.AbstractText });
+      (ddg.RelatedTopics||[]).slice(0,4).forEach(t => {
+        if (t.Text) results.push({ title: t.Text.slice(0,80), url: t.FirstURL||"", description: t.Text });
+      });
+      return { results };
     }
 
     case "get_macro_snapshot":
@@ -2543,12 +2560,20 @@ app.post("/api/backtest/run", async (req, res) => {
       .filter(s => !DELISTED.some(d => s.includes(d)))
       .join(", ") || "";
 
+    // Build explicit symbol table
+    const symbolTable = portfolio?.combined?.positions
+      ?.filter(p => !DELISTED.some(d => (p.yahooSymbol||p.symbol).includes(d)))
+      ?.map(p => `  ${p.symbol.padEnd(8)} → ${p.yahooSymbol||yfSymbol(p.symbol)||p.symbol}`)
+      .join("\n") || "";
+
     const scriptPrompt = `You are writing a Python script for financial analysis/backtesting to run on a server with yfinance, pandas, numpy, matplotlib, scipy installed.
 
 User request: "${instruction}"
-Portfolio holdings (IBKR symbols): ${holdings}
-Yahoo Finance symbols to use: ${yahooSyms}
 
+SYMBOL MAPPING — use the RIGHT column in yf.download(), NEVER the left column:
+${symbolTable}
+
+CRITICAL: yf.download("CNDX") will fail. yf.download("CNDX.L") will work. Always use the Yahoo symbol (right column).
 CAPABILITIES — you can write any of these based on what the user asks:
 1. SIGNAL BACKTEST: traditional entry/exit strategy on price data
 2. MONTE CARLO SIMULATION: stochastic process simulation (GBM, Heston, jump-diffusion)

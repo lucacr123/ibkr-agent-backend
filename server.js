@@ -2717,8 +2717,10 @@ Return ONLY the corrected Python code, no markdown fences, no explanation.`;
 
 // Monte Carlo simulation endpoint
 app.post("/api/backtest/montecarlo", async (req, res) => {
-  const { symbol, horizon_days = 252, n_paths = 1000, model = "heston_jump" } = req.body;
+  const { symbol, horizon_days = 252, n_paths = 1000, model = "heston_jump", strategy_desc = "" } = req.body;
   if (!symbol) return res.status(400).json({ error: "symbol required" });
+  const yahooSym = yfSymbol(symbol) || symbol;
+  const labelDesc = strategy_desc ? strategy_desc.slice(0,60) : yahooSym;
 
   const mcScript = `
 import json
@@ -2732,12 +2734,12 @@ from scipy import stats
 import warnings
 warnings.filterwarnings("ignore")
 
-# ── Parameters ────────────────────────────────────────────────────
-SYMBOL       = "${symbol}"
-T            = ${horizon_days} / 252          # horizon in years
+SYMBOL       = "${yahooSym}"
+STRATEGY     = """${labelDesc}"""
+T            = ${horizon_days} / 252
 N_STEPS      = ${horizon_days}
 N_PATHS      = ${n_paths}
-MODEL        = "${model}"                     # gbm | heston | heston_jump
+MODEL        = "${model}"
 np.random.seed(42)
 
 # ── Fetch historical data (3Y for calibration) ────────────────────
@@ -2860,7 +2862,7 @@ metrics = {
     "jump_sigma":       round(float(sigma_j), 4),
 }
 trades = []
-label  = f"Monte Carlo {MODEL.upper()} — {SYMBOL} — {N_STEPS}d horizon — {N_PATHS} paths"
+label  = f"Monte Carlo {MODEL.upper()} — {STRATEGY} — {N_STEPS}d — {N_PATHS} paths"
 
 with open(OUTPUT_JSON, "w") as f:
     json.dump({"metrics": metrics, "trades": trades, "label": label}, f)
@@ -2892,7 +2894,7 @@ for i,(p,lb,c) in enumerate(zip(percs,labels_p,colors_p)):
 ax_paths.fill_between(t_axis, percs[0], percs[4], color="#E74C3C", alpha=0.08)
 ax_paths.fill_between(t_axis, percs[1], percs[3], color="#2ECC71", alpha=0.12)
 ax_paths.axhline(S0, color=TEXT, linewidth=0.8, linestyle="--", alpha=0.5)
-ax_paths.set_title(f"{SYMBOL} — {MODEL.upper()} — {N_PATHS} paths — {N_STEPS}d", color=TEXT, fontsize=10)
+ax_paths.set_title(f"{SYMBOL} — {MODEL.upper()} — {N_PATHS} paths — {N_STEPS}d\\n{STRATEGY[:50]}", color=TEXT, fontsize=9)
 ax_paths.set_xlabel("Months", color=TEXT, fontsize=8)
 ax_paths.set_ylabel("Price", color=TEXT, fontsize=8)
 ax_paths.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT, framealpha=0.5)

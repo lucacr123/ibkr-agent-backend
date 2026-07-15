@@ -2715,6 +2715,247 @@ Return ONLY the corrected Python code, no markdown fences, no explanation.`;
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Monte Carlo simulation endpoint
+app.post("/api/backtest/montecarlo", async (req, res) => {
+  const { symbol, horizon_days = 252, n_paths = 1000, model = "heston_jump" } = req.body;
+  if (!symbol) return res.status(400).json({ error: "symbol required" });
+
+  const mcScript = `
+import json
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from scipy import stats
+import warnings
+warnings.filterwarnings("ignore")
+
+# ── Parameters ────────────────────────────────────────────────────
+SYMBOL       = "${symbol}"
+T            = ${horizon_days} / 252          # horizon in years
+N_STEPS      = ${horizon_days}
+N_PATHS      = ${n_paths}
+MODEL        = "${model}"                     # gbm | heston | heston_jump
+np.random.seed(42)
+
+# ── Fetch historical data (3Y for calibration) ────────────────────
+try:
+    df = yf.download(SYMBOL, period="3y", auto_adjust=True, progress=False)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.dropna()
+    if df.empty:
+        raise ValueError(f"No data for {SYMBOL}")
+    prices = df["Close"].values
+    log_rets = np.diff(np.log(prices))
+    S0 = float(prices[-1])
+except Exception as e:
+    raise RuntimeError(f"Data fetch failed: {e}")
+
+# ── Calibrate GBM parameters from historical data ─────────────────
+dt        = 1 / 252
+mu        = float(np.mean(log_rets)) / dt                  # annualised drift
+sigma_hist = float(np.std(log_rets)) / np.sqrt(dt)         # annualised vol
+
+# ── Rolling volatility for Heston calibration ─────────────────────
+rolling_var = pd.Series(log_rets).rolling(21).var() / dt   # annualised variance
+v0          = float(rolling_var.dropna().iloc[-1])          # current variance
+theta       = float(rolling_var.dropna().mean())            # long-run variance
+kappa       = 2.0                                           # mean-reversion speed
+xi          = float(rolling_var.dropna().std()) * 2         # vol of vol
+rho         = float(np.corrcoef(log_rets[1:],
+              np.diff(rolling_var.dropna().values[-len(log_rets):]))[0,1]
+              if len(rolling_var.dropna()) > len(log_rets) else -0.7)
+rho         = np.clip(rho, -0.99, 0.99)
+
+# ── Jump parameters (Merton jump-diffusion) ───────────────────────
+# Calibrated from large daily moves (|ret| > 2.5 sigma)
+jump_threshold = 2.5 * np.std(log_rets)
+jumps          = log_rets[np.abs(log_rets) > jump_threshold]
+lambda_j       = len(jumps) / (len(log_rets) / 252)         # jumps per year
+mu_j           = float(np.mean(jumps)) if len(jumps) else -0.01
+sigma_j        = float(np.std(jumps))  if len(jumps) else 0.02
+
+print(f"Calibrated: S0={S0:.2f}, mu={mu:.3f}, sigma={sigma_hist:.3f}")
+print(f"Heston: v0={v0:.4f}, theta={theta:.4f}, kappa={kappa:.2f}, xi={xi:.4f}, rho={rho:.3f}")
+print(f"Jumps: lambda={lambda_j:.2f}/yr, mu_j={mu_j:.4f}, sigma_j={sigma_j:.4f}")
+
+# ── Simulate paths ────────────────────────────────────────────────
+paths = np.zeros((N_PATHS, N_STEPS + 1))
+paths[:, 0] = S0
+
+if MODEL == "gbm":
+    # Simple GBM: dS = mu*S*dt + sigma*S*dW
+    Z = np.random.standard_normal((N_PATHS, N_STEPS))
+    for t in range(N_STEPS):
+        paths[:, t+1] = paths[:, t] * np.exp((mu - 0.5*sigma_hist**2)*dt + sigma_hist*np.sqrt(dt)*Z[:, t])
+
+elif MODEL in ("heston", "heston_jump"):
+    # Heston stochastic vol + optional Merton jumps
+    Z1 = np.random.standard_normal((N_PATHS, N_STEPS))
+    Z2 = np.random.standard_normal((N_PATHS, N_STEPS))
+    Zv = rho * Z1 + np.sqrt(1 - rho**2) * Z2   # correlated BM for variance
+
+    v = np.full(N_PATHS, v0)
+    S = paths[:, 0].copy()
+
+    for t in range(N_STEPS):
+        v = np.maximum(v, 1e-8)
+        # Heston variance process (Milstein scheme)
+        dv = kappa*(theta - v)*dt + xi*np.sqrt(v*dt)*Zv[:, t] + 0.25*xi**2*dt*(Zv[:, t]**2 - 1)
+        v  = np.maximum(v + dv, 1e-8)
+        # Price process
+        dS = (mu - 0.5*v)*dt + np.sqrt(v*dt)*Z1[:, t]
+        # Add jumps (Merton)
+        if MODEL == "heston_jump":
+            N_jumps = np.random.poisson(lambda_j * dt, N_PATHS)
+            jump_sizes = np.where(N_jumps > 0,
+                np.random.normal(mu_j, sigma_j, N_PATHS) * N_jumps, 0)
+            dS += jump_sizes
+        S = S * np.exp(dS)
+        paths[:, t+1] = S
+
+# ── Compute path metrics ──────────────────────────────────────────
+terminal     = paths[:, -1]
+returns      = (terminal - S0) / S0           # terminal returns
+log_returns  = np.log(terminal / S0)
+
+pct = np.percentile(terminal, [5, 10, 25, 50, 75, 90, 95])
+prob_loss    = float(np.mean(terminal < S0))
+prob_gain_10 = float(np.mean(terminal > S0* 1.10))
+prob_gain_25 = float(np.mean(terminal > S0 * 1.25))
+exp_ret      = float(np.mean(returns))
+vol_terminal = float(np.std(returns))
+var95        = float(np.percentile(returns, 5))
+cvar95       = float(np.mean(returns[returns <= var95]))
+sharpe       = float(exp_ret / vol_terminal) if vol_terminal > 0 else 0
+
+metrics = {
+    "symbol":           SYMBOL,
+    "model":            MODEL,
+    "horizon_days":     N_STEPS,
+    "n_paths":          N_PATHS,
+    "current_price":    round(S0, 2),
+    "expected_return_pct":  round(exp_ret * 100, 2),
+    "vol_of_terminal_pct":  round(vol_terminal * 100, 2),
+    "sharpe_annualised":    round(sharpe * np.sqrt(252 / N_STEPS), 3),
+    "prob_loss_pct":        round(prob_loss * 100, 1),
+    "prob_gain_10pct":      round(prob_gain_10 * 100, 1),
+    "prob_gain_25pct":      round(prob_gain_25 * 100, 1),
+    "var95_pct":            round(var95 * 100, 2),
+    "cvar95_pct":           round(cvar95 * 100, 2),
+    "p5_price":  round(pct[0], 2), "p10_price": round(pct[1], 2),
+    "p25_price": round(pct[2], 2), "p50_price": round(pct[3], 2),
+    "p75_price": round(pct[4], 2), "p90_price": round(pct[5], 2),
+    "p95_price": round(pct[6], 2),
+    "calibrated_mu":    round(float(mu), 4),
+    "calibrated_sigma": round(float(sigma_hist), 4),
+    "calibrated_v0":    round(float(v0), 4),
+    "calibrated_kappa": round(float(kappa), 4),
+    "calibrated_theta": round(float(theta), 4),
+    "jump_intensity":   round(float(lambda_j), 3),
+    "jump_mu":          round(float(mu_j), 4),
+    "jump_sigma":       round(float(sigma_j), 4),
+}
+trades = []
+label  = f"Monte Carlo {MODEL.upper()} — {SYMBOL} — {N_STEPS}d horizon — {N_PATHS} paths"
+
+with open(OUTPUT_JSON, "w") as f:
+    json.dump({"metrics": metrics, "trades": trades, "label": label}, f)
+
+# ── Plot ─────────────────────────────────────────────────────────
+BG, PANEL = "#0D0F14", "#161B22"
+TEXT, GRID = "#E0E0E0", "#2A2F3A"
+COLS = {"p5":"#E74C3C","p25":"#E67E22","p50":"#2ECC71","p75":"#E67E22","p95":"#E74C3C"}
+
+fig, axes = plt.subplots(2, 2, figsize=(14, 9), facecolor=BG,
+                          gridspec_kw={"height_ratios":[2,1],"hspace":0.08,"wspace":0.25})
+ax_paths, ax_dist, ax_vol, ax_stats = axes[0,0], axes[0,1], axes[1,0], axes[1,1]
+for ax in axes.flat:
+    ax.set_facecolor(PANEL)
+    ax.tick_params(colors=TEXT, labelsize=8)
+    for sp in ax.spines.values(): sp.set_edgecolor(GRID)
+
+t_axis = np.arange(N_STEPS + 1) / 252 * 12  # months
+
+# Panel 1: fan chart
+sample_idx = np.random.choice(N_PATHS, min(200, N_PATHS), replace=False)
+for i in sample_idx:
+    ax_paths.plot(t_axis, paths[i], color="#4A9EFF", alpha=0.03, linewidth=0.5)
+percs = np.percentile(paths, [5,25,50,75,95], axis=0)
+labels_p = ["P5","P25","Median","P75","P95"]
+colors_p  = ["#E74C3C","#E67E22","#2ECC71","#E67E22","#E74C3C"]
+for i,(p,lb,c) in enumerate(zip(percs,labels_p,colors_p)):
+    ax_paths.plot(t_axis, p, color=c, linewidth=1.5 if lb=="Median" else 1, label=lb)
+ax_paths.fill_between(t_axis, percs[0], percs[4], color="#E74C3C", alpha=0.08)
+ax_paths.fill_between(t_axis, percs[1], percs[3], color="#2ECC71", alpha=0.12)
+ax_paths.axhline(S0, color=TEXT, linewidth=0.8, linestyle="--", alpha=0.5)
+ax_paths.set_title(f"{SYMBOL} — {MODEL.upper()} — {N_PATHS} paths — {N_STEPS}d", color=TEXT, fontsize=10)
+ax_paths.set_xlabel("Months", color=TEXT, fontsize=8)
+ax_paths.set_ylabel("Price", color=TEXT, fontsize=8)
+ax_paths.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT, framealpha=0.5)
+
+# Panel 2: terminal distribution
+ax_dist.hist(terminal, bins=60, color="#4A9EFF", alpha=0.7, edgecolor="none", density=True)
+ax_dist.axvline(S0, color="#FFFFFF", linewidth=1, linestyle="--", label=f"Current {S0:.0f}")
+ax_dist.axvline(pct[3], color="#2ECC71", linewidth=1.5, label=f"Median {pct[3]:.0f}")
+ax_dist.axvline(np.percentile(terminal,5), color="#E74C3C", linewidth=1, linestyle=":", label=f"VaR 5% {np.percentile(terminal,5):.0f}")
+ax_dist.set_title("Terminal Price Distribution", color=TEXT, fontsize=10)
+ax_dist.set_xlabel("Price", color=TEXT, fontsize=8)
+ax_dist.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT, framealpha=0.5)
+
+# Panel 3: vol through time (from paths)
+path_vols = np.std(np.diff(np.log(paths), axis=1), axis=0) * np.sqrt(252) * 100
+ax_vol.plot(t_axis[1:], path_vols, color="#FFB347", linewidth=1.2)
+ax_vol.axhline(sigma_hist*100, color=TEXT, linewidth=0.8, linestyle="--", label=f"Hist vol {sigma_hist*100:.1f}%")
+ax_vol.set_title("Cross-path Volatility", color=TEXT, fontsize=10)
+ax_vol.set_xlabel("Months", color=TEXT, fontsize=8)
+ax_vol.set_ylabel("Ann. Vol %", color=TEXT, fontsize=8)
+ax_vol.legend(fontsize=7, facecolor=PANEL, labelcolor=TEXT, framealpha=0.5)
+
+# Panel 4: key stats
+stats_txt = (
+    f"Expected Return:  {exp_ret*100:+.1f}%\\n"
+    f"Vol (terminal):   {vol_terminal*100:.1f}%\\n"
+    f"Sharpe (ann):     {sharpe*np.sqrt(252/N_STEPS):.2f}\\n"
+    f"\\nP(loss):          {prob_loss*100:.1f}%\\n"
+    f"P(gain>10%):      {prob_gain_10*100:.1f}%\\n"
+    f"P(gain>25%):      {prob_gain_25*100:.1f}%\\n"
+    f"\\nVaR 95%:          {var95*100:.2f}%\\n"
+    f"CVaR 95%:         {cvar95*100:.2f}%\\n"
+    f"\\nMedian price:     {pct[3]:.2f}\\n"
+    f"P5 / P95:         {pct[0]:.2f} / {pct[6]:.2f}\\n"
+    f"\\nModel: {MODEL}\\n"
+    f"κ={kappa:.2f}  θ={theta:.4f}  ξ={xi:.3f}\\n"
+    f"λ_jump={lambda_j:.2f}/yr"
+)
+ax_stats.text(0.05, 0.95, stats_txt, transform=ax_stats.transAxes,
+              color=TEXT, fontsize=8, fontfamily="monospace",
+              verticalalignment="top",
+              bbox=dict(boxstyle="round,pad=0.5", facecolor=BG, edgecolor=GRID, alpha=0.8))
+ax_stats.axis("off")
+ax_stats.set_title("Simulation Statistics", color=TEXT, fontsize=10)
+
+plt.savefig(CHART_PNG, dpi=150, bbox_inches="tight", facecolor=BG)
+plt.close()
+print("DONE")
+`;
+
+  try {
+    const bt = await runPythonBacktest(mcScript);
+    if (!bt.ok) return res.status(500).json({ error: bt.error, detail: (bt.stderr||"")+(bt.stdout||"") });
+
+    const label = bt.result?.label || `Monte Carlo ${symbol}`;
+    const html  = buildBacktestEmail(label, bt.result, bt.chartB64, mcScript);
+    await sendEmail(REPORT_TO, `📊 ${label}`, html);
+    await sendPush("📊 Monte Carlo complete", `Results emailed: ${label}`, "📊");
+
+    res.json({ ok:true, label, metrics: bt.result?.metrics });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get("/health", (req, res) => res.json({ status: "ok", time: new Date().toISOString(), pushSubscribers: pushSubs.size }));
 
 const PORT = process.env.PORT || 3001;

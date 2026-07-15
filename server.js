@@ -1769,19 +1769,30 @@ async function executeTool(name, input) {
           return { results: r.web.results.map(r=>({ title:r.title, url:r.url, description:r.description })) };
         }
       }
-      // Fallback: Google News RSS (no key, real search results)
-      const rss = await fetch(`https://news.google.com/rss/search?q=${q}&hl=en-US&gl=US&ceid=US:en`)
+      // Fallback 1: Google News RSS for news queries
+      const rss = await fetch(`https://news.google.com/rss/search?q=${q}&hl=en-US&gl=US&ceid=US:en`, {headers:{"User-Agent":"Mozilla/5.0"}})
         .then(r=>r.text()).catch(()=>"");
       const items = [];
       const itemRx = /<item>([\s\S]*?)<\/item>/g;
-      let m;
-      while ((m=itemRx.exec(rss))!==null && items.length<6) {
-        const title = (/<title>([\s\S]*?)<\/title>/.exec(m[1])||[])[1]?.replace(/<!\[CDATA\[|\]\]>/g,"").trim();
-        const link  = (/<link>([\s\S]*?)<\/link>/.exec(m[1])||[])[1]?.trim();
-        const desc  = (/<description>([\s\S]*?)<\/description>/.exec(m[1])||[])[1]?.replace(/<!\[CDATA\[|\]\]>|<[^>]+>/g,"").trim();
+      let m2;
+      while ((m2=itemRx.exec(rss))!==null && items.length<6) {
+        const title = (/<title>([\s\S]*?)<\/title>/.exec(m2[1])||[])[1]?.replace(/<!\[CDATA\[|\]\]>/g,"").trim();
+        const link  = (/<link>([\s\S]*?)<\/link>/.exec(m2[1])||[])[1]?.trim();
+        const desc  = (/<description>([\s\S]*?)<\/description>/.exec(m2[1])||[])[1]?.replace(/<!\[CDATA\[|\]\]>|<[^>]+>/g,"").trim();
         if (title) items.push({ title, url:link||"", description:desc||title });
       }
-      return { results: items };
+      if (items.length) return { results: items };
+      // Fallback 2: DuckDuckGo HTML scrape
+      const ddgHtml = await fetch(`https://html.duckduckgo.com/html/?q=${q}`, {
+        headers:{"User-Agent":"Mozilla/5.0","Accept":"text/html"}
+      }).then(r=>r.text()).catch(()=>"");
+      const ddgItems = [];
+      const snippetRx = /class="result__snippet"[^>]*>([\s\S]*?)<\/a>/g;
+      const titleRx2  = /class="result__a"[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/g;
+      const titles=[], urls=[];
+      let tm; while((tm=titleRx2.exec(ddgHtml))!==null&&titles.length<6){urls.push(tm[1]);titles.push(tm[2].replace(/<[^>]+>/g,"").trim());}
+      let sm,si=0; while((sm=snippetRx.exec(ddgHtml))!==null&&si<titles.length){ddgItems.push({title:titles[si]||"",url:urls[si]||"",description:sm[1].replace(/<[^>]+>/g,"").trim()});si++;}
+      return { results: ddgItems.slice(0,5) };
     }
 
     case "get_macro_snapshot":
@@ -1904,11 +1915,12 @@ PORTFOLIO WORKFLOW: call get_portfolio_analytics for portfolio overview. Include
 DATA RULE: Never invent market data. Fetch via tools. Mathematical models (Black-Scholes, Kelly, Sharpe) are fine on real fetched inputs.
 Format: EUR=€, GBP=£, USD=$. Today: ${new Date().toDateString()}.
 
-MACRO DATA: For any economic indicator (CPI, PCE, NFP, consumer confidence, inflation expectations, PMI, GDP, ISM, JOLTS, retail sales, yield curve, Fed funds rate etc.):
-- Just use web_search. Search for whatever the user asks, find the numbers, compute what's requested.
-- Never say you cannot access this data. If you can search the web, you can find it.
-- After finding data, do the maths: MoM, YoY, trend, surprise vs consensus, z-score, correlation — whatever is useful.
-- Build a clean table or summary from what you find. State the source and date.
+MACRO DATA RULE — NON NEGOTIABLE:
+- For ANY question about economic data (CPI, PCE, NFP, GDP, PMI, consumer confidence, inflation, rates, yields, ANYTHING macro): you MUST call web_search FIRST before saying anything.
+- Do NOT use training data for economic numbers. Training data is stale. Always search.
+- If web_search returns results, extract the numbers from them and compute what was asked.
+- If web_search returns nothing useful, say so honestly. Do NOT make up numbers.
+- Never say "I now have the data" unless you actually called web_search and got results back.
 
 CONVERSATION STYLE:
 - Be natural and conversational — like a sharp analyst friend, not a robot generating reports.
@@ -2648,39 +2660,44 @@ REQUIRED structure at end of script (use these exact variable names):
     // Step 2: Run the script
     let bt = await runPythonBacktest(script);
 
-    // Auto-fix: if Python error, send error back to Claude to fix and retry once
-    if (!bt.ok && bt.stderr) {
-      console.log("🐍 Python error, asking Claude to fix...");
-      const fixPrompt = `The Python backtest script you wrote produced this error:
+    // Retry loop: up to 3 attempts, Claude fixes errors each time
+    let attempts = 1;
+    while (!bt.ok && bt.stderr && attempts < 3) {
+      attempts++;
+      console.log(`🐍 Python error (attempt ${attempts-1}), asking Claude to fix...`);
+      const fixPrompt = `The Python backtest script produced this error on attempt ${attempts-1}:
 
-\`\`\`
-${bt.stderr.slice(0,1500)}
-\`\`\`
+ERROR:
+${bt.stderr.slice(0,1000)}
 
-The script started with:
-\`\`\`python
-${script.slice(0,500)}
-\`\`\`
+STDOUT:
+${bt.stdout?.slice(0,300)||"(none)"}
 
-Fix the error and return the complete corrected Python script. Common issues:
-- "sorting by datetime is deprecated" → use df.sort_index() instead of df.sort_values("Date")
-- Symbol not found → check Yahoo Finance symbol (e.g. CNDX.L not CNDX)
-- MultiIndex columns → use df.columns.get_level_values(0) or df.xs(symbol, axis=1, level=1)
-- Empty dataframe → add try/except and skip missing symbols
+SCRIPT (first 600 chars):
+${script.slice(0,600)}
 
-Return ONLY the corrected Python code, no markdown fences.`;
+Fix ALL errors and return the complete corrected Python script. Common fixes:
+- "sorting by datetime is deprecated" → use df.sort_index() not df.sort_values("Date")  
+- Symbol not found / empty dataframe → use try/except, skip missing symbols
+- MultiIndex columns → df.columns = df.columns.get_level_values(0) after download
+- NameError → make sure all variables are defined before use
+- The script must end with json.dump to OUTPUT_JSON and plt.savefig to CHART_PNG
 
-      const fixResponse = await anthropic.messages.create({
+Return ONLY the corrected Python code, no markdown fences, no explanation.`;
+
+      const fixResp = await anthropic.messages.create({
         model: "claude-sonnet-4-6",
         max_tokens: 8000,
         messages: [{ role: "user", content: fixPrompt }],
       });
-      let fixedScript = fixResponse.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
-      fixedScript = fixedScript.replace(/^```[\w]*\n?/gm,"").replace(/^```\s*$/gm,"").trim();
-      if (fixedScript.length > 100) {
-        console.log("🔧 Retrying with fixed script...");
-        bt = await runPythonBacktest(fixedScript);
-        if (bt.ok) script = fixedScript; // use fixed script for email
+      let fixed = fixResp.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
+      fixed = fixed.replace(/^```[\w]*\n?/gm,"").replace(/^```\s*$/gm,"").trim();
+      if (fixed.length > 100) {
+        console.log(`🔧 Retrying with fixed script (attempt ${attempts})...`);
+        script = fixed;
+        bt = await runPythonBacktest(script);
+      } else {
+        break;
       }
     }
 

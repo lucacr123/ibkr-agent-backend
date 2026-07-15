@@ -2675,10 +2675,8 @@ Return ONLY the corrected Python code, no markdown fences.`;
         max_tokens: 8000,
         messages: [{ role: "user", content: fixPrompt }],
       });
-      let fixedScript = fixResponse.content.filter(b=>b.type==="text").map(b=>b.text).join("
-");
-      fixedScript = fixedScript.replace(/^```[\w]*
-?/gm,"").replace(/^```\s*$/gm,"").trim();
+      let fixedScript = fixResponse.content.filter(b=>b.type==="text").map(b=>b.text).join("\n");
+      fixedScript = fixedScript.replace(/^```[\w]*\n?/gm,"").replace(/^```\s*$/gm,"").trim();
       if (fixedScript.length > 100) {
         console.log("🔧 Retrying with fixed script...");
         bt = await runPythonBacktest(fixedScript);

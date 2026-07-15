@@ -770,16 +770,13 @@ async function computePortfolioMetrics(positions, totalNLV) {
       portfolioIndex: cumulativeFromReturns(pr).map(v => +(v * 100).toFixed(3)),
       drawdownSeries: (() => { let peak=-Infinity; return cumulativeFromReturns(pr).map(v=>{ if(v>peak)peak=v; return +((v-peak)/peak*100).toFixed(3); }); })(),
       weights: (() => {
-        // Marginal Risk Contribution (MRC) = w_i * (Cov·w)_i / σ_p
-        // This gives the annualised vol contribution of each asset in % terms
-        // Sum of all MRC_i = portfolio annualised vol
-        const covW = weights.map((_, i) => cov[i].reduce((s, c, j) => s + weights[j] * c, 0)); // Cov·w vector
-        const portVar = weights.reduce((s, w, i) => s + w * covW[i], 0);
-        const portVolAnn = Math.sqrt(Math.max(portVar, 0)) * Math.sqrt(252);
+        // Risk Contribution = % of total portfolio VARIANCE explained by each asset
+        // RC_i = w_i * (Cov·w)_i / portVar * 100
+        // Sums to 100% — shows each asset's share of total portfolio variance
+        const covW = weights.map((_, i) => cov[i].reduce((s, c, j) => s + weights[j] * c, 0));
+        const portVar = Math.max(weights.reduce((s, w, i) => s + w * covW[i], 0), 1e-12);
         return items.map((x, i) => {
-          const mrcAnn = portVolAnn > 0 ? weights[i] * covW[i] * Math.sqrt(252) / portVolAnn * portVolAnn : 0;
-          // riskContribPct = percentage points of annualised portfolio vol from this asset
-          const riskContribPct = portVolAnn > 0 ? +(weights[i] * covW[i] * Math.sqrt(252) / portVolAnn * 100).toFixed(2) : 0;
+          const riskContribPct = +(weights[i] * covW[i] / portVar * 100).toFixed(2);
           return { symbol:x.symbol, yahooSymbol:x.yahooSymbol, weightPct:+(weights[i]*100).toFixed(2), riskContribPct };
         });
       })(),
@@ -1762,23 +1759,29 @@ async function executeTool(name, input) {
 
     case "web_search": {
       const q = encodeURIComponent(input.query);
-      // Try Brave first if API key available, fall back to DuckDuckGo
+      // Try Brave if API key available
       const braveKey = process.env.BRAVE_API_KEY;
       if (braveKey) {
-        const r = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${q}&count=5`, {
+        const r = await fetch(`https://api.search.brave.com/res/v1/web/search?q=${q}&count=6`, {
           headers: { "Accept":"application/json","Accept-Encoding":"gzip","X-Subscription-Token":braveKey }
         }).then(r=>r.json()).catch(()=>({}));
-        return { results: (r.web?.results||[]).map(r=>({ title:r.title, url:r.url, description:r.description })) };
+        if (r.web?.results?.length) {
+          return { results: r.web.results.map(r=>({ title:r.title, url:r.url, description:r.description })) };
+        }
       }
-      // DuckDuckGo instant answer (no API key needed)
-      const ddg = await fetch(`https://api.duckduckgo.com/?q=${q}&format=json&no_redirect=1&no_html=1&skip_disambig=1`)
-        .then(r=>r.json()).catch(()=>({}));
-      const results = [];
-      if (ddg.AbstractText) results.push({ title: ddg.Heading, url: ddg.AbstractURL, description: ddg.AbstractText });
-      (ddg.RelatedTopics||[]).slice(0,4).forEach(t => {
-        if (t.Text) results.push({ title: t.Text.slice(0,80), url: t.FirstURL||"", description: t.Text });
-      });
-      return { results };
+      // Fallback: Google News RSS (no key, real search results)
+      const rss = await fetch(`https://news.google.com/rss/search?q=${q}&hl=en-US&gl=US&ceid=US:en`)
+        .then(r=>r.text()).catch(()=>"");
+      const items = [];
+      const itemRx = /<item>([\s\S]*?)<\/item>/g;
+      let m;
+      while ((m=itemRx.exec(rss))!==null && items.length<6) {
+        const title = (/<title>([\s\S]*?)<\/title>/.exec(m[1])||[])[1]?.replace(/<!\[CDATA\[|\]\]>/g,"").trim();
+        const link  = (/<link>([\s\S]*?)<\/link>/.exec(m[1])||[])[1]?.trim();
+        const desc  = (/<description>([\s\S]*?)<\/description>/.exec(m[1])||[])[1]?.replace(/<!\[CDATA\[|\]\]>|<[^>]+>/g,"").trim();
+        if (title) items.push({ title, url:link||"", description:desc||title });
+      }
+      return { results: items };
     }
 
     case "get_macro_snapshot":
@@ -2643,7 +2646,46 @@ REQUIRED structure at end of script (use these exact variable names):
     console.log("📝 Backtest script end:", script.slice(-300));
 
     // Step 2: Run the script
-    const bt = await runPythonBacktest(script);
+    let bt = await runPythonBacktest(script);
+
+    // Auto-fix: if Python error, send error back to Claude to fix and retry once
+    if (!bt.ok && bt.stderr) {
+      console.log("🐍 Python error, asking Claude to fix...");
+      const fixPrompt = `The Python backtest script you wrote produced this error:
+
+\`\`\`
+${bt.stderr.slice(0,1500)}
+\`\`\`
+
+The script started with:
+\`\`\`python
+${script.slice(0,500)}
+\`\`\`
+
+Fix the error and return the complete corrected Python script. Common issues:
+- "sorting by datetime is deprecated" → use df.sort_index() instead of df.sort_values("Date")
+- Symbol not found → check Yahoo Finance symbol (e.g. CNDX.L not CNDX)
+- MultiIndex columns → use df.columns.get_level_values(0) or df.xs(symbol, axis=1, level=1)
+- Empty dataframe → add try/except and skip missing symbols
+
+Return ONLY the corrected Python code, no markdown fences.`;
+
+      const fixResponse = await anthropic.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 8000,
+        messages: [{ role: "user", content: fixPrompt }],
+      });
+      let fixedScript = fixResponse.content.filter(b=>b.type==="text").map(b=>b.text).join("
+");
+      fixedScript = fixedScript.replace(/^```[\w]*
+?/gm,"").replace(/^```\s*$/gm,"").trim();
+      if (fixedScript.length > 100) {
+        console.log("🔧 Retrying with fixed script...");
+        bt = await runPythonBacktest(fixedScript);
+        if (bt.ok) script = fixedScript; // use fixed script for email
+      }
+    }
+
     if (!bt.ok) return res.status(500).json({ error: bt.error, detail: (bt.stderr||"")+(bt.stdout||"") });
 
     // Step 3: Email results
